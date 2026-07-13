@@ -1,0 +1,9 @@
+# Real secrets — only .env.example belongs in the repo.
+.env
+
+__pycache__/
+*.py[cod]
+
+# Persisted session + device registry.
+state.json
+data/
