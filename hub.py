@@ -225,6 +225,9 @@ class Hub:
 
     async def _broadcast_session(self) -> None:
         self._save()
+        # DIAG (pause-echo hunt): the authoritative state every client is about to receive.
+        log(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
+            f"idx={self.session.index} active={self.session.active_device_id}")
         await self._broadcast({"t": "session", **self.session.snapshot()})
         self._mirror_play_queue()
 
@@ -385,7 +388,12 @@ class Hub:
             # A report may have been sent BEFORE the receiver processed a fresh
             # play/pause command — accepting it would flip the user's intent
             # back (and the next transfer would then carry the wrong state).
-            if time.monotonic() - self._play_intent_at >= INTENT_GRACE:
+            within_grace = time.monotonic() - self._play_intent_at < INTENT_GRACE
+            # DIAG (pause-echo hunt): a report that contradicts current play-state.
+            log(f"REPORT from {dev.name}/{dev.id[:8]} isPlaying={msg.get('isPlaying')} "
+                f"pos={msg.get('positionMs')} | is_playing={self.session.is_playing} "
+                f"{'IGNORED(grace)' if within_grace else 'APPLIED'}")
+            if not within_grace:
                 self.session.is_playing = bool(msg["isPlaying"]); changed = True
 
         if msg.get("ended"):
@@ -408,6 +416,10 @@ class Hub:
         action = msg.get("action")
         s = self.session
         active = s.active_device_id
+        # DIAG (pause-echo hunt): every act frame, with the fields that move play-state.
+        log(f"ACT {action} from {dev.name}/{dev.id[:8]} "
+            f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
+            f"| pre is_playing={s.is_playing}")
 
         # Promote the sender to active when there's nothing playing yet.
         if active is None and action in ("play", "setQueue"):
