@@ -1,0 +1,93 @@
+package paige.navic.ui.screens.settings.dialogs
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
+import navic.composeapp.generated.resources.Res
+import navic.composeapp.generated.resources.action_ok
+import navic.composeapp.generated.resources.option_artwork_shape
+import org.jetbrains.compose.resources.stringResource
+import org.koin.compose.koinInject
+import paige.navic.LocalPlatformContext
+import paige.navic.domain.manager.PreferenceManager
+import paige.navic.domain.models.settings.CoverArtShape
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ArtworkShapeDialog(
+	presented: Boolean,
+	onDismissRequest: () -> Unit
+) {
+	if (!presented) return
+
+	val platformContext = LocalPlatformContext.current
+	val preferenceManager = koinInject<PreferenceManager>()
+
+	AlertDialog(
+		title = {
+			Text(stringResource(Res.string.option_artwork_shape))
+		},
+		text = {
+			Column(
+				modifier = Modifier
+					.fillMaxWidth()
+					.heightIn(max = 300.dp),
+				verticalArrangement = Arrangement.spacedBy(16.dp)
+			) {
+				CoverArtShape.entries.forEach { shape ->
+					Row(
+						modifier = Modifier
+							.fillMaxWidth()
+							.clip(MaterialTheme.shapes.small)
+							.clickable {
+								platformContext.clickSound()
+								preferenceManager.coverArtShape = shape
+								onDismissRequest()
+							},
+						horizontalArrangement = Arrangement.spacedBy(16.dp),
+						verticalAlignment = Alignment.CenterVertically
+					) {
+						RadioButton(
+							selected = preferenceManager.coverArtShape == shape,
+							onClick = null
+						)
+						Box(
+							modifier = Modifier
+								.size(48.dp)
+								.background(MaterialTheme.colorScheme.primaryContainer, shape.decreasedShape)
+								.border(2.dp, MaterialTheme.colorScheme.primary, shape.decreasedShape)
+						)
+						Text(text = shape.name)
+					}
+				}
+			}
+		},
+		onDismissRequest = onDismissRequest,
+		confirmButton = {
+			Button(onClick = {
+				platformContext.clickSound()
+				onDismissRequest()
+			}) {
+				Text(stringResource(Res.string.action_ok))
+			}
+		}
+	)
+}

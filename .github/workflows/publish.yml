@@ -1,0 +1,108 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  testflight:
+    name: TestFlight
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+
+      - name: Download IPA from GitHub Release
+        run: |
+          set -e
+          mkdir -p prepare
+
+          TAG="${{ github.event.release.tag_name }}"
+
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+
+          [ -z "$TAG" ] || [ "$TAG" = "null" ] && exit 1
+
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "Navic.ipa" \
+            --dir prepare
+        env:
+          GH_TOKEN: ${{ secrets.NAVIC_GITHUB_TOKEN }}
+
+      - name: Setup Certificates
+        uses: apple-actions/import-codesign-certs@v5
+        with:
+          p12-file-base64: ${{ secrets.APP_STORE_CONNECT_P12 }}
+          p12-password: ${{ secrets.APP_STORE_CONNECT_P12_PASS }}
+
+      - run: bundle exec fastlane ios resign_and_upload
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_SIGNING_IDENTITY: ${{ secrets.APP_STORE_CONNECT_SIGNING_IDENTITY }}
+
+  altstore:
+    name: AltStore
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        run: |
+          git clone https://$USERNAME:$API_TOKEN@github.com/${{ github.repository }}.git repo
+        env:
+          API_TOKEN: ${{ secrets.NAVIC_GITHUB_TOKEN }}
+          USERNAME: GitHub-Actions
+
+      - name: Update app-repo.json
+        run: |
+          cd repo
+          TAG="${{ github.event.release.tag_name }}"
+          DATE="${{ github.event.release.published_at }}"
+          VERSION="${TAG#v}"
+
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Navic.ipa"
+
+          jq \
+            --arg version "$VERSION" \
+            --arg date "$DATE" \
+            --arg url "$DOWNLOAD_URL" \
+            '
+            .apps[0].version = $version |
+            .apps[0].versionDate = $date |
+            .apps[0].downloadURL = $url |
+            .apps[0].versions[0].version = $version |
+            .apps[0].versions[0].date = $date |
+            .apps[0].versions[0].downloadURL = $url
+            ' app-repo.json > tmp.json
+
+          mv tmp.json app-repo.json
+
+      - name: Commit and push changes
+        run: |
+          cd repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add app-repo.json
+
+          git diff --cached --quiet && echo "No changes" && exit 0
+
+          git commit -m "chore: update altstore repo for ${{ github.event.release.tag_name }}"
+
+          git push --force https://$USERNAME:$API_TOKEN@github.com/${{ github.repository }}.git
+        env:
+          API_TOKEN: ${{ secrets.NAVIC_GITHUB_TOKEN }}
+          USERNAME: GitHub-Actions
