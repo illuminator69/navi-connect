@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -38,6 +39,8 @@ MIRROR_PLAYQUEUE = os.environ.get("HUB_MIRROR_PLAYQUEUE", "true").lower() == "tr
 ND_USER = os.environ.get("HUB_ND_USER", "")
 ND_PASS = os.environ.get("HUB_ND_PASS", "")
 
+DEBUG = os.environ.get("HUB_DEBUG", "").lower() in ("1", "true", "yes")
+
 PING_INTERVAL = 10  # seconds (matches Feishin's heartbeat)
 PING_TIMEOUT = 10
 RELEASE_TIMEOUT = 1.5  # seconds to wait for an old device to hand off
@@ -45,10 +48,17 @@ PROGRESS_THROTTLE = 1.0  # seconds between fanned-out progress broadcasts
 INTENT_GRACE = 2.0  # seconds during which receiver reports can't contradict a
                     # fresh user play/pause intent (guards against stale
                     # in-flight 1 Hz reports flipping the state back)
+MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 
 
 def log(*a: Any) -> None:
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def dlog(*a: Any) -> None:
+    """Verbose diagnostic log, gated behind HUB_DEBUG (chatty at 1 Hz)."""
+    if DEBUG:
+        log(*a)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,10 +157,24 @@ class Hub:
         self.devices: dict[str, Device] = {}
         self._last_progress_sent = 0.0
         self._play_intent_at = 0.0  # monotonic time of the last user play/pause intent
+        self._position_intent_at = 0.0  # monotonic time of the last seek/jump/skip intent
+        self._pre_intent_position = 0  # position_ms just BEFORE that seek/jump/skip
+        self._mirror_task: Optional[asyncio.Task] = None  # single mirror worker
+        self._mirror_pending = False  # a newer snapshot is waiting to be written
+        self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
         self._load()
 
     def _mark_play_intent(self) -> None:
         self._play_intent_at = time.monotonic()
+
+    def _mark_position_intent(self) -> None:
+        # A fresh seek/jump/skip makes the receiver's in-flight 1 Hz reports
+        # (carrying the OLD position) untrustworthy for INTENT_GRACE seconds.
+        # Capture the position we're leaving so a stale report — one still near
+        # that old spot — can be told apart from real forward progress toward
+        # the new target. MUST be called BEFORE overwriting session.position_ms.
+        self._position_intent_at = time.monotonic()
+        self._pre_intent_position = self.session.position_ms
 
     # ----- persistence ----------------------------------------------------- #
     def _load(self) -> None:
@@ -226,8 +250,8 @@ class Hub:
     async def _broadcast_session(self) -> None:
         self._save()
         # DIAG (pause-echo hunt): the authoritative state every client is about to receive.
-        log(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
-            f"idx={self.session.index} active={self.session.active_device_id}")
+        dlog(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
+             f"idx={self.session.index} active={self.session.active_device_id}")
         await self._broadcast({"t": "session", **self.session.snapshot()})
         self._mirror_play_queue()
 
@@ -243,10 +267,30 @@ class Hub:
         current = None
         if 0 <= self.session.index < len(self.session.queue):
             current = self.session.queue[self.session.index].get("id")
-        asyncio.create_task(asyncio.to_thread(
-            _nd_save_play_queue_blocking, ids, current, self.session.position_ms))
+        # Record the latest intent; a single debounced worker serializes the
+        # actual HTTP writes so rapid seeks/skips can't fire concurrent, out-of-
+        # order savePlayQueue calls that persist a stale position.
+        self._mirror_latest = (ids, current, self.session.position_ms)
+        self._mirror_pending = True
+        if self._mirror_task is None or self._mirror_task.done():
+            self._mirror_task = asyncio.create_task(self._mirror_worker())
+
+    async def _mirror_worker(self) -> None:
+        try:
+            while self._mirror_pending:
+                self._mirror_pending = False
+                await asyncio.sleep(MIRROR_DEBOUNCE)  # coalesce a burst of edits
+                ids, current, position = self._mirror_latest
+                await asyncio.to_thread(
+                    _nd_save_play_queue_blocking, ids, current, position)
+        finally:
+            self._mirror_task = None
 
     # ----- queue / order maths --------------------------------------------- #
+    def _clamp_index(self, i: int) -> int:
+        """Keep a client-supplied index inside the queue (0 for an empty queue)."""
+        return max(0, min(i, len(self.session.queue) - 1)) if self.session.queue else 0
+
     def _play_order(self) -> list[int]:
         n = len(self.session.queue)
         if self.session.order and len(self.session.order) == n:
@@ -254,7 +298,12 @@ class Hub:
         return list(range(n))
 
     def _rebuild_order(self) -> None:
-        """Shuffle queue indices, keeping the current track first."""
+        """Shuffle queue indices from scratch, keeping the current track first.
+
+        Only for setQueue / shuffle-toggle. Plain queue edits (enqueue/remove/
+        move) must NOT reshuffle — they patch `order` incrementally below so the
+        user's upcoming shuffled order is preserved.
+        """
         n = len(self.session.queue)
         if not self.session.shuffle or n == 0:
             self.session.order = None
@@ -262,6 +311,48 @@ class Hub:
         rest = [i for i in range(n) if i != self.session.index]
         random.shuffle(rest)
         self.session.order = [self.session.index] + rest
+
+    def _order_after_insert(self, at: int, count: int, play_next: bool) -> None:
+        """Patch shuffle order for `count` items inserted at raw position `at`."""
+        order = self.session.order
+        if order is None or count <= 0:
+            return  # sequential order; nothing to track
+        new_order = [v + count if v >= at else v for v in order]
+        new_vals = list(range(at, at + count))
+        if play_next:
+            try:
+                pos = new_order.index(self.session.index) + 1
+            except ValueError:
+                pos = len(new_order)
+            new_order[pos:pos] = new_vals
+        else:
+            new_order.extend(new_vals)
+        self.session.order = new_order
+
+    def _order_after_remove(self, at: int) -> None:
+        """Patch shuffle order for the item removed at raw position `at`."""
+        order = self.session.order
+        if order is None:
+            return
+        patched = [v - 1 if v > at else v for v in order if v != at]
+        self.session.order = patched or None
+
+    def _order_after_move(self, fr: int, to: int) -> None:
+        """Patch shuffle order for a raw move (queue.insert(to, queue.pop(fr)))."""
+        order = self.session.order
+        if order is None:
+            return
+
+        def remap(v: int) -> int:
+            if v == fr:
+                return to
+            if fr < to and fr < v <= to:
+                return v - 1
+            if to <= v < fr:
+                return v + 1
+            return v
+
+        self.session.order = [remap(v) for v in order]
 
     def _step_index(self, delta: int) -> Optional[int]:
         """Next/previous queue index respecting repeat + shuffle order."""
@@ -289,7 +380,11 @@ class Hub:
             # First frame MUST be hello + valid token.
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             msg = json.loads(raw)
-            if msg.get("t") != "hello" or (TOKEN and msg.get("token") != TOKEN):
+            if not isinstance(msg, dict):
+                await ws.close(4002, "protocol")
+                return
+            token_ok = not TOKEN or hmac.compare_digest(str(msg.get("token") or ""), TOKEN)
+            if msg.get("t") != "hello" or not token_ok:
                 got = str(msg.get("token") or "")
                 name = (msg.get("device") or {}).get("name", "?")
                 log(f"AUTH REJECTED for {name!r}: got token "
@@ -299,7 +394,7 @@ class Hub:
                 await ws.close(4001, "auth")
                 return
 
-            dev = self._register(msg.get("device", {}), ws)
+            dev = await self._register(msg.get("device", {}), ws)
             await self._send(dev, {
                 "t": "welcome",
                 "deviceId": dev.id,
@@ -320,14 +415,23 @@ class Hub:
             pass
         finally:
             if dev:
-                await self._disconnect(dev)
+                await self._disconnect(dev, ws)
 
-    def _register(self, desc: dict, ws: Any) -> Device:
+    async def _register(self, desc: dict, ws: Any) -> Device:
         did = desc.get("id") or os.urandom(8).hex()
         dev = self.devices.get(did)
         if dev is None:
             dev = Device(id=did)
             self.devices[did] = dev
+        # Evict a prior live socket for this device before adopting the new one.
+        # Without this, a reconnect while the old WS is still half-open leaves
+        # two sockets bound to one Device, both driving session state.
+        old_ws = dev.ws
+        if old_ws is not None and old_ws is not ws:
+            try:
+                await old_ws.close(4003, "superseded")
+            except Exception:  # noqa: BLE001 — best-effort; its finally still runs
+                pass
         dev.name = desc.get("name", dev.name)
         dev.platform = desc.get("platform", dev.platform)
         dev.caps = desc.get("caps", dev.caps)
@@ -337,14 +441,27 @@ class Hub:
         self._save()
         return dev
 
-    async def _disconnect(self, dev: Device) -> None:
+    async def _disconnect(self, dev: Device, ws: Any) -> None:
+        # Only tear down if THIS socket is still the device's live socket. On a
+        # reconnect blip the new connection may have already re-registered
+        # (dev.ws = new_ws) before this old socket's finally fires; nulling it
+        # here would kill the live new socket and spuriously mark the device
+        # offline (and pause/relinquish active if it was the active receiver).
+        if dev.ws is not ws:
+            return
         dev.online = False
         dev.ws = None
         dev.last_seen = int(time.time() * 1000)
         log(f"- {dev.name} ({dev.id[:8]}) disconnected")
-        # If the active receiver dropped, pause the session but keep the queue/position.
+        # If the active receiver dropped, pause the session AND relinquish the active
+        # slot (keep the queue/position). Clearing active_device_id is the "no live
+        # receiver" signal controllers use to adopt the last-known queue locally
+        # (paused) so a still-open client isn't stranded mirroring a dead device. A
+        # device that is genuinely still playing re-claims active via its reporter on
+        # reconnect, so this doesn't disrupt a brief network blip.
         if self.session.active_device_id == dev.id:
             self.session.is_playing = False
+            self.session.active_device_id = None
             self.session.bump()
             await self._broadcast_session()
         await self._broadcast_devices()
@@ -380,19 +497,33 @@ class Hub:
         if dev.id != self.session.active_device_id:
             return
         changed = False
+        now = time.monotonic()
         if "positionMs" in msg:
-            self.session.position_ms = int(msg["positionMs"])
+            # Right after a seek/jump/skip the receiver may still emit an in-flight
+            # 1 Hz report carrying the OLD position, which would rewind the scrubber.
+            # Within the grace window, reject a report that sits closer to where we
+            # just left than to where we intend to be — that's a stale tick. A report
+            # near (or past) the new target is real progress and is accepted.
+            report_pos = int(msg["positionMs"])
+            target = self.session.position_ms
+            stale = (now - self._position_intent_at < INTENT_GRACE
+                     and abs(report_pos - self._pre_intent_position) < abs(report_pos - target))
+            if not stale:
+                self.session.position_ms = report_pos
+            else:
+                dlog(f"REPORT pos={report_pos} from {dev.name}/{dev.id[:8]} "
+                     f"IGNORED(pos-grace; pre={self._pre_intent_position} target={target})")
         if "index" in msg and msg["index"] != self.session.index:
             self.session.index = int(msg["index"]); changed = True
         if "isPlaying" in msg and msg["isPlaying"] != self.session.is_playing:
             # A report may have been sent BEFORE the receiver processed a fresh
             # play/pause command — accepting it would flip the user's intent
             # back (and the next transfer would then carry the wrong state).
-            within_grace = time.monotonic() - self._play_intent_at < INTENT_GRACE
+            within_grace = now - self._play_intent_at < INTENT_GRACE
             # DIAG (pause-echo hunt): a report that contradicts current play-state.
-            log(f"REPORT from {dev.name}/{dev.id[:8]} isPlaying={msg.get('isPlaying')} "
-                f"pos={msg.get('positionMs')} | is_playing={self.session.is_playing} "
-                f"{'IGNORED(grace)' if within_grace else 'APPLIED'}")
+            dlog(f"REPORT from {dev.name}/{dev.id[:8]} isPlaying={msg.get('isPlaying')} "
+                 f"pos={msg.get('positionMs')} | is_playing={self.session.is_playing} "
+                 f"{'IGNORED(grace)' if within_grace else 'APPLIED'}")
             if not within_grace:
                 self.session.is_playing = bool(msg["isPlaying"]); changed = True
 
@@ -404,7 +535,6 @@ class Hub:
             self.session.bump()
             await self._broadcast_session()
         else:
-            now = time.monotonic()
             if now - self._last_progress_sent >= PROGRESS_THROTTLE:
                 self._last_progress_sent = now
                 await self._broadcast({"t": "progress",
@@ -417,9 +547,9 @@ class Hub:
         s = self.session
         active = s.active_device_id
         # DIAG (pause-echo hunt): every act frame, with the fields that move play-state.
-        log(f"ACT {action} from {dev.name}/{dev.id[:8]} "
-            f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
-            f"| pre is_playing={s.is_playing}")
+        dlog(f"ACT {action} from {dev.name}/{dev.id[:8]} "
+             f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
+             f"| pre is_playing={s.is_playing}")
 
         # Promote the sender to active when there's nothing playing yet.
         if active is None and action in ("play", "setQueue"):
@@ -428,8 +558,8 @@ class Hub:
 
         if action == "setQueue":
             s.queue = msg.get("tracks", [])
-            s.index = int(msg.get("index", 0))
-            s.position_ms = int(msg.get("positionMs", 0))
+            s.index = self._clamp_index(int(msg.get("index", 0)))
+            s.position_ms = max(0, int(msg.get("positionMs", 0)))
             s.is_playing = bool(msg.get("play", True))
             self._mark_play_intent()
             self._rebuild_order()
@@ -448,10 +578,13 @@ class Hub:
             tracks = msg.get("tracks", [])
             at = msg.get("at", "end")
             if at == "next":
-                s.queue[s.index + 1:s.index + 1] = tracks
+                insert_pos = s.index + 1
+                s.queue[insert_pos:insert_pos] = tracks
+                self._order_after_insert(insert_pos, len(tracks), play_next=True)
             else:
+                insert_pos = len(s.queue)
                 s.queue.extend(tracks)
-            self._rebuild_order()
+                self._order_after_insert(insert_pos, len(tracks), play_next=False)
             s.bump()
             await self._send_to(active, {"t": "do", "cmd": "queueChanged",
                                          "tracks": s.queue, "index": s.index})
@@ -479,6 +612,7 @@ class Hub:
                 i = int(msg["index"])
                 if 0 <= i < len(s.queue):
                     s.queue.pop(i)
+                    self._order_after_remove(i)
                     if i < s.index:
                         s.index -= 1
                     elif i == s.index:
@@ -494,6 +628,7 @@ class Hub:
                 fr, to = int(msg["from"]), int(msg["to"])
                 if 0 <= fr < len(s.queue) and 0 <= to < len(s.queue):
                     s.queue.insert(to, s.queue.pop(fr))
+                    self._order_after_move(fr, to)
                     # Keep s.index pointing at the SAME (currently-playing) song
                     # after the reorder, so the active device doesn't restart/jump.
                     if fr == s.index:
@@ -503,7 +638,6 @@ class Hub:
                             s.index -= 1
                         if to <= s.index:
                             s.index += 1
-            self._rebuild_order()
             s.bump()
             if not s.queue:
                 await self._send_to(active, {"t": "do", "cmd": "clear"})
@@ -536,17 +670,20 @@ class Hub:
                 s.is_playing = False; self._mark_play_intent(); s.bump()
                 await self._send_to(active, {"t": "do", "cmd": "pause"})
             else:
+                self._mark_position_intent()
                 s.index = nxt; s.position_ms = 0; s.bump()
                 await self._send_to(active, {"t": "do", "cmd": "jump", "index": s.index})
             await self._broadcast_session()
 
         elif action == "jump":
-            s.index = int(msg["index"]); s.position_ms = 0; s.bump()
+            self._mark_position_intent()
+            s.index = self._clamp_index(int(msg["index"])); s.position_ms = 0; s.bump()
             await self._send_to(active, {"t": "do", "cmd": "jump", "index": s.index})
             await self._broadcast_session()
 
         elif action == "seek":
-            s.position_ms = int(msg["positionMs"]); s.bump()
+            self._mark_position_intent()
+            s.position_ms = max(0, int(msg["positionMs"])); s.bump()
             await self._send_to(active, {"t": "do", "cmd": "seek", "positionMs": s.position_ms})
             await self._broadcast_session()
 
@@ -596,7 +733,7 @@ class Hub:
         old_id = s.active_device_id
         if old_id and old_id != target_id and self.devices.get(old_id, Device("x")).online:
             old = self.devices[old_id]
-            fut = asyncio.get_event_loop().create_future()
+            fut = asyncio.get_running_loop().create_future()
             old.release_future = fut
             await self._send(old, {"t": "do", "cmd": "release"})
             try:
