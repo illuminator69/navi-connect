@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -96,7 +97,15 @@ class HubManager(
 	private val mediaPlayer: MediaPlayerViewModel
 ) : RemotePlaybackRouter {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-	private val client = HttpClient { install(WebSockets) }
+	private val client = HttpClient {
+		install(WebSockets) {
+			// Protocol-level WS pings so a half-open socket (Wi-Fi→cellular, NAT
+			// timeout) is detected and torn down instead of blocking `incoming`
+			// forever — the app-level `ping`/`pong` only refreshes the hub's
+			// last-seen and can't detect a dead link on its own.
+			pingIntervalMillis = 10_000
+		}
+	}
 
 	private val _connected = MutableStateFlow(false)
 	val connected: StateFlow<Boolean> = _connected.asStateFlow()
@@ -117,6 +126,18 @@ class HubManager(
 
 	/** True when playback is live on ANOTHER device — show/route the remote view. */
 	val isRemoteActive: StateFlow<Boolean> = _isRemoteActive.asStateFlow()
+
+	/**
+	 * Last hub-side error the user should know about (bad token, target offline, …).
+	 * The UI (device picker / NaviConnect settings) can surface it as a snackbar —
+	 * without this a wrong token just looked like "never connects". Cleared on a
+	 * successful `welcome`.
+	 */
+	private val _connectionError = MutableStateFlow<String?>(null)
+	val connectionError: StateFlow<String?> = _connectionError.asStateFlow()
+
+	/** Set when the hub rejects our token, so the reconnect loop stops tight-looping. */
+	private var authFailed = false
 
 	/** When our socket dropped, so a brief reconnect doesn't tear the remote view down. */
 	private var disconnectedAtMs = 0L
@@ -173,6 +194,8 @@ class HubManager(
 		play: Boolean
 	) = loadSessionQueue(songs, index, positionMs, play)
 
+	override fun seek(positionMs: Long) = actSeek(positionMs)
+
 	private fun nowMs(): Long = Clock.System.now().toEpochMilliseconds()
 
 	private fun isActiveDevice(): Boolean {
@@ -183,11 +206,20 @@ class HubManager(
 	fun start() = restart()
 
 	fun restart() {
-		connectJob?.cancel()
-		wsSession = null
+		// Join the previous connect job before starting a new one — cancelling
+		// without joining let the old coroutine race the new one over the shared
+		// `wsSession` (duplicate/stale sockets). restart() runs on every settings
+		// change, so this race was easy to hit.
+		val old = connectJob
 		_connected.value = false
-		if (!preferenceManager.hubEnabled) return
-		connectJob = scope.launch { runLoop() }
+		authFailed = false
+		_connectionError.value = null
+		connectJob = scope.launch {
+			old?.cancelAndJoin()
+			wsSession = null
+			if (!preferenceManager.hubEnabled) return@launch
+			runLoop()
+		}
 	}
 
 	fun stop() {
@@ -449,17 +481,30 @@ class HubManager(
 	// ------------------------------------------------------------------ //
 
 	private suspend fun runLoop() {
+		var backoffMs = INITIAL_BACKOFF_MS
 		while (currentCoroutineContext().isActive) {
 			try {
 				connectOnce()
 			} catch (e: Exception) {
 				Logger.e("HubManager", "hub connection failed: ${e.message}", e)
 			}
+			val wasConnected = _connected.value
 			wsSession = null
-			if (_connected.value) disconnectedAtMs = nowMs()
+			if (wasConnected) {
+				disconnectedAtMs = nowMs()
+				backoffMs = INITIAL_BACKOFF_MS  // the link worked; reset the backoff
+			}
 			_connected.value = false
 			evaluateRemoteActive()
-			delay(3000)
+			// The hub rejected our token — retrying with the same bad token would
+			// tight-loop forever and never surface the error. Stop; a settings
+			// change (which calls restart()) clears the flag and tries again.
+			if (authFailed) {
+				Logger.e("HubManager", "hub auth rejected — stopping reconnect until settings change")
+				return
+			}
+			delay(backoffMs)
+			backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
 		}
 	}
 
@@ -551,6 +596,7 @@ class HubManager(
 				msg["session"]?.let { applySession(it.jsonObject) }
 				msg["devices"]?.let { parseDevices(it.asObjectList()) }
 				_connected.value = true
+				_connectionError.value = null
 				// Hub is authoritative: adopt its session rather than re-publishing ours.
 				adoptIfNoLiveReceiver()
 				Logger.i("HubManager", "connected to hub as $id")
@@ -564,22 +610,31 @@ class HubManager(
 				adoptIfNoLiveReceiver()
 			}
 
-			"progress" -> _remoteSession.value = _remoteSession.value.copy(
-				index = msg["index"]?.jsonPrimitive?.intOrNull
-					?: _remoteSession.value.index,
-				isPlaying = msg["isPlaying"]?.jsonPrimitive?.booleanOrNull ?: false,
-				positionMs = msg["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L,
-				positionAtMs = nowMs()
-			)
+			// A partial progress frame must NOT reset the fields it omits: defaulting
+			// a missing isPlaying to false / positionMs to 0 snapped the scrubber and
+			// flickered a paused state. Keep the previous mirror value for anything absent.
+			"progress" -> {
+				val prev = _remoteSession.value
+				_remoteSession.value = prev.copy(
+					index = msg["index"]?.jsonPrimitive?.intOrNull ?: prev.index,
+					isPlaying = msg["isPlaying"]?.jsonPrimitive?.booleanOrNull ?: prev.isPlaying,
+					positionMs = msg["positionMs"]?.jsonPrimitive?.longOrNull ?: prev.positionMs,
+					positionAtMs = nowMs()
+				)
+			}
 
 			"devices" -> msg["devices"]?.let { parseDevices(it.asObjectList()) }
 
 			"do" -> handleDo(msg)
 
-			"error" -> Logger.e(
-				"HubManager",
-				"hub error: ${msg["code"]?.jsonPrimitive?.content} ${msg["message"]?.jsonPrimitive?.content}"
-			)
+			"error" -> {
+				val code = msg["code"]?.jsonPrimitive?.content
+				val message = msg["message"]?.jsonPrimitive?.content
+				Logger.e("HubManager", "hub error: $code $message")
+				_connectionError.value = message ?: code
+				// A bad token never resolves by retrying — stop the reconnect loop.
+				if (code == "auth") authFailed = true
+			}
 		}
 	}
 
@@ -1030,6 +1085,10 @@ class HubManager(
 	private companion object {
 		/** Matches the hub's PING_INTERVAL, so a silent (paused) session still holds the socket. */
 		const val PING_INTERVAL_MS = 10_000L
+
+		/** Reconnect backoff: the protocol mandates exponential backoff, not a fixed retry. */
+		const val INITIAL_BACKOFF_MS = 1_000L
+		const val MAX_BACKOFF_MS = 30_000L
 
 		/**
 		 * How long the remote view survives a lost socket before falling back to local. Comfortably

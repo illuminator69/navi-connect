@@ -39,6 +39,7 @@ import com.google.android.gms.cast.framework.CastContext
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -46,6 +47,7 @@ import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -225,6 +227,14 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 			null
 		}
 
+		// A cast session already live when the process starts never fires the
+		// availability listener (it only reports TRANSITIONS), so adopt it explicitly
+		// here — otherwise a relaunch during casting silently reverts playback to the
+		// phone. (Known open item.)
+		castPlayer?.let { cp ->
+			if (cp.isCastSessionAvailable) switchSessionPlayer(cp)
+		}
+
 		// navi-connect: while another device is the active receiver, swap the
 		// session's player to a facade that mirrors AND drives the REMOTE session,
 		// so the Android system controls (notification / lock screen / Bluetooth)
@@ -268,6 +278,9 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 			val index = oldPlayer.currentMediaItemIndex
 			val position = oldPlayer.currentPosition
 			val playWhenReady = oldPlayer.playWhenReady
+			// The URI-less filter below can DROP items, so the old index no longer maps
+			// 1:1 into the filtered list — remember the current track's id and relocate it.
+			val currentMediaId = rawItems.getOrNull(index)?.mediaId
 
 			val items = if (newPlayer === exoPlayer) {
 				// Restore playable URIs by mediaId from the pre-cast snapshot;
@@ -287,7 +300,9 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 			if (items.isNotEmpty()) {
 				newPlayer.setMediaItems(
 					items,
-					index.coerceIn(0, items.size - 1),
+					currentMediaId?.let { id -> items.indexOfFirst { it.mediaId == id } }
+						?.takeIf { it >= 0 }
+						?: index.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
 					position.coerceAtLeast(0)
 				)
 				newPlayer.playWhenReady = playWhenReady
@@ -399,7 +414,14 @@ class AndroidMediaPlayerViewModel(
 						if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
 							mediaItem?.mediaId?.let { id ->
 								if (!isAvailable(id)) {
-									controller?.seekToNextMediaItem()
+									val c = controller
+									if (c != null && c.hasNextMediaItem()) {
+										c.seekToNextMediaItem()
+									} else {
+										// No next item: an unavailable LAST track would leave the player
+										// stuck buffering forever — stop rather than spin.
+										c?.pause()
+									}
 								}
 							}
 						}
@@ -468,7 +490,7 @@ class AndroidMediaPlayerViewModel(
 					snapshotFlow { preferenceManager.isAdvancedTranscodingActive },
 					snapshotFlow { preferenceManager.customMaxBitrateWifi },
 					snapshotFlow { preferenceManager.customMaxBitrateCellular }
-				) { it }.collectLatest { args ->
+				) { it.toList() }.distinctUntilChanged().collectLatest { args ->
 					@Suppress("UNCHECKED_CAST")
 					val downloadedMap = args[0] as Map<String, String>
 					val player = controller ?: return@collectLatest
@@ -519,6 +541,9 @@ class AndroidMediaPlayerViewModel(
 				val album = albumDao.getAlbumById(albumId)
 
 				_uiState.update { it.copy(currentCollection = album?.toDomainModel()) }
+				// A miss (album not cached yet) must NOT stick — otherwise we never retry
+				// once it syncs in. Only a real hit keeps the loading guard set.
+				if (album == null) loadingCollectionId = null
 			}.onFailure {
 				loadingCollectionId = null
 			}
@@ -703,8 +728,14 @@ class AndroidMediaPlayerViewModel(
 		}
 	}
 
+	private var progressJob: Job? = null
+
 	private fun startProgressLoop() {
-		viewModelScope.launch {
+		// Every isPlaying→true used to launch a fresh, untracked loop; rapid
+		// pause/play stacked overlapping loops that fought over `progress` (jitter).
+		// Cancel the previous one before starting a new one so only ever one runs.
+		progressJob?.cancel()
+		progressJob = viewModelScope.launch {
 			while (controller?.isPlaying == true) {
 				val player = controller ?: break
 				val duration = player.duration
@@ -863,7 +894,11 @@ class AndroidMediaPlayerViewModel(
 					queue = emptyList(),
 					currentSong = null,
 					currentIndex = -1,
-					progress = 0f
+					progress = 0f,
+					// Clearing ends the session: drop its saved-queue identity so the
+					// SavedQueues screen doesn't keep showing it as the active queue.
+					savedQueueId = null,
+					savedQueueKind = "manual"
 				)
 			}
 			controller?.clearMediaItems()
@@ -1113,6 +1148,13 @@ class AndroidMediaPlayerViewModel(
 	}
 
 	override fun seek(normalized: Float) {
+		// When another device is active, the scrubber must drive THAT device via
+		// the hub, not the silent local player (whose progress isn't even shown).
+		routeRemotely?.let { router ->
+			val durationMs = uiState.value.currentSong?.duration?.inWholeMilliseconds ?: 0L
+			router.seek((normalized.coerceIn(0f, 1f) * durationMs).toLong())
+			return
+		}
 		viewModelScope.launch(Dispatchers.Main.immediate) {
 			controller?.let {
 				val target = (it.duration * normalized).toLong()

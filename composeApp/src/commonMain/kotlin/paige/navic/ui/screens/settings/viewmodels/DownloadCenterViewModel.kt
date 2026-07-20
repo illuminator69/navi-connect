@@ -88,12 +88,29 @@ class DownloadCenterViewModel(
 
 	init {
 		viewModelScope.launch(Dispatchers.IO) {
+			// allDownloads re-emits on every ~1% progress write. Only the ACTIVE/queued rows
+			// actually change on a tick, so cache the expensive, whole-library-scale work
+			// (the song-resolution DB query and the terminal-section builds) and rebuild it
+			// only when the relevant SET of downloads changes — not on every progress tick.
+			var cachedIdSet: Set<String> = emptySet()
+			var cachedSongs: Map<String, DomainSong> = emptyMap()
+			var completedIds: Set<String> = emptySet()
+			var failedIds: Set<String> = emptySet()
+			var cachedCompleted: List<DownloadCenterItem> = emptyList()
+			var cachedFailed: List<DownloadCenterItem> = emptyList()
+			var cachedTotalSize = 0L
+
 			downloadManager.allDownloads.collect { downloads ->
-				// Resolve every song in ONE query rather than per row — the completed section can
-				// hold the entire library.
-				val songs = songDao
-					.getSongsByIds(downloads.map { it.songId })
-					.associate { it.songId to it.toDomainModel() }
+				val idSet = downloads.mapTo(HashSet()) { it.songId }
+				val songsChanged = idSet != cachedIdSet
+				val songs = if (songsChanged) {
+					cachedIdSet = idSet
+					songDao.getSongsByIds(downloads.map { it.songId })
+						.associate { it.songId to it.toDomainModel() }
+						.also { cachedSongs = it }
+				} else {
+					cachedSongs
+				}
 
 				// In-flight and queued rows are ordered by when they were REQUESTED, and that order
 				// never changes while they run. Sorting them by `updatedAt` (as this first did)
@@ -105,20 +122,38 @@ class DownloadCenterViewModel(
 					.map { DownloadCenterItem(it, songs[it.songId]) }
 
 				// Finished and failed rows are terminal — their `updatedAt` is the moment they
-				// settled, so most-recent-first is both meaningful and stable.
+				// settled, so most-recent-first is both meaningful and stable. Rebuild them only
+				// when their membership changes (never on an active download's progress tick).
 				fun byCompletion(status: DownloadStatus) = downloads
 					.filter { it.status == status }
 					.sortedByDescending { it.updatedAt }
 					.map { DownloadCenterItem(it, songs[it.songId]) }
 
+				val newCompletedIds = downloads.filterTo(HashSet()) {
+					it.status == DownloadStatus.DOWNLOADED
+				}.mapTo(HashSet()) { it.songId }
+				if (newCompletedIds != completedIds || songsChanged) {
+					completedIds = newCompletedIds
+					cachedCompleted = byCompletion(DownloadStatus.DOWNLOADED)
+					cachedTotalSize = downloads
+						.filter { it.status == DownloadStatus.DOWNLOADED }
+						.sumOf { it.fileSize }
+				}
+
+				val newFailedIds = downloads.filterTo(HashSet()) {
+					it.status == DownloadStatus.FAILED
+				}.mapTo(HashSet()) { it.songId }
+				if (newFailedIds != failedIds || songsChanged) {
+					failedIds = newFailedIds
+					cachedFailed = byCompletion(DownloadStatus.FAILED)
+				}
+
 				_state.value = DownloadCenterState(
 					active = byRequest(DownloadStatus.DOWNLOADING),
 					queued = byRequest(DownloadStatus.QUEUED),
-					failed = byCompletion(DownloadStatus.FAILED),
-					completed = byCompletion(DownloadStatus.DOWNLOADED),
-					totalSize = downloads
-						.filter { it.status == DownloadStatus.DOWNLOADED }
-						.sumOf { it.fileSize }
+					failed = cachedFailed,
+					completed = cachedCompleted,
+					totalSize = cachedTotalSize
 				)
 			}
 		}

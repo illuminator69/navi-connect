@@ -18,7 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -116,7 +116,7 @@ fun BlendBackground(
 		Box(
 			modifier = Modifier
 				.fillMaxSize()
-				.rotate(frameRotation)
+				.graphicsLayer { rotationZ = frameRotation }
 		) {
 			Box(
 				modifier = Modifier
@@ -133,7 +133,7 @@ fun BlendBackground(
 					colorFilter = ColorFilter.colorMatrix(colorMatrix),
 					modifier = Modifier
 						.fillMaxSize()
-						.rotate(topLeftRotation)
+						.graphicsLayer { rotationZ = topLeftRotation }
 				)
 			}
 			Box(
@@ -151,7 +151,7 @@ fun BlendBackground(
 					colorFilter = ColorFilter.colorMatrix(colorMatrix),
 					modifier = Modifier
 						.fillMaxSize()
-						.rotate(botRightRotation)
+						.graphicsLayer { rotationZ = botRightRotation }
 				)
 			}
 		}

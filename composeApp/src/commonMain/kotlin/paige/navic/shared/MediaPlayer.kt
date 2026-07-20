@@ -47,6 +47,9 @@ interface RemotePlaybackRouter {
 	/** Append to the session queue, either next or at the end. */
 	fun enqueue(songs: List<DomainSong>, playNext: Boolean)
 
+	/** Route a scrubber seek to the active remote device (absolute position). */
+	fun seek(positionMs: Long)
+
 	/**
 	 * Undo restore: replace the session queue AND resume at [index]/[positionMs]. Unlike
 	 * [setQueue] (which always restarts at position 0), this carries the saved playhead so an
@@ -214,7 +217,7 @@ abstract class MediaPlayerViewModel(
 	/** Set by HubManager. Null (or inactive) means everything below plays locally, as before. */
 	var remotePlaybackRouter: RemotePlaybackRouter? = null
 
-	private val routeRemotely: RemotePlaybackRouter?
+	protected val routeRemotely: RemotePlaybackRouter?
 		get() = remotePlaybackRouter?.takeIf { it.isRemoteSessionActive }
 
 	protected abstract fun addToQueueSingleLocal(song: DomainSong)

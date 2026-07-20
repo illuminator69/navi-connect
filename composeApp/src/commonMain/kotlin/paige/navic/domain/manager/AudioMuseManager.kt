@@ -45,21 +45,25 @@ class AudioMuseManager(
 	private val _lastMoodCentroid = MutableStateFlow<List<Float>?>(null)
 	val lastMoodCentroid: StateFlow<List<Float>?> = _lastMoodCentroid.asStateFlow()
 
-	private fun newClient() = HttpClient {
-		install(ContentNegotiation) {
-			json(Json {
-				ignoreUnknownKeys = true
-				isLenient = true
-				coerceInputValues = true
-			})
-		}
-		install(UserAgent) { agent = "Navic" }
-		// Tier-2 endpoints are synchronous in-memory lookups; keep timeouts tight
-		// so a slow/unreachable core fails fast and we fall back to Tier 1.
-		install(HttpTimeout) {
-			connectTimeoutMillis = 8_000
-			requestTimeoutMillis = 30_000
-			socketTimeoutMillis = 30_000
+	// One client reused for the manager's lifetime. The old per-call new/close
+	// built and tore down a full HttpClient on the hot autoplay top-up path.
+	private val client by lazy {
+		HttpClient {
+			install(ContentNegotiation) {
+				json(Json {
+					ignoreUnknownKeys = true
+					isLenient = true
+					coerceInputValues = true
+				})
+			}
+			install(UserAgent) { agent = "Navic" }
+			// Tier-2 endpoints are synchronous in-memory lookups; keep timeouts tight
+			// so a slow/unreachable core fails fast and we fall back to Tier 1.
+			install(HttpTimeout) {
+				connectTimeoutMillis = 8_000
+				requestTimeoutMillis = 30_000
+				socketTimeoutMillis = 30_000
+			}
 		}
 	}
 
@@ -77,7 +81,6 @@ class AudioMuseManager(
 		val ndUser = settings.getString("username", "")
 		val ndPass = settings.getString("password", "")
 
-		val client = newClient()
 		return try {
 			val results: List<FingerprintItem> =
 				client.get("$base/api/sonic_fingerprint/generate") {
@@ -90,8 +93,6 @@ class AudioMuseManager(
 		} catch (e: Exception) {
 			Logger.e("AudioMuseManager", "sonic fingerprint failed", e)
 			emptyList()
-		} finally {
-			client.close()
 		}
 	}
 
@@ -115,7 +116,6 @@ class AudioMuseManager(
 		val items = addIds.map { AlchemyItem(op = "ADD", id = it) } +
 			subtractIds.map { AlchemyItem(op = "SUBTRACT", id = it) }
 
-		val client = newClient()
 		return try {
 			val resp: AlchemyResponse = client.post("$base/api/alchemy") {
 				header("Authorization", "Bearer $token")
@@ -134,8 +134,6 @@ class AudioMuseManager(
 		} catch (e: Exception) {
 			Logger.e("AudioMuseManager", "alchemy mix failed", e)
 			emptyList()
-		} finally {
-			client.close()
 		}
 	}
 
@@ -151,7 +149,6 @@ class AudioMuseManager(
 		val base = preferenceManager.audioMuseUrl.trimEnd('/')
 		val token = preferenceManager.audioMuseToken
 
-		val client = newClient()
 		return try {
 			val resp: ClapSearchResponse = client.post("$base/api/clap/search") {
 				header("Authorization", "Bearer $token")
@@ -162,8 +159,6 @@ class AudioMuseManager(
 		} catch (e: Exception) {
 			Logger.e("AudioMuseManager", "clap search failed", e)
 			emptyList()
-		} finally {
-			client.close()
 		}
 	}
 
@@ -177,7 +172,6 @@ class AudioMuseManager(
 		val base = preferenceManager.audioMuseUrl.trimEnd('/')
 		val token = preferenceManager.audioMuseToken
 
-		val client = newClient()
 		return try {
 			val stats: ClapStats = client.get("$base/api/clap/stats") {
 				header("Authorization", "Bearer $token")
@@ -186,8 +180,6 @@ class AudioMuseManager(
 		} catch (e: Exception) {
 			Logger.e("AudioMuseManager", "clap stats failed", e)
 			false
-		} finally {
-			client.close()
 		}
 	}
 }
