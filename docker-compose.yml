@@ -1,0 +1,20 @@
+# Separate container for the navi-connect hub. On Unraid you can also use the
+# `docker run` form below (compose `volumes:` are honored here, unlike the bot).
+services:
+  navi-connect-hub:
+    build: .
+    image: navi-connect-hub
+    container_name: navi-connect-hub
+    restart: unless-stopped
+    # Same Docker network as Navidrome/the bot so the savePlayQueue mirror can
+    # reach Navidrome internally; clients reach the hub on 4790.
+    networks: [media]
+    ports:
+      - "4790:4790"
+    env_file: .env
+    volumes:
+      - ./data:/data        # persisted session + device registry
+
+networks:
+  media:
+    external: true
