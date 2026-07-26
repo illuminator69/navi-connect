@@ -56,6 +56,8 @@ INTENT_GRACE = 2.0  # seconds during which receiver reports can't contradict a
 MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
+TOMBSTONE_MAX = 200  # remembered saved-queue deletions (so a client re-sync can't resurrect)
+POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
 
 
 def log(*a: Any) -> None:
@@ -173,7 +175,11 @@ class Hub:
         # Rolling saved-queue history (Continue Listening), authoritative + shared.
         # Keyed by record id; capped at SAVED_QUEUES_MAX, oldest by updatedAt evicted.
         self.saved_queues: dict[str, dict] = {}
+        # Deletions remembered as {id: deletedAt} so a client that still holds the row
+        # locally can't resurrect it via syncSavedQueues. Capped + persisted.
+        self.deleted_saved_queues: dict[str, int] = {}
         self._last_sq_progress_at = 0.0  # throttle the current record's cursor writes
+        self._last_position_save_at = 0.0  # throttle position-only state persistence
         self._last_progress_sent = 0.0
         self._play_intent_at = 0.0  # monotonic time of the last user play/pause intent
         self._position_intent_at = 0.0  # monotonic time of the last seek/jump/skip intent
@@ -181,6 +187,7 @@ class Hub:
         self._mirror_task: Optional[asyncio.Task] = None  # single mirror worker
         self._mirror_pending = False  # a newer snapshot is waiting to be written
         self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
+        self._started_at = time.monotonic()
         self._load()
 
     def _mark_play_intent(self) -> None:
@@ -225,6 +232,11 @@ class Hub:
                 rid = rec.get("id")
                 if rid:
                     self.saved_queues[rid] = rec
+            for rid, at in (data.get("deletedSavedQueues") or {}).items():
+                try:
+                    self.deleted_saved_queues[rid] = int(at)
+                except (TypeError, ValueError):
+                    continue
             for d in data.get("devices", []):
                 self.devices[d["id"]] = Device(
                     id=d["id"], name=d.get("name", "Unknown"),
@@ -256,21 +268,23 @@ class Hub:
             log(f"pruned {len(stale)} device(s) not seen in {DEVICE_TTL_DAYS}d")
 
     def health(self) -> dict:
-        """Snapshot for the HTTP health endpoint (no session intent leaked)."""
+        """Liveness snapshot for the HTTP health endpoint.
+
+        Deliberately carries NO session intent (no active device, queue contents or
+        play-state): the port is a plain unauthenticated HTTP probe.
+        """
         return {
             "status": "ok",
+            "uptimeSeconds": int(time.monotonic() - self._started_at),
             "devices": len(self.devices),
             "online": sum(1 for d in self.devices.values() if d.online),
-            "queue": len(self.session.queue),
-            "activeDevice": self.session.active_device_id,
-            "isPlaying": self.session.is_playing,
-            "rev": self.session.rev,
         }
 
     def _save(self) -> None:
         data = {
             "session": self.session.snapshot(),
             "savedQueues": self._saved_queues_list(),
+            "deletedSavedQueues": self.deleted_saved_queues,
             "devices": [
                 {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
                  "volume": d.volume, "lastSeen": d.last_seen}
@@ -348,16 +362,41 @@ class Hub:
         return f"q_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
 
     def _saved_queues_list(self) -> list[dict]:
-        """The history, newest-first, capped — the exact payload clients render."""
-        return sorted(self.saved_queues.values(),
-                      key=lambda r: r.get("updatedAt", 0), reverse=True)[:SAVED_QUEUES_MAX]
+        """The history, newest-first, capped — the exact payload clients render.
+
+        The live session's record is always included even if the cap would push it
+        out (a big offline sync can carry newer rows), so clients never end up with
+        a session.savedQueueId that matches nothing in the list they render.
+        """
+        ordered = sorted(self.saved_queues.values(),
+                         key=lambda r: r.get("updatedAt", 0), reverse=True)
+        out = ordered[:SAVED_QUEUES_MAX]
+        cur_id = self.session.saved_queue_id
+        if cur_id and not any(r.get("id") == cur_id for r in out):
+            cur = self.saved_queues.get(cur_id)
+            if cur is not None:
+                out = out[:SAVED_QUEUES_MAX - 1] + [cur]
+        return out
 
     def _evict_saved_queues(self) -> None:
         if len(self.saved_queues) <= SAVED_QUEUES_MAX:
             return
         keep = {r["id"] for r in self._saved_queues_list()}
+        # The record backing the LIVE session is never evictable — dropping it would
+        # leave session.savedQueueId dangling and un-highlight the playing queue.
+        if self.session.saved_queue_id:
+            keep.add(self.session.saved_queue_id)
         for rid in [r for r in self.saved_queues if r not in keep]:
             del self.saved_queues[rid]
+
+    def _tombstone(self, rid: str) -> None:
+        """Remember a deletion so a client's stale local copy can't re-add it."""
+        self.deleted_saved_queues[rid] = int(time.time() * 1000)
+        if len(self.deleted_saved_queues) > TOMBSTONE_MAX:
+            for old in sorted(self.deleted_saved_queues,
+                              key=lambda k: self.deleted_saved_queues[k],
+                              )[:len(self.deleted_saved_queues) - TOMBSTONE_MAX]:
+                del self.deleted_saved_queues[old]
 
     def _upsert_saved_queue(self, rid: str, kind: str, name: Optional[str],
                             server_id: Optional[str] = None) -> None:
@@ -371,8 +410,11 @@ class Hub:
         # Kind/name are established when the queue is BORN. A refresh (re-publish of the
         # same id — a reporter republish, or a device adopting then republishing the same
         # queue) must NOT clobber them, so a client republishing needn't know the kind.
-        kind_final = prev.get("sourceKind", kind) if prev else kind
-        name_final = prev.get("sourceName") if prev else name
+        # But an established value only wins if it EXISTS: freezing a null at birth would
+        # make the hole permanent, and a client that learns the real name a moment later
+        # (Navic publishes before its collection metadata resolves) could never fill it.
+        kind_final = (prev or {}).get("sourceKind") or kind or "manual"
+        name_final = (prev or {}).get("sourceName") or name
         self.saved_queues[rid] = {
             "id": rid,
             "serverId": server_id if server_id is not None else (prev or {}).get("serverId"),
@@ -407,6 +449,7 @@ class Hub:
         rec["songs"] = list(s.queue)
         rec["songCount"] = len(s.queue)
         rec["currentIndex"] = s.index
+        rec["positionMs"] = s.position_ms
         rec["updatedAt"] = int(time.time() * 1000)
 
     def _touch_saved_queue_progress(self) -> None:
@@ -420,18 +463,56 @@ class Hub:
         rec["positionMs"] = self.session.position_ms
         rec["updatedAt"] = int(time.time() * 1000)
 
+    # Fields a client is allowed to contribute through syncSavedQueues. Anything else
+    # (including a stray `token`) is dropped rather than stored and rebroadcast.
+    SQ_FIELDS = ("id", "serverId", "songs", "songCount", "currentIndex", "positionMs",
+                 "sourceKind", "sourceName", "name", "shuffle", "shuffleMode", "repeat",
+                 "createdAt", "updatedAt")
+
     def _merge_saved_queues(self, incoming: list[dict]) -> bool:
-        """Union-merge client-supplied offline history by id (newest updatedAt wins).
-        Returns True if anything changed."""
+        """Union-merge client-supplied offline history by id (newest updatedAt wins),
+        field by field. Returns True if anything changed.
+
+        Field-level rather than wholesale replace: a client's copy of a record can be
+        missing metadata the hub has (name/sourceName/cover), and a newer updatedAt
+        from an unrelated edit shouldn't erase it.
+        """
         changed = False
-        for rec in incoming:
-            rid = rec.get("id")
-            if not rid or not rec.get("songs"):
+        for raw in incoming[:SAVED_QUEUES_MAX * 2]:
+            if not isinstance(raw, dict):
                 continue
+            rid = raw.get("id")
+            if not rid or not raw.get("songs"):
+                continue
+            if rid in self.deleted_saved_queues:
+                continue  # deleted on the hub; the client's copy is stale
+            rec = {k: raw[k] for k in self.SQ_FIELDS if k in raw}
+            if "coverImageUrl" in raw:
+                rec["coverImageUrl"] = raw["coverImageUrl"]
             cur = self.saved_queues.get(rid)
-            if cur is None or rec.get("updatedAt", 0) > cur.get("updatedAt", 0):
+            if cur is None:
                 self.saved_queues[rid] = rec
                 changed = True
+                continue
+            # The live session's record is authoritative — never let an offline copy
+            # overwrite the queue that's playing right now.
+            if rid == self.session.saved_queue_id:
+                continue
+            if rec.get("updatedAt", 0) <= cur.get("updatedAt", 0):
+                # Older overall, but it may still fill holes the hub has.
+                for k in ("sourceName", "name", "coverImageUrl", "serverId"):
+                    if cur.get(k) in (None, "") and rec.get(k):
+                        cur[k] = rec[k]
+                        changed = True
+                continue
+            merged = dict(cur)
+            merged.update(rec)
+            # Never let a newer-but-emptier copy blank out established metadata.
+            for k in ("sourceName", "name", "coverImageUrl", "serverId"):
+                if not merged.get(k) and cur.get(k):
+                    merged[k] = cur[k]
+            self.saved_queues[rid] = merged
+            changed = True
         if changed:
             self._evict_saved_queues()
         return changed
@@ -530,6 +611,15 @@ class Hub:
     # ----- connection lifecycle -------------------------------------------- #
     async def handler(self, ws: Any) -> None:
         dev: Optional[Device] = None
+        # PROTOCOL §2: clients connect to /connect. `/` is still accepted (older
+        # builds of both clients used it) but logged so it can be retired.
+        path = (getattr(ws, "request", None) and ws.request.path) or getattr(ws, "path", "/")
+        path = (path or "/").split("?")[0].rstrip("/") or "/"
+        if path not in ("/connect", "/"):
+            await ws.close(4004, "bad path")
+            return
+        if path == "/":
+            dlog("client connected on deprecated path '/'; use /connect")
         try:
             # First frame MUST be hello + valid token.
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
@@ -582,16 +672,19 @@ class Hub:
         # Without this, a reconnect while the old WS is still half-open leaves
         # two sockets bound to one Device, both driving session state.
         old_ws = dev.ws
+        dev.name = desc.get("name", dev.name)
+        dev.platform = desc.get("platform", dev.platform)
+        dev.caps = desc.get("caps", dev.caps)
+        dev.online = True
+        # Adopt the new socket BEFORE awaiting the old one's close: _disconnect bails
+        # unless it owns dev.ws, so claiming it first is what stops the superseded
+        # socket's teardown from marking the device offline / clearing the active slot.
+        dev.ws = ws
         if old_ws is not None and old_ws is not ws:
             try:
                 await old_ws.close(4003, "superseded")
             except Exception:  # noqa: BLE001 — best-effort; its finally still runs
                 pass
-        dev.name = desc.get("name", dev.name)
-        dev.platform = desc.get("platform", dev.platform)
-        dev.caps = desc.get("caps", dev.caps)
-        dev.online = True
-        dev.ws = ws
         dev.last_seen = int(time.time() * 1000)
         self._save()
         return dev
@@ -615,6 +708,9 @@ class Hub:
         # device that is genuinely still playing re-claims active via its reporter on
         # reconnect, so this doesn't disrupt a brief network blip.
         if self.session.active_device_id == dev.id:
+            # Flush the resume cursor unthrottled: this device's last report IS the
+            # final position, and after the clear below nothing else will write it.
+            self._touch_saved_queue_progress()
             self.session.is_playing = False
             self.session.active_device_id = None
             self.session.bump()
@@ -634,15 +730,36 @@ class Hub:
             # apply it atomically, AND de-authorize the device immediately so a
             # straggler report (e.g. a cast device's stop() emitting position 0)
             # can't clobber the resume point before the transfer completes.
+            # Only the current active device (or one we're actively awaiting a
+            # handoff from) may speak here: a late/duplicate `released` from a
+            # device that handed off two transfers ago would otherwise rewind the
+            # session to that device's ancient position.
+            fut = dev.release_future
+            authoritative = self.session.active_device_id == dev.id or fut is not None
+            if not authoritative:
+                dlog(f"RELEASED from {dev.name}/{dev.id[:8]} IGNORED (not active, no pending release)")
+                return
+            changed = False
             if "positionMs" in msg:
-                self.session.position_ms = int(msg["positionMs"])
+                pos = max(0, int(msg["positionMs"]))
+                if pos != self.session.position_ms:
+                    self.session.position_ms = pos
+                    changed = True
             if "index" in msg:
-                self.session.index = int(msg["index"])
+                idx = self._clamp_index(int(msg["index"]))
+                if idx != self.session.index:
+                    self.session.index = idx
+                    changed = True
             if self.session.active_device_id == dev.id:
                 self.session.active_device_id = None
-            fut = dev.release_future
+                changed = True
             if fut and not fut.done():
                 fut.set_result(True)
+            elif changed:
+                # No transfer in flight to broadcast on our behalf — publish it.
+                self.session.bump()
+                await self._broadcast_session()
+                await self._broadcast_devices()
         elif t == "ping":
             await self._send(dev, {"t": "pong"})
         # 'do'/'session'/'progress' are hub-authored; ignore if a client sends them.
@@ -659,17 +776,24 @@ class Hub:
             # Within the grace window, reject a report that sits closer to where we
             # just left than to where we intend to be — that's a stale tick. A report
             # near (or past) the new target is real progress and is accepted.
-            report_pos = int(msg["positionMs"])
+            report_pos = max(0, int(msg["positionMs"]))
             target = self.session.position_ms
+            # "Stale" means the report still sits essentially AT the position we just
+            # left. A relative compare (closer-to-pre than to-target) wrongly rejected
+            # legitimate reports after a backward seek, where real progress from the
+            # new target is still nearer the old spot than the target is.
             stale = (now - self._position_intent_at < INTENT_GRACE
-                     and abs(report_pos - self._pre_intent_position) < abs(report_pos - target))
+                     and abs(report_pos - self._pre_intent_position) < 1500
+                     and abs(report_pos - target) >= 1500)
             if not stale:
                 self.session.position_ms = report_pos
             else:
                 dlog(f"REPORT pos={report_pos} from {dev.name}/{dev.id[:8]} "
                      f"IGNORED(pos-grace; pre={self._pre_intent_position} target={target})")
-        if "index" in msg and msg["index"] != self.session.index:
-            self.session.index = int(msg["index"]); changed = True
+        if "index" in msg:
+            idx = self._clamp_index(int(msg["index"]))
+            if idx != self.session.index:
+                self.session.index = idx; changed = True
         if "isPlaying" in msg and msg["isPlaying"] != self.session.is_playing:
             # A report may have been sent BEFORE the receiver processed a fresh
             # play/pause command — accepting it would flip the user's intent
@@ -697,6 +821,12 @@ class Hub:
             self.session.bump()
             await self._broadcast_session()
         else:
+            # Position-only ticks don't bump/broadcast the session, so without this the
+            # persisted position only advances on the next real state change — a hub
+            # kill mid-track would resume from wherever the track started.
+            if now - self._last_position_save_at >= POSITION_SAVE_THROTTLE:
+                self._last_position_save_at = now
+                self._save()
             if now - self._last_progress_sent >= PROGRESS_THROTTLE:
                 self._last_progress_sent = now
                 await self._broadcast({"t": "progress",
@@ -714,9 +844,19 @@ class Hub:
              f"| pre is_playing={s.is_playing}")
 
         # Promote the sender to active when there's nothing playing yet.
+        promoted = False
         if active is None and action in ("play", "setQueue"):
             s.active_device_id = active = dev.id
+            promoted = True
             await self._broadcast_devices()
+
+        # Acts that only make sense against a live receiver. We still apply the intent
+        # (so the session stays coherent and clients mirror it), but the sender is told
+        # the directive went nowhere instead of it vanishing silently.
+        if active is None and action in ("pause", "playpause", "next", "previous",
+                                         "jump", "seek", "volume"):
+            await self._send(dev, {"t": "error", "code": "no_active_device",
+                                   "message": f"{action}: no device is currently active"})
 
         if action == "setQueue":
             # Flush where we left the OUTGOING queue before it becomes "previous".
@@ -730,11 +870,19 @@ class Hub:
             # Saved-queue identity: adopt the client's id (or mint one) and record it as
             # the current history entry. Re-publishing the SAME id (e.g. a reporter
             # re-publish) just refreshes that record rather than forking a new one.
-            s.saved_queue_id = msg.get("savedQueueId") or self._mint_saved_queue_id()
-            s.source_kind = msg.get("sourceKind", "manual")
-            s.source_name = msg.get("sourceName")
-            self._upsert_saved_queue(s.saved_queue_id, s.source_kind, s.source_name,
-                                     server_id=msg.get("serverId"))
+            # An empty queue gets no history record — minting one here would leave
+            # session.savedQueueId pointing at a record _upsert_saved_queue refuses
+            # to create, which then reads as "nothing is playing" forever.
+            if s.queue:
+                s.saved_queue_id = msg.get("savedQueueId") or self._mint_saved_queue_id()
+                s.source_kind = msg.get("sourceKind") or "manual"
+                s.source_name = msg.get("sourceName")
+                self._upsert_saved_queue(s.saved_queue_id, s.source_kind, s.source_name,
+                                         server_id=msg.get("serverId"))
+            else:
+                s.saved_queue_id = None
+                s.source_kind = "manual"
+                s.source_name = None
             s.bump()
             # Only push a load to the active receiver if it ISN'T the device that
             # sent the queue. When a device publishes the queue it's already
@@ -767,10 +915,16 @@ class Hub:
             await self._broadcast_saved_queues()
 
         elif action == "clear":
+            # Flush where we left off BEFORE detaching, so the cleared queue stays
+            # resumable from the history, then stop pointing the live session at it.
+            self._touch_saved_queue_progress()
             s.queue = []
             s.index = 0
             s.position_ms = 0
             s.is_playing = False
+            s.saved_queue_id = None
+            s.source_kind = "manual"
+            s.source_name = None
             self._mark_play_intent()
             self._rebuild_order()
             s.bump()
@@ -778,6 +932,7 @@ class Hub:
             # so an emptied queue needs its own command to actually stop the device.
             await self._send_to(active, {"t": "do", "cmd": "clear"})
             await self._broadcast_session()
+            await self._broadcast_saved_queues()
 
         elif action in ("remove", "move"):
             # Removing the CURRENT track leaves s.index pointing at what was the next
@@ -829,7 +984,16 @@ class Hub:
 
         elif action == "play":
             s.is_playing = True; self._mark_play_intent(); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "play"})
+            if promoted and s.queue:
+                # The sender just took over an orphaned session (e.g. the previous
+                # device was force-stopped). It has no idea what the session holds, so
+                # a bare do:play would resume ITS own stale local queue/position —
+                # hand it the session's queue + resume point instead (PROTOCOL §5.1).
+                await self._send_to(active, {"t": "do", "cmd": "load",
+                                             "tracks": s.queue, "index": s.index,
+                                             "positionMs": s.position_ms, "play": True})
+            else:
+                await self._send_to(active, {"t": "do", "cmd": "play"})
             await self._broadcast_session()
 
         elif action == "pause":
@@ -879,13 +1043,21 @@ class Hub:
 
         elif action == "volume":
             level = max(0, min(100, int(msg.get("level", 100))))
-            if active:
-                self.devices[active].volume = level
+            active_dev = self.devices.get(active) if active else None
+            if active_dev is not None:
+                active_dev.volume = level
             await self._send_to(active, {"t": "do", "cmd": "setVolume", "level": level})
             await self._broadcast_devices()
 
         elif action in ("favorite", "rating"):
-            await self._send_to(active, {"t": "do", **{k: v for k, v in msg.items() if k != "t"}})
+            # Relay a purpose-built directive with whitelisted fields only — echoing
+            # the raw act back would forward the sender's auth token to the receiver.
+            relay = {"t": "do", "cmd": action, "id": msg.get("id")}
+            if action == "favorite":
+                relay["favorite"] = bool(msg.get("favorite", True))
+            else:
+                relay["rating"] = max(0, min(5, int(msg.get("rating", 0))))
+            await self._send_to(active, relay)
 
         elif action == "transfer":
             await self._transfer(msg.get("target"), msg.get("play"))
@@ -902,6 +1074,13 @@ class Hub:
             rid = msg.get("id")
             if rid and rid in self.saved_queues:
                 del self.saved_queues[rid]
+                self._tombstone(rid)
+                if s.saved_queue_id == rid:
+                    # Otherwise _sync_current_saved_queue re-creates it on the next
+                    # queue edit and the deleted row reappears.
+                    s.saved_queue_id = None
+                    s.bump()
+                    await self._broadcast_session()
                 await self._broadcast_saved_queues()
 
         elif action == "syncSavedQueues":
@@ -922,6 +1101,11 @@ class Hub:
             await self._broadcast({"t": "error", "code": "target_offline",
                                    "message": "target device is not connected"})
             return
+        if "receiver" not in (target.caps or []):
+            await self._send(target, {"t": "error", "code": "not_a_receiver",
+                                      "message": "target device cannot play audio"})
+            log(f"transfer rejected: {target.name} has no 'receiver' cap")
+            return
 
         # Default: preserve the play state (Spotify behaviour — transferring a
         # paused session keeps it paused). Captured BEFORE release, because the
@@ -930,8 +1114,22 @@ class Hub:
             play = s.is_playing
 
         old_id = s.active_device_id
-        if old_id and old_id != target_id and self.devices.get(old_id, Device("x")).online:
-            old = self.devices[old_id]
+        if old_id == target_id:
+            # Transferring to the device that's already active. A do:load here would
+            # reload it at session.position_ms, which lags the live position by up to a
+            # report interval — i.e. the "transfer to myself rewinds playback" bug. At
+            # most nudge play-state; otherwise this is a no-op.
+            if play != s.is_playing:
+                s.is_playing = play
+                self._mark_play_intent()
+                s.bump()
+                await self._send(target, {"t": "do", "cmd": "play" if play else "pause"})
+                await self._broadcast_session()
+            log(f"transfer -> {target.name}: already active, no-op")
+            return
+
+        old = self.devices.get(old_id) if old_id else None
+        if old is not None and old.online:
             fut = asyncio.get_running_loop().create_future()
             old.release_future = fut
             await self._send(old, {"t": "do", "cmd": "release"})
