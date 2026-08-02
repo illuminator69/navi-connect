@@ -399,7 +399,8 @@ class Hub:
                 del self.deleted_saved_queues[old]
 
     def _upsert_saved_queue(self, rid: str, kind: str, name: Optional[str],
-                            server_id: Optional[str] = None) -> None:
+                            server_id: Optional[str] = None,
+                            cover_image_url: Optional[str] = None) -> None:
         """Create/refresh the record for [rid] from the current live queue. Preserves a
         user-assigned name and the original createdAt across refreshes."""
         s = self.session
@@ -415,6 +416,9 @@ class Hub:
         # (Navic publishes before its collection metadata resolves) could never fill it.
         kind_final = (prev or {}).get("sourceKind") or kind or "manual"
         name_final = (prev or {}).get("sourceName") or name
+        # Same rule for the card art: frozen at the queue's origin, so it doesn't
+        # change as playback moves through the queue.
+        cover_final = (prev or {}).get("coverImageUrl") or cover_image_url
         self.saved_queues[rid] = {
             "id": rid,
             "serverId": server_id if server_id is not None else (prev or {}).get("serverId"),
@@ -424,6 +428,7 @@ class Hub:
             "positionMs": s.position_ms,
             "sourceKind": kind_final,
             "sourceName": name_final,
+            "coverImageUrl": cover_final,
             "name": (prev or {}).get("name"),   # user rename survives a refresh
             "shuffle": s.shuffle,
             "repeat": s.repeat,
@@ -466,8 +471,8 @@ class Hub:
     # Fields a client is allowed to contribute through syncSavedQueues. Anything else
     # (including a stray `token`) is dropped rather than stored and rebroadcast.
     SQ_FIELDS = ("id", "serverId", "songs", "songCount", "currentIndex", "positionMs",
-                 "sourceKind", "sourceName", "name", "shuffle", "shuffleMode", "repeat",
-                 "createdAt", "updatedAt")
+                 "sourceKind", "sourceName", "coverImageUrl", "name", "shuffle",
+                 "shuffleMode", "repeat", "createdAt", "updatedAt")
 
     def _merge_saved_queues(self, incoming: list[dict]) -> bool:
         """Union-merge client-supplied offline history by id (newest updatedAt wins),
@@ -487,8 +492,6 @@ class Hub:
             if rid in self.deleted_saved_queues:
                 continue  # deleted on the hub; the client's copy is stale
             rec = {k: raw[k] for k in self.SQ_FIELDS if k in raw}
-            if "coverImageUrl" in raw:
-                rec["coverImageUrl"] = raw["coverImageUrl"]
             cur = self.saved_queues.get(rid)
             if cur is None:
                 self.saved_queues[rid] = rec
@@ -878,7 +881,8 @@ class Hub:
                 s.source_kind = msg.get("sourceKind") or "manual"
                 s.source_name = msg.get("sourceName")
                 self._upsert_saved_queue(s.saved_queue_id, s.source_kind, s.source_name,
-                                         server_id=msg.get("serverId"))
+                                         server_id=msg.get("serverId"),
+                                         cover_image_url=msg.get("coverImageUrl"))
             else:
                 s.saved_queue_id = None
                 s.source_kind = "manual"

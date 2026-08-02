@@ -39,6 +39,9 @@ class Client:
         self.online = {}         # id -> online from devices/welcome
         self.saved_queue_id = None   # latest session.savedQueueId
         self.saved_queues = []       # latest savedQueues broadcast (or welcome)
+        self.position = None         # latest session.positionMs
+        self.dos = []                # every `do` directive received
+        self.errors = []             # every `error` frame received
 
     async def connect(self, url=URL):
         self.ws = await websockets.connect(url)
@@ -55,6 +58,7 @@ class Client:
         self.active = s.get("activeDeviceId")
         self.is_playing = s.get("isPlaying")
         self.saved_queue_id = s.get("savedQueueId")
+        self.position = s.get("positionMs")
 
     async def _loop(self):
         try:
@@ -73,6 +77,10 @@ class Client:
                 elif t == "devices":
                     for d in msg.get("devices", []):
                         self.online[d["id"]] = d["online"]
+                elif t == "do":
+                    self.dos.append(msg)
+                elif t == "error":
+                    self.errors.append(msg)
         except websockets.ConnectionClosed:
             pass
 
@@ -81,6 +89,12 @@ class Client:
 
     async def report(self, **kw):
         await self.ws.send(json.dumps({"t": "report", **kw}))
+
+    async def send(self, **kw):
+        await self.ws.send(json.dumps(kw))
+
+    def last_do(self, cmd):
+        return next((d for d in reversed(self.dos) if d.get("cmd") == cmd), None)
 
 
 def expected_after_remove(order, at):
@@ -241,15 +255,36 @@ async def test_saved_queues():
         # setQueue with an explicit id + kind → one record, current, tracks captured.
         tracks = [{"id": f"t{i}", "title": f"T{i}"} for i in range(4)]
         await r.act(action="setQueue", tracks=tracks, index=0, play=True,
-                    savedQueueId="q1", sourceKind="album", sourceName="Album One")
+                    savedQueueId="q1", sourceKind="album", sourceName="Album One",
+                    coverImageUrl="http://cover/one.jpg")
         await asyncio.sleep(0.3)
         q1 = rec(c, "q1")
         if q1 is None:
             failures.append(f"setQueue didn't create a saved-queue record: {c.saved_queues}")
         elif q1["songCount"] != 4 or q1["sourceKind"] != "album":
             failures.append(f"record fields wrong: {q1}")
+        elif q1.get("coverImageUrl") != "http://cover/one.jpg":
+            failures.append(f"cover not stored on the record: {q1}")
         if c.saved_queue_id != "q1":
             failures.append(f"session.savedQueueId not set: {c.saved_queue_id!r}")
+
+        # A reorder of the SAME session republishes the same id: the record is refreshed
+        # in place (no fork), and its frozen identity — name, kind, cover — survives even
+        # though the republish carries different/blank values.
+        reordered = [tracks[2], tracks[0], tracks[3], tracks[1]]
+        await r.act(action="setQueue", tracks=reordered, index=0, play=True,
+                    savedQueueId="q1", sourceKind="manual", sourceName=None,
+                    coverImageUrl="http://cover/other.jpg")
+        await asyncio.sleep(0.3)
+        if len([x for x in c.saved_queues if x["id"] == "q1"]) != 1:
+            failures.append("reorder forked a second record for the same session")
+        q1r = rec(c, "q1")
+        if q1r is None or q1r["sourceName"] != "Album One" or q1r["sourceKind"] != "album":
+            failures.append(f"reorder clobbered the frozen name/kind: {q1r}")
+        elif q1r.get("coverImageUrl") != "http://cover/one.jpg":
+            failures.append(f"reorder clobbered the frozen cover: {q1r}")
+        elif [t["id"] for t in q1r["songs"]] != [t["id"] for t in reordered]:
+            failures.append(f"reorder didn't refresh the record's tracks: {q1r}")
 
         # enqueue → SAME record grows (no new id minted).
         await c.act(action="enqueue", tracks=[{"id": "t4", "title": "T4"}], at="end")
@@ -307,7 +342,158 @@ async def test_saved_queues():
     print("PASS - saved-queue history: record/enqueue-grow/second-record/merge/delete/rename")
 
 
+async def test_audit_fixes():
+    """Regressions for the 2026-07-26 audit fixes:
+
+    takeover sends do:load (not a bare do:play) · self-transfer is a no-op ·
+    a late/spurious `released` is ignored · a null source name is backfilled by a
+    later publish · the current record survives eviction · `clear` detaches the
+    session from its record · a deleted record stays deleted across a client re-sync.
+    """
+    port = 4801
+    url = f"ws://localhost:{port}"
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
+           "HUB_HEALTH_PORT": str(port + 1)}
+    hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
+                           cwd=os.path.join(os.path.dirname(__file__), ".."))
+    failures = []
+
+    def rec(client, rid):
+        return next((r for r in client.saved_queues if r["id"] == rid), None)
+
+    try:
+        await asyncio.sleep(1.2)
+        r = Client("Recv", device_id="recv")
+        r2 = Client("Recv2", device_id="recv2")
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await r.connect(url); await r2.connect(url); await c.connect(url)
+
+        tracks = [{"id": f"t{i}", "title": f"T{i}"} for i in range(4)]
+
+        # ----- name backfill ------------------------------------------------ #
+        # Born without a name (Navic publishes before its collection metadata
+        # resolves); a later publish of the SAME id must be able to fill the hole.
+        await r.act(action="setQueue", tracks=tracks, index=0, play=True,
+                    savedQueueId="q1", sourceKind="album")
+        await asyncio.sleep(0.3)
+        await r.act(action="setQueue", tracks=tracks, index=0, play=True,
+                    savedQueueId="q1", sourceKind="album", sourceName="Album One")
+        await asyncio.sleep(0.3)
+        q1 = rec(c, "q1")
+        if q1 is None or q1.get("sourceName") != "Album One":
+            failures.append(f"null sourceName wasn't backfilled by a later publish: {q1}")
+
+        # An established name still wins over a later null.
+        await r.act(action="setQueue", tracks=tracks, index=0, play=True,
+                    savedQueueId="q1", sourceKind="album")
+        await asyncio.sleep(0.3)
+        if (rec(c, "q1") or {}).get("sourceName") != "Album One":
+            failures.append("a later null publish clobbered an established sourceName")
+
+        # ----- current record is never evicted ------------------------------ #
+        now = int(time.time() * 1000)
+        await c.act(action="syncSavedQueues", queues=[
+            {"id": f"bulk{i}", "songs": [{"id": "z"}], "songCount": 1, "currentIndex": 0,
+             "positionMs": 0, "sourceKind": "manual", "updatedAt": now + i}
+            for i in range(24)
+        ])
+        await asyncio.sleep(0.4)
+        if rec(c, "q1") is None:
+            failures.append("the current (playing) record was evicted by a bulk sync")
+
+        # ----- transfer sends the receiver a load --------------------------- #
+        await r2.report(positionMs=1000, index=0, isPlaying=True)  # ignored: not active
+        await c.act(action="transfer", target="recv2")
+        # > RELEASE_TIMEOUT: this Client never answers do:release, so the handoff
+        # completes on the timeout path. Waiting it out also means the `released`
+        # frame sent below is genuinely late (no pending release_future).
+        await asyncio.sleep(2.0)
+        if r2.last_do("load") is None:
+            failures.append(f"transfer didn't send do:load to the target: {r2.dos}")
+
+        # r2 is the active receiver; establish a real playback position.
+        await r2.report(positionMs=45_000, index=0, isPlaying=True)
+        await asyncio.sleep(0.4)
+
+        # ----- late/spurious `released` is ignored -------------------------- #
+        # `r` handed off already; a straggler frame from it must not rewind the session.
+        await r.send(t="released", positionMs=999_999, index=3)
+        await asyncio.sleep(0.4)
+        probe = Client("Probe", device_id="probe", caps=["controller"])
+        await probe.connect(url)
+        await asyncio.sleep(0.3)
+        if probe.position == 999_999 or probe.active != "recv2":
+            failures.append(f"late `released` was honoured: pos={probe.position} active={probe.active}")
+
+        # ----- self-transfer is a no-op ------------------------------------- #
+        before = len(r2.dos)
+        await c.act(action="transfer", target="recv2", play=True)
+        await asyncio.sleep(0.5)
+        new_loads = [d for d in r2.dos[before:] if d.get("cmd") == "load"]
+        if new_loads:
+            failures.append(f"transfer to the already-active device reloaded it: {new_loads}")
+
+        # ----- takeover of an orphaned session gets do:load ------------------ #
+        await r2.ws.close()          # force-stop: active device vanishes
+        await asyncio.sleep(0.5)
+        r3 = Client("Recv3", device_id="recv3")
+        await r3.connect(url)
+        await r3.act(action="play")
+        await asyncio.sleep(0.5)
+        load = r3.last_do("load")
+        if load is None:
+            failures.append(f"takeover sent no do:load (bare do:play?): {r3.dos}")
+        elif load.get("positionMs") != 45_000:
+            failures.append(f"takeover load didn't carry the session position: {load.get('positionMs')}")
+
+        # ----- clear detaches the session from its record -------------------- #
+        await c.act(action="clear")
+        await asyncio.sleep(0.4)
+        if c.saved_queue_id is not None:
+            failures.append(f"clear left session.savedQueueId set: {c.saved_queue_id!r}")
+        if rec(c, "q1") is None:
+            failures.append("clear deleted the history record (it should stay resumable)")
+
+        # ----- delete is tombstoned ------------------------------------------ #
+        await c.act(action="deleteSavedQueue", id="q1")
+        await asyncio.sleep(0.3)
+        if rec(c, "q1") is not None:
+            failures.append("deleteSavedQueue left the record behind")
+        await c.act(action="syncSavedQueues", queues=[{
+            "id": "q1", "songs": [{"id": "t0"}], "songCount": 1, "currentIndex": 0,
+            "positionMs": 0, "sourceKind": "album", "updatedAt": int(time.time() * 1000) + 5000,
+        }])
+        await asyncio.sleep(0.4)
+        if rec(c, "q1") is not None:
+            failures.append("a client re-sync resurrected a deleted record (no tombstone)")
+
+        # ----- transfer to a controller-only device is rejected --------------- #
+        before_ctl = len(c.dos)
+        await c.act(action="transfer", target="ctl")
+        await asyncio.sleep(0.4)
+        if [d for d in c.dos[before_ctl:] if d.get("cmd") == "load"]:
+            failures.append("transferred to a device without the 'receiver' cap")
+    finally:
+        hub.terminate()
+        try:
+            hub.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            hub.kill()
+        os.unlink(state)
+
+    if failures:
+        print("FAIL (audit fixes):")
+        for f in failures:
+            print("  -", f)
+        sys.exit(1)
+    print("PASS - audit fixes: takeover-load/self-transfer-noop/late-released/"
+          "name-backfill/eviction-exempt/clear-detach/tombstone/receiver-cap")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
     asyncio.run(test_prune())
     asyncio.run(test_saved_queues())
+    asyncio.run(test_audit_fixes())
