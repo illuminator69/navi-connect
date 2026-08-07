@@ -64,6 +64,11 @@ MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
 TOMBSTONE_MAX = 200  # remembered saved-queue deletions (so a client re-sync can't resurrect)
+SAVED_QUEUE_SONGS_MAX = 1000  # per-record track cap for CLIENT-SUPPLIED history (syncSavedQueues)
+# Reload ceiling. Records the hub built itself from a live queue are uncapped (the session
+# queue is), so re-reading state.json must not truncate one — this is only a sanity bound.
+SAVED_QUEUE_SONGS_HARD_MAX = 20000
+SQ_STR_MAX = 512  # longest accepted string field inside a client-supplied saved-queue record
 POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
 
 # --- AudioMuse proxy tuning ---
@@ -86,6 +91,34 @@ def dlog(*a: Any) -> None:
     """Verbose diagnostic log, gated behind HUB_DEBUG (chatty at 1 Hz)."""
     if DEBUG:
         log(*a)
+
+
+# --------------------------------------------------------------------------- #
+# Coercion helpers for client-supplied data
+#
+# Everything a client sends is untrusted JSON, but saved-queue records are the one
+# payload the hub *stores and re-broadcasts verbatim*: a bad value doesn't just fail
+# one act, it lands in state.json and then breaks every later _save(). Hence coerce
+# on the way in rather than validating at the point of use.
+# --------------------------------------------------------------------------- #
+def _as_int(v: Any, default: int = 0, lo: Optional[int] = None,
+            hi: Optional[int] = None) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = default
+    if lo is not None and n < lo:
+        n = lo
+    if hi is not None and n > hi:
+        n = hi
+    return n
+
+
+def _as_str(v: Any, max_len: int = SQ_STR_MAX) -> Optional[str]:
+    """A string or None — never a number/dict/list that would surprise a client renderer."""
+    if not isinstance(v, str):
+        return None
+    return v[:max_len]
 
 
 # --------------------------------------------------------------------------- #
@@ -531,10 +564,12 @@ class Hub:
                 source_name=s.get("sourceName"),
             )
             # Saved-queue history (rolling, capped). Keyed by id for cheap upsert.
+            # Re-sanitised on the way in so a state.json written by an older build (which
+            # stored client values verbatim) can't keep breaking _save() forever.
             for rec in data.get("savedQueues", []):
-                rid = rec.get("id")
-                if rid:
-                    self.saved_queues[rid] = rec
+                clean = self._sanitize_saved_queue(rec, SAVED_QUEUE_SONGS_HARD_MAX)
+                if clean is not None:
+                    self.saved_queues[clean["id"]] = clean
             for rid, at in (data.get("deletedSavedQueues") or {}).items():
                 try:
                     self.deleted_saved_queues[rid] = int(at)
@@ -584,17 +619,19 @@ class Hub:
         }
 
     def _save(self) -> None:
-        data = {
-            "session": self.session.snapshot(),
-            "savedQueues": self._saved_queues_list(),
-            "deletedSavedQueues": self.deleted_saved_queues,
-            "devices": [
-                {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
-                 "volume": d.volume, "lastSeen": d.last_seen}
-                for d in self.devices.values()
-            ],
-        }
         try:
+            # Built inside the try: _saved_queues_list() sorts records, and a persistence
+            # failure must not escape into whichever act handler happened to trigger it.
+            data = {
+                "session": self.session.snapshot(),
+                "savedQueues": self._saved_queues_list(),
+                "deletedSavedQueues": self.deleted_saved_queues,
+                "devices": [
+                    {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
+                     "volume": d.volume, "lastSeen": d.last_seen}
+                    for d in self.devices.values()
+                ],
+            }
             os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
             tmp = STATE_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -671,8 +708,12 @@ class Hub:
         out (a big offline sync can carry newer rows), so clients never end up with
         a session.savedQueueId that matches nothing in the list they render.
         """
+        # _as_int on the sort key, not r.get(..., 0): a record whose updatedAt is a
+        # string (an older build stored client values unsanitised) would otherwise raise
+        # TypeError here — and this runs inside _save(), so one bad row would break
+        # persistence for the whole hub.
         ordered = sorted(self.saved_queues.values(),
-                         key=lambda r: r.get("updatedAt", 0), reverse=True)
+                         key=lambda r: _as_int(r.get("updatedAt")), reverse=True)
         out = ordered[:SAVED_QUEUES_MAX]
         cur_id = self.session.saved_queue_id
         if cur_id and not any(r.get("id") == cur_id for r in out):
@@ -689,8 +730,12 @@ class Hub:
         # leave session.savedQueueId dangling and un-highlight the playing queue.
         if self.session.saved_queue_id:
             keep.add(self.session.saved_queue_id)
-        for rid in [r for r in self.saved_queues if r not in keep]:
+        dropped = [r for r in self.saved_queues if r not in keep]
+        for rid in dropped:
             del self.saved_queues[rid]
+        if dropped:
+            log(f"saved-queue eviction dropped {len(dropped)} record(s), "
+                f"{len(self.saved_queues)} kept")
 
     def _tombstone(self, rid: str) -> None:
         """Remember a deletion so a client's stale local copy can't re-add it."""
@@ -701,6 +746,27 @@ class Hub:
                               )[:len(self.deleted_saved_queues) - TOMBSTONE_MAX]:
                 del self.deleted_saved_queues[old]
 
+    def _delete_saved_queue(self, rid: Optional[str]) -> tuple[bool, bool]:
+        """Drop a record and remember the deletion. Returns (changed, detached-live-session).
+
+        Tombstoned unconditionally, even when the hub holds no such record: a client can
+        delete a row it captured offline before the hub ever merged it, and without the
+        tombstone the next syncSavedQueues (from this client or another) re-adds it.
+
+        Callers do the broadcasting, so a batch costs one broadcast rather than N.
+        """
+        if not rid:
+            return (False, False)
+        existed = self.saved_queues.pop(rid, None) is not None
+        first_time = rid not in self.deleted_saved_queues
+        self._tombstone(rid)
+        detached = self.session.saved_queue_id == rid
+        if detached:
+            # Otherwise _sync_current_saved_queue re-creates it on the next queue edit
+            # and the deleted row reappears.
+            self.session.saved_queue_id = None
+        return (existed or detached or first_time, detached)
+
     def _upsert_saved_queue(self, rid: str, kind: str, name: Optional[str],
                             server_id: Optional[str] = None,
                             cover_image_url: Optional[str] = None) -> None:
@@ -708,6 +774,11 @@ class Hub:
         user-assigned name and the original createdAt across refreshes."""
         s = self.session
         if not rid or not s.queue:
+            return
+        # A deleted record stays deleted. The live device may still be publishing the id
+        # it was born with (it only restarts its session when IT did the deleting), so
+        # without this a delete from another device is undone by the next report.
+        if rid in self.deleted_saved_queues:
             return
         now = int(time.time() * 1000)
         prev = self.saved_queues.get(rid)
@@ -777,6 +848,53 @@ class Hub:
                  "sourceKind", "sourceName", "coverImageUrl", "name", "shuffle",
                  "shuffleMode", "repeat", "createdAt", "updatedAt")
 
+    # Same idea one level down: a client-supplied *track* is whitelisted too, so a song
+    # object can't smuggle extra keys into state.json and out to every other device.
+    SQ_TRACK_FIELDS = ("id", "serverId", "title", "artist", "album", "durationMs",
+                       "coverArtId", "imageUrl", "streamUrl", "mime")
+
+    @classmethod
+    def _sanitize_saved_queue(cls, raw: Any,
+                              songs_max: int = SAVED_QUEUE_SONGS_MAX) -> Optional[dict]:
+        """A client-supplied history record, coerced into the shape the hub stores.
+
+        Returns None for anything unusable. Everything that survives is safe to sort,
+        serialize and rebroadcast — which matters because these records are persisted
+        and fanned out to devices that never saw the sender.
+        """
+        if not isinstance(raw, dict):
+            return None
+        rid = _as_str(raw.get("id"), 128)
+        songs_raw = raw.get("songs")
+        if not rid or not isinstance(songs_raw, list) or not songs_raw:
+            return None
+        songs = [
+            {k: t[k] for k in cls.SQ_TRACK_FIELDS if k in t}
+            for t in songs_raw[:songs_max] if isinstance(t, dict)
+        ]
+        if not songs:
+            return None
+        repeat = raw.get("repeat")
+        rec: dict = {
+            "id": rid,
+            "songs": songs,
+            "songCount": len(songs),
+            "currentIndex": _as_int(raw.get("currentIndex"), 0, 0, len(songs) - 1),
+            "positionMs": _as_int(raw.get("positionMs"), 0, 0),
+            "sourceKind": _as_str(raw.get("sourceKind"), 32) or "manual",
+            "shuffle": bool(raw.get("shuffle")),
+            "repeat": repeat if repeat in ("none", "one", "all") else "none",
+            "createdAt": _as_int(raw.get("createdAt"), 0, 0),
+            "updatedAt": _as_int(raw.get("updatedAt"), 0, 0),
+        }
+        # Optional strings: absent rather than null, so the merge's "a hole can be
+        # filled, an established value can't be blanked" rule reads naturally.
+        for k in ("serverId", "sourceName", "coverImageUrl", "name", "shuffleMode"):
+            v = _as_str(raw.get(k))
+            if v is not None:
+                rec[k] = v
+        return rec
+
     def _merge_saved_queues(self, incoming: list[dict]) -> bool:
         """Union-merge client-supplied offline history by id (newest updatedAt wins),
         field by field. Returns True if anything changed.
@@ -786,23 +904,50 @@ class Hub:
         from an unrelated edit shouldn't erase it.
         """
         changed = False
-        for raw in incoming[:SAVED_QUEUES_MAX * 2]:
-            if not isinstance(raw, dict):
+        # One client's offline history can't exceed the whole cap: accepting twice the
+        # cap let a single reconnecting device evict every record the other device is
+        # looking at, including the one its UI was highlighting.
+        for raw in incoming[:SAVED_QUEUES_MAX]:
+            rec = self._sanitize_saved_queue(raw)
+            if rec is None:
                 continue
-            rid = raw.get("id")
-            if not rid or not raw.get("songs"):
-                continue
+            rid = rec["id"]
             if rid in self.deleted_saved_queues:
                 continue  # deleted on the hub; the client's copy is stale
-            rec = {k: raw[k] for k in self.SQ_FIELDS if k in raw}
             cur = self.saved_queues.get(rid)
+            # The live session's record is decided FIRST, before the insert branch below:
+            # after a hub restart that kept session.savedQueueId but lost the record, an
+            # `cur is None` insert would let a stale client copy become the playing queue.
+            if rid == self.session.saved_queue_id:
+                if cur is None:
+                    if self.session.queue:
+                        # Rebuild from what is actually playing, not from the client copy.
+                        self._upsert_saved_queue(rid, self.session.source_kind,
+                                                 self.session.source_name)
+                        cur = self.saved_queues.get(rid)
+                        changed = changed or cur is not None
+                    else:
+                        self.saved_queues[rid] = rec
+                        changed = True
+                        continue
+                if cur is None:
+                    continue
+                # Metadata-only reconciliation: never let an offline copy overwrite the
+                # songs/cursor of the queue that's playing right now. Holes get filled,
+                # and a genuinely newer `name` is accepted — an offline rename of the
+                # CURRENT queue is otherwise the one edit that could never sync back.
+                for k in ("sourceName", "name", "coverImageUrl", "serverId"):
+                    if not cur.get(k) and rec.get(k):
+                        cur[k] = rec[k]
+                        changed = True
+                if rec.get("name") and rec["name"] != cur.get("name") and \
+                        rec.get("updatedAt", 0) > cur.get("updatedAt", 0):
+                    cur["name"] = rec["name"]
+                    changed = True
+                continue
             if cur is None:
                 self.saved_queues[rid] = rec
                 changed = True
-                continue
-            # The live session's record is authoritative — never let an offline copy
-            # overwrite the queue that's playing right now.
-            if rid == self.session.saved_queue_id:
                 continue
             if rec.get("updatedAt", 0) <= cur.get("updatedAt", 0):
                 # Older overall, but it may still fill holes the hub has.
@@ -915,6 +1060,22 @@ class Hub:
         return order[nxt]
 
     # ----- connection lifecycle -------------------------------------------- #
+    @staticmethod
+    async def _close(ws: Any, code: int, reason: str) -> None:
+        """Close a socket, tolerating a peer that has already gone.
+
+        `ws.close()` writes a close frame and drains, so it raises ConnectionClosedError
+        when the peer vanished first — which is the norm for the codes we use it with
+        (a client that sent garbage and hung up, a superseded socket). Raised from
+        inside an `except` block it escapes the handler entirely, and `websockets`
+        logs it as an unhandled error in the connection handler: a scary traceback for
+        the most routine thing a network can do.
+        """
+        try:
+            await ws.close(code, reason)
+        except Exception:  # noqa: BLE001 — closing is best-effort by definition
+            pass
+
     async def handler(self, ws: Any) -> None:
         dev: Optional[Device] = None
         # PROTOCOL §2: clients connect to /connect. `/` is still accepted (older
@@ -922,7 +1083,7 @@ class Hub:
         path = (getattr(ws, "request", None) and ws.request.path) or getattr(ws, "path", "/")
         path = (path or "/").split("?")[0].rstrip("/") or "/"
         if path not in ("/connect", "/"):
-            await ws.close(4004, "bad path")
+            await self._close(ws, 4004, "bad path")
             return
         if path == "/":
             dlog("client connected on deprecated path '/'; use /connect")
@@ -931,7 +1092,7 @@ class Hub:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             msg = json.loads(raw)
             if not isinstance(msg, dict):
-                await ws.close(4002, "protocol")
+                await self._close(ws, 4002, "protocol")
                 return
             token_ok = not TOKEN or hmac.compare_digest(str(msg.get("token") or ""), TOKEN)
             if msg.get("t") != "hello" or not token_ok:
@@ -941,7 +1102,7 @@ class Hub:
                     f"{got[:4]!r}…(len {len(got)}), expected …(len {len(TOKEN)}) — "
                     f"check HUB_TOKEN (note: docker --env-file does NOT strip quotes)")
                 await ws.send(json.dumps({"t": "error", "code": "auth", "message": "bad token"}))
-                await ws.close(4001, "auth")
+                await self._close(ws, 4001, "auth")
                 return
 
             dev = await self._register(msg.get("device", {}), ws)
@@ -961,7 +1122,7 @@ class Hub:
                 except Exception as e:  # noqa: BLE001 — never let one bad frame kill the socket
                     log("message error:", e)
         except (asyncio.TimeoutError, json.JSONDecodeError):
-            await ws.close(4002, "protocol")
+            await self._close(ws, 4002, "protocol")
         except websockets.ConnectionClosed:
             pass
         finally:
@@ -988,7 +1149,7 @@ class Hub:
         dev.ws = ws
         if old_ws is not None and old_ws is not ws:
             try:
-                await old_ws.close(4003, "superseded")
+                await self._close(old_ws, 4003, "superseded")
             except Exception:  # noqa: BLE001 — best-effort; its finally still runs
                 pass
         dev.last_seen = int(time.time() * 1000)
@@ -1180,7 +1341,13 @@ class Hub:
             # session.savedQueueId pointing at a record _upsert_saved_queue refuses
             # to create, which then reads as "nothing is playing" forever.
             if s.queue:
-                s.saved_queue_id = msg.get("savedQueueId") or self._mint_saved_queue_id()
+                requested = _as_str(msg.get("savedQueueId"), 128)
+                if requested and requested in self.deleted_saved_queues:
+                    # Deleted from another device while this one kept playing. Start a
+                    # NEW session rather than resurrect the record the user just removed
+                    # — the hub-side mirror of the client's restartQueueSession().
+                    requested = None
+                s.saved_queue_id = requested or self._mint_saved_queue_id()
                 s.source_kind = msg.get("sourceKind") or "manual"
                 s.source_name = msg.get("sourceName")
                 self._upsert_saved_queue(s.saved_queue_id, s.source_kind, s.source_name,
@@ -1373,28 +1540,60 @@ class Hub:
             rid = msg.get("id")
             rec = self.saved_queues.get(rid) if rid else None
             if rec is not None:
-                rec["name"] = (msg.get("name") or "").strip() or None
+                rec["name"] = (_as_str(msg.get("name")) or "").strip() or None
                 rec["updatedAt"] = int(time.time() * 1000)
                 await self._broadcast_saved_queues()
+            else:
+                # The client has already applied the rename locally, so silence would
+                # leave the two permanently disagreeing with nothing to notice it.
+                await self._send(dev, {"t": "error", "code": "unknown_saved_queue",
+                                       "message": f"no saved queue {rid!r}"})
 
         elif action == "deleteSavedQueue":
-            rid = msg.get("id")
-            if rid and rid in self.saved_queues:
-                del self.saved_queues[rid]
-                self._tombstone(rid)
-                if s.saved_queue_id == rid:
-                    # Otherwise _sync_current_saved_queue re-creates it on the next
-                    # queue edit and the deleted row reappears.
-                    s.saved_queue_id = None
+            changed, detached = self._delete_saved_queue(_as_str(msg.get("id"), 128))
+            if detached:
+                s.bump()
+                await self._broadcast_session()
+            if changed:
+                await self._broadcast_saved_queues()
+
+        elif action == "deleteSavedQueues":
+            # Batched form: clear-all / delete-others used to send one act per row, so
+            # 20 deletions meant 20 full-history broadcasts and 20 state.json rewrites.
+            ids = msg.get("ids")
+            if isinstance(ids, list):
+                changed = False
+                detached = False
+                for raw_id in ids[:SAVED_QUEUES_MAX]:
+                    c, d = self._delete_saved_queue(_as_str(raw_id, 128))
+                    changed = changed or c
+                    detached = detached or d
+                if detached:
                     s.bump()
                     await self._broadcast_session()
-                await self._broadcast_saved_queues()
+                if changed:
+                    await self._broadcast_saved_queues()
 
         elif action == "syncSavedQueues":
             # A (re)connecting client pushes its local/offline history up; union-merge
             # and rebroadcast the reconciled list to everyone.
+            changed = False
+            detached = False
+            # Deletions first: a client that deleted a row while offline still holds it
+            # in `queues` (it can't have re-fetched), so merging first would re-add it.
+            deleted = msg.get("deleted")
+            if isinstance(deleted, list):
+                for raw_id in deleted[:SAVED_QUEUES_MAX]:
+                    c, d = self._delete_saved_queue(_as_str(raw_id, 128))
+                    changed = changed or c
+                    detached = detached or d
             incoming = msg.get("queues")
             if isinstance(incoming, list) and self._merge_saved_queues(incoming):
+                changed = True
+            if detached:
+                s.bump()
+                await self._broadcast_session()
+            if changed:
                 await self._broadcast_saved_queues()
 
         else:
@@ -1561,13 +1760,20 @@ async def main() -> None:
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "
         f"mirror={'on' if MIRROR_PLAYQUEUE and NAVIDROME_URL else 'off'})")
 
-    proxy_protocol = _build_proxy_protocol() if AUDIOMUSE_URL else None
+    # Installed unconditionally — NOT gated on AUDIOMUSE_URL. Without the custom
+    # protocol nothing routes /sonic/*, so the request falls through to the WebSocket
+    # upgrade and the client gets a stock 426 text/plain "Upgrade Required". That is
+    # not JSON, so the clients' Tier-2 probe can't parse it, reads as a hard failure,
+    # and never reaches the "hub has no AudioMuse → fall back to the direct route"
+    # path that SonicProxy.handle's `if not self.enabled` branch exists to trigger.
+    proxy_protocol = _build_proxy_protocol()
     if SONIC.enabled and proxy_protocol is not None:
         log(f"audiomuse proxy on http://{HOST}:{PORT}/sonic/* -> {AUDIOMUSE_URL}")
-    elif AUDIOMUSE_URL:
-        # Still routed (so /sonic/* answers a clean 503 instead of a WS handshake
-        # error), just refusing to forward.
-        log("audiomuse proxy NOT forwarding — see the warning above")
+    elif proxy_protocol is not None:
+        # Routed but not forwarding: /sonic/clap/stats answers {"configured": false}
+        # and everything else a clean 503, so clients demote instead of erroring.
+        log("audiomuse proxy routed but NOT forwarding "
+            f"({'AUDIOMUSE_URL unset' if not AUDIOMUSE_URL else 'HUB_TOKEN empty'})")
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
