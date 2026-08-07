@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import http
 import json
 import os
 import random
 import signal
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -44,6 +46,11 @@ MIRROR_PLAYQUEUE = os.environ.get("HUB_MIRROR_PLAYQUEUE", "true").lower() == "tr
 ND_USER = os.environ.get("HUB_ND_USER", "")
 ND_PASS = os.environ.get("HUB_ND_PASS", "")
 
+# AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
+# the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
+AUDIOMUSE_URL = os.environ.get("AUDIOMUSE_URL", "").rstrip("/")
+AUDIOMUSE_TOKEN = os.environ.get("AUDIOMUSE_TOKEN", "")
+
 DEBUG = os.environ.get("HUB_DEBUG", "").lower() in ("1", "true", "yes")
 
 PING_INTERVAL = 10  # seconds (matches Feishin's heartbeat)
@@ -58,6 +65,17 @@ SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
 TOMBSTONE_MAX = 200  # remembered saved-queue deletions (so a client re-sync can't resurrect)
 POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
+
+# --- AudioMuse proxy tuning ---
+PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls; a hung core must not eat the
+                            # default thread pool and stall the 1 Hz progress fan-out
+PROXY_TIMEOUT = 20          # seconds per upstream socket op (urllib has one knob for
+                            # connect+read); Tier 2 is in-memory lookups, so fail fast
+PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the same
+                            # question cost one upstream call
+PROXY_CACHE_MAX = 64
+PROXY_MAX_BODY = 256 * 1024        # largest client request body accepted
+PROXY_MAX_RESPONSE = 4 * 1024 * 1024
 
 
 def log(*a: Any) -> None:
@@ -163,6 +181,291 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
             r.read()
     except Exception as e:  # noqa: BLE001 — mirror is best-effort
         log("savePlayQueue mirror failed:", e)
+
+
+# --------------------------------------------------------------------------- #
+# AudioMuse-AI Tier-2 proxy  (design: ../DESIGN-hub-audiomuse-proxy.md)
+#
+# Plain HTTP served on the WebSocket port, so the clients reach AudioMuse through
+# the one component that is already authenticated and remotely reachable. They
+# stop holding the AudioMuse base URL, the AudioMuse bearer token and (on the
+# fingerprint call) the Navidrome password.
+#
+# This is a WHITELIST, not a forwarder: HUB_TOKEN is on every device, so a
+# pass-through proxy would hand it AudioMuse's analysis/clustering/embedding
+# admin endpoints. Unknown path or method → 404 with no upstream call; unknown
+# parameters are dropped rather than relayed.
+# --------------------------------------------------------------------------- #
+#   (method, hub path) -> upstream method/path + what may be forwarded
+#     params: allowed query parameters (GET)
+#     body:   allowed top-level JSON body keys (POST)
+#     nd:     inject HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them)
+#     cache:  cacheable for PROXY_CACHE_TTL
+SONIC_ROUTES: dict[tuple[str, str], dict] = {
+    ("GET", "/sonic/fingerprint"): {
+        "method": "GET", "path": "/api/sonic_fingerprint/generate",
+        "params": ("n",), "nd": True, "cache": True,
+    },
+    ("POST", "/sonic/alchemy"): {
+        "method": "POST", "path": "/api/alchemy",
+        "body": ("items", "n", "temperature", "subtract_distance"),
+        # NOT cached: alchemy is stochastic (temperature) and Mood Flow re-asks with
+        # the same add/subtract sets as a session goes on — serving a cached mix would
+        # top the queue up with the exact tracks it just added.
+        "cache": False,
+    },
+    ("POST", "/sonic/clap/search"): {
+        "method": "POST", "path": "/api/clap/search",
+        "body": ("query", "limit"), "cache": True,
+    },
+    ("GET", "/sonic/clap/stats"): {
+        "method": "GET", "path": "/api/clap/stats",
+        "params": (), "cache": True, "probe": True,
+    },
+    ("GET", "/sonic/score"): {
+        "method": "GET", "path": "/get_score",
+        "params": ("id",), "cache": True,
+    },
+}
+
+
+def _sonic_upstream_blocking(method: str, url: str,
+                             body: Optional[bytes]) -> tuple[int, bytes, str]:
+    """One upstream call, off the event loop (same shape as the savePlayQueue mirror).
+
+    Upstream status codes are passed through (503 cold index, 404 unanalyzed track,
+    400 feature disabled) so the clients' existing fail-soft branches keep working.
+    """
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    if AUDIOMUSE_TOKEN:
+        req.add_header("Authorization", f"Bearer {AUDIOMUSE_TOKEN}")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT) as r:
+            return (r.status, r.read(PROXY_MAX_RESPONSE),
+                    r.headers.get("Content-Type") or "application/json")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read(PROXY_MAX_RESPONSE)
+        except Exception:  # noqa: BLE001
+            payload = b""
+        return e.code, payload, e.headers.get("Content-Type") or "application/json"
+    except Exception as e:  # noqa: BLE001 — never raise into the WS loop
+        log("audiomuse proxy: upstream failed:", e)
+        return 502, b'{"error":"audiomuse unreachable"}', "application/json"
+
+
+class SonicProxy:
+    """Route table + auth + concurrency cap + shared short-TTL result cache."""
+
+    def __init__(self) -> None:
+        self._sem = asyncio.Semaphore(PROXY_MAX_INFLIGHT)
+        self._cache: dict[str, tuple[float, int, bytes, str]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        # An empty HUB_TOKEN already means "accept any client"; refusing to run the
+        # proxy in that state is what stops it becoming an open relay to AudioMuse.
+        return bool(AUDIOMUSE_URL and TOKEN)
+
+    # ----- cache ----------------------------------------------------------- #
+    def _cache_get(self, key: str) -> Optional[tuple[int, bytes, str]]:
+        hit = self._cache.get(key)
+        if hit is None:
+            return None
+        expiry, status, body, ctype = hit
+        if expiry < time.monotonic():
+            del self._cache[key]
+            return None
+        return status, body, ctype
+
+    def _cache_put(self, key: str, status: int, body: bytes, ctype: str) -> None:
+        # Only cache successes — a cold-index 503 must not stick for a minute.
+        if status != 200:
+            return
+        if len(self._cache) >= PROXY_CACHE_MAX:
+            for old in sorted(self._cache, key=lambda k: self._cache[k][0])[:PROXY_CACHE_MAX // 4]:
+                del self._cache[old]
+        self._cache[key] = (time.monotonic() + PROXY_CACHE_TTL, status, body, ctype)
+
+    # ----- request handling ------------------------------------------------ #
+    @staticmethod
+    def _filtered_params(spec: dict, query: str) -> list[tuple[str, str]]:
+        allowed = spec.get("params") or ()
+        out = [(k, v) for k, v in urllib.parse.parse_qsl(query, keep_blank_values=False)
+               if k in allowed]
+        if spec.get("nd") and ND_USER and ND_PASS:
+            # The core reads Navidrome play history for the fingerprint. The hub holds
+            # these already (savePlayQueue mirror) — clients never send them.
+            out += [("navidrome_user", ND_USER), ("navidrome_password", ND_PASS)]
+        return out
+
+    @staticmethod
+    def _filtered_body(spec: dict, raw: bytes) -> Optional[dict]:
+        """Whitelist the client's JSON body. None = malformed (→ 400)."""
+        allowed = spec.get("body") or ()
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(data, dict):
+            return None
+        out = {k: v for k, v in data.items() if k in allowed}
+        items = out.get("items")
+        if isinstance(items, list):
+            # Alchemy items are the only nested structure we forward; keep it to the
+            # three fields the API defines rather than relaying arbitrary objects.
+            out["items"] = [{k: v for k, v in it.items() if k in ("op", "id", "type")}
+                            for it in items if isinstance(it, dict)]
+        return out
+
+    async def call(self, route: tuple[str, str], spec: dict,
+                   params: list[tuple[str, str]],
+                   body: Optional[dict]) -> tuple[int, bytes, str]:
+        key = json.dumps([route, sorted(params), body], sort_keys=True, default=str)
+        if spec.get("cache"):
+            hit = self._cache_get(key)
+            if hit is not None:
+                return hit
+
+        url = AUDIOMUSE_URL + spec["path"]
+        # nd creds are injected here, not logged: keep them out of the cache key too.
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        payload = json.dumps(body).encode() if body is not None else None
+
+        async with self._sem:
+            status, data, ctype = await asyncio.to_thread(
+                _sonic_upstream_blocking, spec["method"], url, payload)
+
+        if spec.get("probe"):
+            status, data, ctype = self._augment_probe(status, data)
+        if spec.get("cache"):
+            self._cache_put(key, status, data, ctype)
+        return status, data, ctype
+
+    @staticmethod
+    def _augment_probe(status: int, data: bytes) -> tuple[int, bytes, str]:
+        """`/sonic/clap/stats` doubles as the Tier-2 liveness probe: pass the upstream
+        stats through, plus the hub's own view, so both clients agree on Tier-2 state
+        from one source. Always 200 — 'unreachable' is an answer, not an error."""
+        stats: dict = {}
+        if status == 200:
+            try:
+                parsed = json.loads(data or b"{}")
+                if isinstance(parsed, dict):
+                    stats = parsed
+            except Exception:  # noqa: BLE001
+                stats = {}
+        stats["configured"] = True
+        stats["upstreamReachable"] = status == 200
+        return 200, json.dumps(stats).encode(), "application/json"
+
+    async def handle(self, protocol: Any, raw_path: str,
+                     headers: Any, method: str) -> Optional[tuple]:
+        """Return an (status, headers, body) triple to answer as plain HTTP, or None
+        to let the request continue into the WebSocket handshake."""
+        path, _, query = raw_path.partition("?")
+        path = path.rstrip("/") or "/"
+        if path != "/sonic" and not path.startswith("/sonic/"):
+            return None  # not ours — WS handshake (or its own 404) proceeds
+
+        if not self.enabled:
+            reason = ("AUDIOMUSE_URL is unset" if not AUDIOMUSE_URL
+                      else "HUB_TOKEN is empty (refusing to run as an open relay)")
+            # The probe still answers, so clients learn Tier 2 is off instead of erroring.
+            if (method, path) == ("GET", "/sonic/clap/stats"):
+                return _http_json(200, {"configured": False, "upstreamReachable": False})
+            return _http_json(503, {"error": f"audiomuse proxy disabled: {reason}"})
+
+        auth = (headers.get("Authorization") or "") if headers is not None else ""
+        supplied = auth[7:] if auth.startswith("Bearer ") else ""
+        if not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+            return _http_json(401, {"error": "unauthorized"})
+
+        spec = SONIC_ROUTES.get((method, path))
+        if spec is None:
+            return _http_json(404, {"error": "unknown route"})
+
+        body: Optional[dict] = None
+        if spec["method"] == "POST":
+            raw = await _read_body(protocol, headers)
+            if raw is None:
+                return _http_json(413, {"error": "request body too large"})
+            body = self._filtered_body(spec, raw)
+            if body is None:
+                return _http_json(400, {"error": "malformed JSON body"})
+
+        params = self._filtered_params(spec, query)
+        try:
+            status, data, ctype = await self.call((method, path), spec, params, body)
+        except Exception as e:  # noqa: BLE001 — a proxy fault must not kill the socket
+            log("audiomuse proxy failed:", e)
+            return _http_json(502, {"error": "proxy failure"})
+        dlog(f"SONIC {method} {path} -> {status} ({len(data)}B)")
+        return _http_response(status, data, ctype)
+
+
+def _http_response(status: int, body: bytes, ctype: str) -> tuple:
+    try:
+        code = http.HTTPStatus(status)
+    except ValueError:
+        code = http.HTTPStatus.BAD_GATEWAY
+    return code, [("Content-Type", ctype), ("Connection", "close")], body
+
+
+def _http_json(status: int, payload: dict) -> tuple:
+    return _http_response(status, json.dumps(payload).encode(), "application/json")
+
+
+async def _read_body(protocol: Any, headers: Any) -> Optional[bytes]:
+    """Read a Content-Length body off the connection.
+
+    `websockets` reads only the request line + headers before handing control to
+    process_request (a WS handshake has no body), so the POST body is still sitting
+    in the protocol's StreamReader.
+    """
+    try:
+        length = int(headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        return b""
+    if length <= 0:
+        return b""
+    if length > PROXY_MAX_BODY:
+        return None
+    try:
+        raw = await asyncio.wait_for(protocol.reader.readexactly(length), timeout=10)
+    except Exception:  # noqa: BLE001
+        raw = b""
+    protocol.body_consumed = True
+    return raw
+
+
+async def _drain_body(protocol: Any, headers: Any) -> None:
+    """Swallow an unread request body before answering.
+
+    Answering a POST without reading its body (401/404/405) closes the socket while
+    the client is still writing, which surfaces on the client as a connection reset
+    instead of the status we meant to send.
+    """
+    if getattr(protocol, "body_consumed", False):
+        return
+    try:
+        length = min(int(headers.get("Content-Length") or 0), PROXY_MAX_BODY)
+    except (TypeError, ValueError):
+        return
+    if length <= 0:
+        return
+    try:
+        await asyncio.wait_for(protocol.reader.readexactly(length), timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+    protocol.body_consumed = True
+
+
+SONIC = SonicProxy()
 
 
 # --------------------------------------------------------------------------- #
@@ -1160,6 +1463,64 @@ class Hub:
         log(f"transfer -> {target.name} @ index {s.index}, {s.position_ms}ms")
 
 
+# --------------------------------------------------------------------------- #
+# Serving the proxy on the WebSocket port
+#
+# `websockets`' legacy asyncio server calls process_request() after the request
+# line + headers, before the handshake; returning a triple short-circuits the
+# connection into a plain HTTP response. Two things need a protocol subclass
+# rather than the plain `process_request=` callable:
+#   * its read_request() hard-rejects any method other than GET, and two proxy
+#     routes are POSTs;
+#   * process_request() as a bare callable gets no access to the StreamReader,
+#     so it could never read a request body.
+# This is legacy-API territory (requirements.txt pins websockets<14): if the
+# internals ever move, the import below fails, the hub logs it and keeps serving
+# WebSocket traffic with the proxy off rather than refusing to start.
+# --------------------------------------------------------------------------- #
+def _build_proxy_protocol() -> Optional[type]:
+    try:
+        from websockets.legacy.http import read_headers, read_line
+        from websockets.legacy.server import WebSocketServerProtocol
+    except Exception as e:  # noqa: BLE001
+        log("audiomuse proxy unavailable (websockets internals moved):", e)
+        return None
+
+    class ProxyProtocol(WebSocketServerProtocol):  # type: ignore[misc,valid-type]
+        http_method = "GET"
+        body_consumed = False
+
+        async def read_http_request(self):  # type: ignore[override]
+            # Same as upstream's, minus the GET-only assertion, and remembering the
+            # method so process_request can route POSTs.
+            request_line = await read_line(self.reader)
+            try:
+                method, raw_path, version = request_line.split(b" ", 2)
+            except ValueError:
+                raise ValueError(f"invalid HTTP request line: {request_line!r}") from None
+            if version != b"HTTP/1.1":
+                raise ValueError(f"unsupported HTTP version: {version!r}")
+            self.http_method = method.decode("ascii", "surrogateescape")
+            path = raw_path.decode("ascii", "surrogateescape")
+            headers = await read_headers(self.reader)
+            self.path = path
+            self.request_headers = headers
+            return path, headers
+
+        async def process_request(self, path, request_headers):  # type: ignore[override]
+            result = await SONIC.handle(self, path, request_headers, self.http_method)
+            if result is None and self.http_method != "GET":
+                # Not a proxy route and not a handshake — don't fall through into the
+                # WS upgrade with a method it can't answer.
+                result = _http_json(405, {"error": "method not allowed"})
+            if result is not None:
+                await _drain_body(self, request_headers)
+                return result
+            return None
+
+    return ProxyProtocol
+
+
 async def _serve_health(hub: Hub, reader: asyncio.StreamReader,
                         writer: asyncio.StreamWriter) -> None:
     """Answer any HTTP request on the health port with the hub's status JSON."""
@@ -1192,10 +1553,21 @@ async def main() -> None:
     if MIRROR_PLAYQUEUE and not NAVIDROME_URL:
         log("WARNING: HUB_MIRROR_PLAYQUEUE is on but NAVIDROME_URL is unset — "
             "the savePlayQueue mirror is disabled. Set it in .env.")
+    if AUDIOMUSE_URL and not TOKEN:
+        log("WARNING: AUDIOMUSE_URL is set but HUB_TOKEN is empty — the AudioMuse "
+            "proxy is DISABLED (it would be an open relay to the core API).")
     hub = Hub()
     log(f"navi-connect hub on ws://{HOST}:{PORT}  "
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "
         f"mirror={'on' if MIRROR_PLAYQUEUE and NAVIDROME_URL else 'off'})")
+
+    proxy_protocol = _build_proxy_protocol() if AUDIOMUSE_URL else None
+    if SONIC.enabled and proxy_protocol is not None:
+        log(f"audiomuse proxy on http://{HOST}:{PORT}/sonic/* -> {AUDIOMUSE_URL}")
+    elif AUDIOMUSE_URL:
+        # Still routed (so /sonic/* answers a clean 503 instead of a WS handshake
+        # error), just refusing to forward.
+        log("audiomuse proxy NOT forwarding — see the warning above")
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
@@ -1217,9 +1589,13 @@ async def main() -> None:
         lambda r, w: _serve_health(hub, r, w), HOST, HEALTH_PORT)
     log(f"health endpoint on http://{HOST}:{HEALTH_PORT}/")
 
+    serve_kwargs: dict[str, Any] = {}
+    if proxy_protocol is not None:
+        serve_kwargs["create_protocol"] = proxy_protocol
+
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
-                                max_size=4 * 1024 * 1024):
+                                max_size=4 * 1024 * 1024, **serve_kwargs):
         await stop  # run until a stop signal arrives
 
     health_server.close()
