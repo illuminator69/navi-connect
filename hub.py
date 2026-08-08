@@ -19,6 +19,7 @@ import http
 import json
 import os
 import random
+import re
 import signal
 import time
 import urllib.error
@@ -51,6 +52,11 @@ ND_PASS = os.environ.get("HUB_ND_PASS", "")
 AUDIOMUSE_URL = os.environ.get("AUDIOMUSE_URL", "").rstrip("/")
 AUDIOMUSE_TOKEN = os.environ.get("AUDIOMUSE_TOKEN", "")
 
+# lb-bot (library-gap intelligence) — proxied for the same reasons plus one more:
+# its Flask API has no authentication at all and binds 0.0.0.0:8899, so it can
+# never be exposed directly. Unset URL = proxy disabled, clients hide the feature.
+LBBOT_URL = os.environ.get("LBBOT_URL", "").rstrip("/")
+
 DEBUG = os.environ.get("HUB_DEBUG", "").lower() in ("1", "true", "yes")
 
 PING_INTERVAL = 10  # seconds (matches Feishin's heartbeat)
@@ -71,13 +77,17 @@ SAVED_QUEUE_SONGS_HARD_MAX = 20000
 SQ_STR_MAX = 512  # longest accepted string field inside a client-supplied saved-queue record
 POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
 
-# --- AudioMuse proxy tuning ---
+# --- proxy tuning (shared by the AudioMuse and lb-bot proxies) ---
 PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls; a hung core must not eat the
                             # default thread pool and stall the 1 Hz progress fan-out
 PROXY_TIMEOUT = 20          # seconds per upstream socket op (urllib has one knob for
                             # connect+read); Tier 2 is in-memory lookups, so fail fast
+PROXY_SLOW_TIMEOUT = 45     # for routes that are known to sit on a rate-limited third
+                            # party (lb-bot's MusicBrainz-backed album lookups)
 PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the same
                             # question cost one upstream call
+PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers (a
+                            # release's tracklist and editions do not change)
 PROXY_CACHE_MAX = 64
 PROXY_MAX_BODY = 256 * 1024        # largest client request body accepted
 PROXY_MAX_RESPONSE = 4 * 1024 * 1024
@@ -217,23 +227,28 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
 
 
 # --------------------------------------------------------------------------- #
-# AudioMuse-AI Tier-2 proxy  (design: ../DESIGN-hub-audiomuse-proxy.md)
+# Upstream proxies  (designs: ../DESIGN-hub-audiomuse-proxy.md,
+#                             ../DESIGN-lbbot-client-integration.md)
 #
-# Plain HTTP served on the WebSocket port, so the clients reach AudioMuse through
-# the one component that is already authenticated and remotely reachable. They
-# stop holding the AudioMuse base URL, the AudioMuse bearer token and (on the
-# fingerprint call) the Navidrome password.
+# Plain HTTP served on the WebSocket port, so the clients reach these services
+# through the one component that is already authenticated and remotely reachable.
+# They stop holding upstream base URLs, upstream tokens and (on the fingerprint
+# call) the Navidrome password.
 #
-# This is a WHITELIST, not a forwarder: HUB_TOKEN is on every device, so a
+# These are WHITELISTS, not forwarders: HUB_TOKEN is on every device, so a
 # pass-through proxy would hand it AudioMuse's analysis/clustering/embedding
-# admin endpoints. Unknown path or method → 404 with no upstream call; unknown
-# parameters are dropped rather than relayed.
+# admin endpoints — or, worse, every write endpoint of lb-bot's unauthenticated
+# API. Unknown path or method → 404 with no upstream call; unknown parameters are
+# dropped rather than relayed.
 # --------------------------------------------------------------------------- #
 #   (method, hub path) -> upstream method/path + what may be forwarded
-#     params: allowed query parameters (GET)
-#     body:   allowed top-level JSON body keys (POST)
-#     nd:     inject HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them)
-#     cache:  cacheable for PROXY_CACHE_TTL
+#     params:    allowed query parameters (GET)
+#     body:      allowed top-level JSON body keys (POST)
+#     path_args: keys lifted out of params/body and interpolated into `path`
+#                (for upstream routes that put an id in the URL)
+#     nd:        inject HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them)
+#     cache:     cacheable; `ttl` overrides PROXY_CACHE_TTL
+#     timeout:   overrides PROXY_TIMEOUT for a known-slow upstream
 SONIC_ROUTES: dict[tuple[str, str], dict] = {
     ("GET", "/sonic/fingerprint"): {
         "method": "GET", "path": "/api/sonic_fingerprint/generate",
@@ -261,9 +276,78 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
     },
 }
 
+# lb-bot's library-gap intelligence. Read-mostly; the three writes (index an
+# artist, download an album, allow mp3 for one album) are all things the clients
+# offer explicitly. Everything else lb-bot exposes — the whole Fill-gaps
+# workspace, delete-file, trash, prefs, the beets import paths — stays off the
+# wire, which is the entire point of a whitelist in front of an API with no auth.
+#
+# Two notes that decide the TTLs. `artist/discography` GET is an instant SQLite
+# read, so a short TTL is right and a stale answer is cheap. `album/releases`,
+# `album/tracklist` and `album/similar` sit on rate-limited MusicBrainz /
+# ListenBrainz calls and return effectively immutable data — a long TTL and a
+# longer timeout. `album/status` is the download-progress poll: never cached.
+LB_ROUTES: dict[tuple[str, str], dict] = {
+    ("GET", "/lb/status"): {
+        "method": "GET", "path": "/api/summary",
+        "params": (), "cache": True, "probe": True,
+    },
+    ("GET", "/lb/artist/discography"): {
+        "method": "GET", "path": "/api/artist/discography",
+        "params": ("nd_id", "mbid"), "cache": True,
+    },
+    ("POST", "/lb/artist/discography"): {
+        "method": "POST", "path": "/api/artist/discography",
+        "body": ("mbid", "name", "nd_id", "external"), "cache": False,
+    },
+    ("GET", "/lb/fresh-releases"): {
+        "method": "GET", "path": "/api/fresh-releases",
+        "params": ("days",), "cache": True,
+    },
+    ("GET", "/lb/album/releases"): {
+        "method": "GET", "path": "/api/album/releases",
+        "params": ("rgid",), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/album/tracklist"): {
+        "method": "GET", "path": "/api/album/tracklist",
+        "params": ("release_mbid", "album_ids", "group_id"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/album/similar"): {
+        "method": "GET", "path": "/api/album/similar",
+        "params": ("artist_mbid", "artist_name", "rgid", "limit"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/download"): {
+        "method": "POST", "path": "/api/album/download",
+        "body": ("rgid", "sourceUsername", "sourceFolder"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/album/status"): {
+        "method": "GET", "path": "/api/album/status",
+        "params": ("release_mbid", "rgid"), "cache": False,
+    },
+    ("POST", "/lb/album/allow-mp3"): {
+        # lb-bot puts the group id in the URL; the clients send it in the body so
+        # the hub route table can stay a table of exact paths.
+        "method": "POST", "path": "/api/gaps/{group_id}/allow-mp3",
+        "path_args": ("group_id",), "body": ("group_id", "allow"), "cache": False,
+    },
+}
 
-def _sonic_upstream_blocking(method: str, url: str,
-                             body: Optional[bytes]) -> tuple[int, bytes, str]:
+# Covers are deliberately absent. lb-bot's /api/cover/<id> serves *Navidrome*
+# art keyed on a Navidrome album id — no use for a release the library does not
+# have — and the art for unowned releases is a public Cover Art Archive URL the
+# clients fetch directly. Proxying images would also put multi-megabyte bodies
+# into a cache bounded by entry count, not bytes.
+
+_PATH_ARG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
+                             token: str, timeout: float,
+                             label: str) -> tuple[int, bytes, str]:
     """One upstream call, off the event loop (same shape as the savePlayQueue mirror).
 
     Upstream status codes are passed through (503 cold index, 404 unanalyzed track,
@@ -271,12 +355,12 @@ def _sonic_upstream_blocking(method: str, url: str,
     """
     req = urllib.request.Request(url, data=body, method=method)
     req.add_header("Accept", "application/json")
-    if AUDIOMUSE_TOKEN:
-        req.add_header("Authorization", f"Bearer {AUDIOMUSE_TOKEN}")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return (r.status, r.read(PROXY_MAX_RESPONSE),
                     r.headers.get("Content-Type") or "application/json")
     except urllib.error.HTTPError as e:
@@ -286,22 +370,56 @@ def _sonic_upstream_blocking(method: str, url: str,
             payload = b""
         return e.code, payload, e.headers.get("Content-Type") or "application/json"
     except Exception as e:  # noqa: BLE001 — never raise into the WS loop
-        log("audiomuse proxy: upstream failed:", e)
-        return 502, b'{"error":"audiomuse unreachable"}', "application/json"
+        log(f"{label} proxy: upstream failed:", e)
+        return 502, json.dumps({"error": f"{label} unreachable"}).encode(), "application/json"
 
 
-class SonicProxy:
-    """Route table + auth + concurrency cap + shared short-TTL result cache."""
+class HttpProxy:
+    """Route table + auth + concurrency cap + shared result cache.
+
+    One instance per upstream. Subclasses supply the URL prefix they answer for,
+    the upstream base URL, and (optionally) an upstream bearer token and a probe
+    response — everything else is identical between them.
+    """
+
+    prefix = ""                                  # e.g. "/sonic"
+    label = "proxy"
+    routes: dict[tuple[str, str], dict] = {}
 
     def __init__(self) -> None:
         self._sem = asyncio.Semaphore(PROXY_MAX_INFLIGHT)
         self._cache: dict[str, tuple[float, int, bytes, str]] = {}
 
+    # ----- per-upstream ---------------------------------------------------- #
+    @property
+    def upstream(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def upstream_token(self) -> str:
+        return ""
+
     @property
     def enabled(self) -> bool:
         # An empty HUB_TOKEN already means "accept any client"; refusing to run the
-        # proxy in that state is what stops it becoming an open relay to AudioMuse.
-        return bool(AUDIOMUSE_URL and TOKEN)
+        # proxy in that state is what stops it becoming an open relay upstream.
+        return bool(self.upstream and TOKEN)
+
+    @property
+    def disabled_reason(self) -> str:
+        return ("upstream URL is unset" if not self.upstream
+                else "HUB_TOKEN is empty (refusing to run as an open relay)")
+
+    def disabled_probe(self, route: tuple[str, str]) -> Optional[tuple]:
+        """Answer for the liveness probe while the proxy is off, so clients learn
+        the feature is unconfigured instead of reading an error."""
+        spec = self.routes.get(route)
+        if spec and spec.get("probe"):
+            return _http_json(200, {"configured": False, "upstreamReachable": False})
+        return None
+
+    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
+        return status, data, "application/json"
 
     # ----- cache ----------------------------------------------------------- #
     def _cache_get(self, key: str) -> Optional[tuple[int, bytes, str]]:
@@ -314,14 +432,15 @@ class SonicProxy:
             return None
         return status, body, ctype
 
-    def _cache_put(self, key: str, status: int, body: bytes, ctype: str) -> None:
+    def _cache_put(self, key: str, status: int, body: bytes, ctype: str,
+                   ttl: float = PROXY_CACHE_TTL) -> None:
         # Only cache successes — a cold-index 503 must not stick for a minute.
         if status != 200:
             return
         if len(self._cache) >= PROXY_CACHE_MAX:
             for old in sorted(self._cache, key=lambda k: self._cache[k][0])[:PROXY_CACHE_MAX // 4]:
                 del self._cache[old]
-        self._cache[key] = (time.monotonic() + PROXY_CACHE_TTL, status, body, ctype)
+        self._cache[key] = (time.monotonic() + ttl, status, body, ctype)
 
     # ----- request handling ------------------------------------------------ #
     @staticmethod
@@ -334,6 +453,30 @@ class SonicProxy:
             # these already (savePlayQueue mirror) — clients never send them.
             out += [("navidrome_user", ND_USER), ("navidrome_password", ND_PASS)]
         return out
+
+    @staticmethod
+    def _upstream_path(spec: dict, params: list[tuple[str, str]],
+                       body: Optional[dict]) -> Optional[str]:
+        """Fill `{name}` placeholders in the upstream path from params/body.
+
+        The value goes into a URL path, so it is validated rather than escaped:
+        an id that isn't a plain token is a client bug or an attempt to walk out
+        of the whitelisted route, and both deserve a 400, not a best-effort quote.
+        Consumed keys are removed so they aren't also forwarded as data.
+        """
+        path = spec["path"]
+        for name in spec.get("path_args") or ():
+            value = ""
+            if body is not None and name in body:
+                value = str(body.pop(name) or "")
+            else:
+                hit = next((v for k, v in params if k == name), "")
+                value = str(hit or "")
+                params[:] = [(k, v) for k, v in params if k != name]
+            if not _PATH_ARG_RE.match(value):
+                return None
+            path = path.replace("{" + name + "}", value)
+        return path
 
     @staticmethod
     def _filtered_body(spec: dict, raw: bytes) -> Optional[dict]:
@@ -357,13 +500,18 @@ class SonicProxy:
     async def call(self, route: tuple[str, str], spec: dict,
                    params: list[tuple[str, str]],
                    body: Optional[dict]) -> tuple[int, bytes, str]:
-        key = json.dumps([route, sorted(params), body], sort_keys=True, default=str)
+        upstream_path = self._upstream_path(spec, params, body)
+        if upstream_path is None:
+            return 400, b'{"error":"invalid path parameter"}', "application/json"
+
+        key = json.dumps([route, upstream_path, sorted(params), body],
+                         sort_keys=True, default=str)
         if spec.get("cache"):
             hit = self._cache_get(key)
             if hit is not None:
                 return hit
 
-        url = AUDIOMUSE_URL + spec["path"]
+        url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -371,30 +519,15 @@ class SonicProxy:
 
         async with self._sem:
             status, data, ctype = await asyncio.to_thread(
-                _sonic_upstream_blocking, spec["method"], url, payload)
+                _proxy_upstream_blocking, spec["method"], url, payload,
+                self.upstream_token, spec.get("timeout", PROXY_TIMEOUT), self.label)
 
         if spec.get("probe"):
-            status, data, ctype = self._augment_probe(status, data)
+            status, data, ctype = self.augment(spec, status, data)
         if spec.get("cache"):
-            self._cache_put(key, status, data, ctype)
+            self._cache_put(key, status, data, ctype,
+                            spec.get("ttl", PROXY_CACHE_TTL))
         return status, data, ctype
-
-    @staticmethod
-    def _augment_probe(status: int, data: bytes) -> tuple[int, bytes, str]:
-        """`/sonic/clap/stats` doubles as the Tier-2 liveness probe: pass the upstream
-        stats through, plus the hub's own view, so both clients agree on Tier-2 state
-        from one source. Always 200 — 'unreachable' is an answer, not an error."""
-        stats: dict = {}
-        if status == 200:
-            try:
-                parsed = json.loads(data or b"{}")
-                if isinstance(parsed, dict):
-                    stats = parsed
-            except Exception:  # noqa: BLE001
-                stats = {}
-        stats["configured"] = True
-        stats["upstreamReachable"] = status == 200
-        return 200, json.dumps(stats).encode(), "application/json"
 
     async def handle(self, protocol: Any, raw_path: str,
                      headers: Any, method: str) -> Optional[tuple]:
@@ -402,23 +535,24 @@ class SonicProxy:
         to let the request continue into the WebSocket handshake."""
         path, _, query = raw_path.partition("?")
         path = path.rstrip("/") or "/"
-        if path != "/sonic" and not path.startswith("/sonic/"):
-            return None  # not ours — WS handshake (or its own 404) proceeds
+        if path != self.prefix and not path.startswith(self.prefix + "/"):
+            return None  # not ours — the next proxy, or the WS handshake, proceeds
 
         if not self.enabled:
-            reason = ("AUDIOMUSE_URL is unset" if not AUDIOMUSE_URL
-                      else "HUB_TOKEN is empty (refusing to run as an open relay)")
-            # The probe still answers, so clients learn Tier 2 is off instead of erroring.
-            if (method, path) == ("GET", "/sonic/clap/stats"):
-                return _http_json(200, {"configured": False, "upstreamReachable": False})
-            return _http_json(503, {"error": f"audiomuse proxy disabled: {reason}"})
+            # The probe still answers, so clients learn the feature is off instead
+            # of erroring. Anything else is a clean 503 they can fail soft on.
+            probe = self.disabled_probe((method, path))
+            if probe is not None:
+                return probe
+            return _http_json(503, {"error": f"{self.label} proxy disabled: "
+                                             f"{self.disabled_reason}"})
 
         auth = (headers.get("Authorization") or "") if headers is not None else ""
         supplied = auth[7:] if auth.startswith("Bearer ") else ""
         if not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
             return _http_json(401, {"error": "unauthorized"})
 
-        spec = SONIC_ROUTES.get((method, path))
+        spec = self.routes.get((method, path))
         if spec is None:
             return _http_json(404, {"error": "unknown route"})
 
@@ -435,10 +569,74 @@ class SonicProxy:
         try:
             status, data, ctype = await self.call((method, path), spec, params, body)
         except Exception as e:  # noqa: BLE001 — a proxy fault must not kill the socket
-            log("audiomuse proxy failed:", e)
+            log(f"{self.label} proxy failed:", e)
             return _http_json(502, {"error": "proxy failure"})
-        dlog(f"SONIC {method} {path} -> {status} ({len(data)}B)")
+        dlog(f"{self.label.upper()} {method} {path} -> {status} ({len(data)}B)")
         return _http_response(status, data, ctype)
+
+
+class SonicProxy(HttpProxy):
+    """AudioMuse-AI Tier 2 (design: ../DESIGN-hub-audiomuse-proxy.md)."""
+
+    prefix = "/sonic"
+    label = "audiomuse"
+    routes = SONIC_ROUTES
+
+    @property
+    def upstream(self) -> str:
+        return AUDIOMUSE_URL
+
+    @property
+    def upstream_token(self) -> str:
+        return AUDIOMUSE_TOKEN
+
+    @property
+    def disabled_reason(self) -> str:
+        return ("AUDIOMUSE_URL is unset" if not AUDIOMUSE_URL
+                else "HUB_TOKEN is empty (refusing to run as an open relay)")
+
+    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
+        """`/sonic/clap/stats` doubles as the Tier-2 liveness probe: pass the upstream
+        stats through, plus the hub's own view, so both clients agree on Tier-2 state
+        from one source. Always 200 — 'unreachable' is an answer, not an error."""
+        stats: dict = {}
+        if status == 200:
+            try:
+                parsed = json.loads(data or b"{}")
+                if isinstance(parsed, dict):
+                    stats = parsed
+            except Exception:  # noqa: BLE001
+                stats = {}
+        stats["configured"] = True
+        stats["upstreamReachable"] = status == 200
+        return 200, json.dumps(stats).encode(), "application/json"
+
+
+class LbProxy(HttpProxy):
+    """lb-bot library-gap intelligence (design: ../DESIGN-lbbot-client-integration.md)."""
+
+    prefix = "/lb"
+    label = "lbbot"
+    routes = LB_ROUTES
+
+    @property
+    def upstream(self) -> str:
+        return LBBOT_URL
+
+    @property
+    def disabled_reason(self) -> str:
+        return ("LBBOT_URL is unset" if not LBBOT_URL
+                else "HUB_TOKEN is empty (refusing to run as an open relay)")
+
+    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
+        """`/lb/status` is the liveness probe. lb-bot has no cheap dedicated health
+        route, so it rides on `/api/summary`, and only the reachability verdict is
+        passed on — the summary itself is a large object about the Fill-gaps
+        workspace that no client renders."""
+        return 200, json.dumps({
+            "configured": True,
+            "upstreamReachable": status == 200,
+        }).encode(), "application/json"
 
 
 def _http_response(status: int, body: bytes, ctype: str) -> tuple:
@@ -499,6 +697,10 @@ async def _drain_body(protocol: Any, headers: Any) -> None:
 
 
 SONIC = SonicProxy()
+LB = LbProxy()
+# Order matters only in that each returns None for paths outside its own prefix;
+# the first one that claims the path answers it.
+PROXIES: tuple[HttpProxy, ...] = (SONIC, LB)
 
 
 # --------------------------------------------------------------------------- #
@@ -1707,7 +1909,12 @@ def _build_proxy_protocol() -> Optional[type]:
             return path, headers
 
         async def process_request(self, path, request_headers):  # type: ignore[override]
-            result = await SONIC.handle(self, path, request_headers, self.http_method)
+            result = None
+            for proxy in PROXIES:
+                result = await proxy.handle(self, path, request_headers,
+                                            self.http_method)
+                if result is not None:
+                    break
             if result is None and self.http_method != "GET":
                 # Not a proxy route and not a handshake — don't fall through into the
                 # WS upgrade with a method it can't answer.
@@ -1755,6 +1962,10 @@ async def main() -> None:
     if AUDIOMUSE_URL and not TOKEN:
         log("WARNING: AUDIOMUSE_URL is set but HUB_TOKEN is empty — the AudioMuse "
             "proxy is DISABLED (it would be an open relay to the core API).")
+    if LBBOT_URL and not TOKEN:
+        log("WARNING: LBBOT_URL is set but HUB_TOKEN is empty — the lb-bot proxy is "
+            "DISABLED. lb-bot's API has no auth of its own, so relaying it without "
+            "a hub token would publish every route on the whitelist.")
     hub = Hub()
     log(f"navi-connect hub on ws://{HOST}:{PORT}  "
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "
@@ -1767,13 +1978,17 @@ async def main() -> None:
     # and never reaches the "hub has no AudioMuse → fall back to the direct route"
     # path that SonicProxy.handle's `if not self.enabled` branch exists to trigger.
     proxy_protocol = _build_proxy_protocol()
-    if SONIC.enabled and proxy_protocol is not None:
-        log(f"audiomuse proxy on http://{HOST}:{PORT}/sonic/* -> {AUDIOMUSE_URL}")
-    elif proxy_protocol is not None:
-        # Routed but not forwarding: /sonic/clap/stats answers {"configured": false}
-        # and everything else a clean 503, so clients demote instead of erroring.
-        log("audiomuse proxy routed but NOT forwarding "
-            f"({'AUDIOMUSE_URL unset' if not AUDIOMUSE_URL else 'HUB_TOKEN empty'})")
+    if proxy_protocol is not None:
+        for proxy in PROXIES:
+            if proxy.enabled:
+                log(f"{proxy.label} proxy on http://{HOST}:{PORT}{proxy.prefix}/* "
+                    f"-> {proxy.upstream}")
+            else:
+                # Routed but not forwarding: the probe route answers
+                # {"configured": false} and everything else a clean 503, so clients
+                # demote instead of erroring.
+                log(f"{proxy.label} proxy routed but NOT forwarding "
+                    f"({proxy.disabled_reason})")
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
