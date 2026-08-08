@@ -118,3 +118,28 @@ val MIGRATION_CACHE_17_18 = object : Migration(17, 18) {
 		}
 	}
 }
+
+/**
+ * v18 → v19: `SavedQueueEntity.currentSongName` (so a row can show what it left off on) and
+ * `songIdsCsv` (so the repository can answer "do I already have a record for this queue?" without
+ * decoding twenty `queueJson` blobs). Both exist to keep the list render and the identity check off
+ * the expensive path this table was built to avoid.
+ *
+ * Additive and nullable — existing rows read `null` until their next capture, and `songIdsCsv` is
+ * backfilled lazily by `SavedQueueRepository.primeIndex()` — with the same idempotent try/catch as
+ * [MIGRATION_CACHE_17_18].
+ */
+val MIGRATION_CACHE_18_19 = object : Migration(18, 19) {
+	override suspend fun migrate(connection: SQLiteConnection) {
+		listOf(
+			"ALTER TABLE SavedQueueEntity ADD COLUMN currentSongName TEXT",
+			"ALTER TABLE SavedQueueEntity ADD COLUMN songIdsCsv TEXT"
+		).forEach { statement ->
+			try {
+				connection.execSQL(statement)
+			} catch (_: Throwable) {
+				// Column already present — nothing to do.
+			}
+		}
+	}
+}

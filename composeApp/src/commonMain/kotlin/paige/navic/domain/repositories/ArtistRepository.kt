@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import paige.navic.domain.manager.SyncManager
 import paige.navic.data.database.dao.ArtistDao
+import paige.navic.data.database.dao.DownloadDao
+import paige.navic.data.database.dao.SongDao
 import paige.navic.data.database.entities.SyncActionType
 import paige.navic.data.database.mappers.toDomainModel
 import paige.navic.data.database.mappers.toEntity
@@ -19,35 +21,61 @@ import kotlin.time.Clock
 
 class ArtistRepository(
 	private val artistDao: ArtistDao,
+	private val downloadDao: DownloadDao,
+	private val songDao: SongDao,
 	private val syncManager: SyncManager,
 	private val dbRepository: DbRepository
 ) {
 	private suspend fun getLocalData(
-		listType: DomainArtistListType
+		listType: DomainArtistListType,
+		reversed: Boolean
 	): ImmutableList<DomainArtist> {
-		return when (listType) {
+		val entities = when (listType) {
 			DomainArtistListType.AlphabeticalByName -> artistDao.getArtistsAlphabeticalByName()
 			DomainArtistListType.Random -> artistDao.getArtistsRandom()
 			DomainArtistListType.Starred -> artistDao.getArtistsStarred()
-		}.map { it.toDomainModel() }.toImmutableList()
+			// Only artists that own at least one downloaded song. Downloads carry just a
+			// songId, so resolve those to their artistIds and keep matching artists (in the
+			// alphabetical order the DAO already returns).
+			DomainArtistListType.Downloaded -> {
+				val downloadedSongIds = downloadDao.getSongIdsByStatus()
+				if (downloadedSongIds.isEmpty()) emptyList()
+				else {
+					// Chunk to stay under SQLite's bound-parameter limit (~999), same as SongRepository.
+					val downloadedArtistIds = downloadedSongIds
+						.chunked(500)
+						.flatMap { songDao.getSongsByIds(it) }
+						.map { it.artistId }
+						.toSet()
+					artistDao.getArtistsAlphabeticalByName()
+						.filter { it.artistId in downloadedArtistIds }
+				}
+			}
+		}
+		return entities
+			.map { it.toDomainModel() }
+			.let { if (reversed) it.asReversed() else it }
+			.toImmutableList()
 	}
 
 	private suspend fun refreshLocalData(
-		listType: DomainArtistListType
+		listType: DomainArtistListType,
+		reversed: Boolean
 	): ImmutableList<DomainArtist> {
 		dbRepository.syncArtists().getOrThrow()
-		return getLocalData(listType)
+		return getLocalData(listType, reversed)
 	}
 
 	fun getArtistsFlow(
 		fullRefresh: Boolean,
-		listType: DomainArtistListType
+		listType: DomainArtistListType,
+		reversed: Boolean
 	): Flow<UiState<ImmutableList<DomainArtist>>> = flow {
-		val localData = getLocalData(listType)
+		val localData = getLocalData(listType, reversed)
 		if (fullRefresh) {
 			emit(UiState.Loading(data = localData))
 			try {
-				emit(UiState.Success(data = refreshLocalData(listType)))
+				emit(UiState.Success(data = refreshLocalData(listType, reversed)))
 			} catch (error: Exception) {
 				emit(UiState.Error(error = error, data = localData))
 			}

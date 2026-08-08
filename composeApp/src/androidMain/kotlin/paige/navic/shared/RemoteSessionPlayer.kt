@@ -143,7 +143,16 @@ class RemoteSessionPlayer(
 			Player.COMMAND_SEEK_TO_PREVIOUS,
 			Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> hubManager.actPrevious()
 
-			Player.COMMAND_SEEK_TO_MEDIA_ITEM -> hubManager.actJump(mediaItemIndex)
+			Player.COMMAND_SEEK_TO_MEDIA_ITEM ->
+				// Only forward a jump to a DIFFERENT track. media3 / the system
+				// controller re-issues SEEK_TO_MEDIA_ITEM at the current index on
+				// every state re-sync (metadata/position invalidations); forwarding
+				// that self-seek makes the hub's `jump` reset position to 0 and
+				// restart the active receiver — the phantom-jump loop that rewinds
+				// playback right after each unpause. (Mirrors the ArtworkPager guard.)
+				if (mediaItemIndex != hubManager.remoteSession.value.index) {
+					hubManager.actJump(mediaItemIndex)
+				}
 
 			else -> if (positionMs != C.TIME_UNSET) hubManager.actSeek(positionMs)
 		}

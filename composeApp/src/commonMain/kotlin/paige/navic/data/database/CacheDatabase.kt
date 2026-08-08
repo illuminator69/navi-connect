@@ -31,7 +31,7 @@ import paige.navic.data.database.entities.SyncActionEntity
 	// NOTE: [DownloadEntity] is an entity of BOTH databases, so changing it changes THIS schema
 	// too. Forgetting to bump this version is exactly how you get Room's "changed schema but
 	// forgot to update the version number" identity-hash crash on launch.
-	version = 18,
+	version = 19,
 	entities = [
 		AlbumEntity::class,
 		GenreEntity::class,

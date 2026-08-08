@@ -14,6 +14,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
@@ -126,13 +127,20 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 	@OptIn(UnstableApi::class)
 	override fun onCreate() {
 		super.onCreate()
+		// Read as far ahead as the track allows rather than the ~1 min a video-shaped default gives
+		// us: a fully-buffered song rides out a Wi-Fi→cellular handover (or a lift ride) without a
+		// gap, which is the whole point on a music player. maxBufferMs alone isn't enough — the
+		// real limiter is targetBufferBytes, which otherwise defaults to a fraction of a megabyte
+		// for audio and caps a lossless stream at a few seconds. 48 MB covers a long FLAC; it is a
+		// ceiling, not an allocation, so short/transcoded tracks still cost little.
 		val loadControl = DefaultLoadControl.Builder()
 			.setBufferDurationsMs(
 				/* minBufferMs = */ 32_000,
-				/* maxBufferMs = */ 64_000,
+				/* maxBufferMs = */ 600_000,
 				/* bufferForPlaybackMs = */ 2_500,
 				/* bufferForPlaybackAfterRebufferMs = */ 5_000
 			)
+			.setTargetBufferBytes(48 * 1024 * 1024)
 			.setBackBuffer(10_000, true)
 			.build()
 
@@ -373,6 +381,18 @@ class AndroidMediaPlayerViewModel(
 
 	private var pendingSyncState: PlayerUiState? = null
 
+	// Last map seen by the URI re-resolution pass, so [reresolveQueueUris] can be re-run from a
+	// track transition without waiting for the flow to re-emit.
+	private var lastDownloadedMap: Map<String, String> = emptyMap()
+
+	// Set when re-resolution deliberately LEFT the playing item alone (see [reresolveQueueUris]);
+	// cleared by the re-run on the next track transition, which is when the swap is free.
+	private var currentItemReresolvePending = false
+
+	// A source/network error killed playback; retry (same URI, resumed by range request) as soon
+	// as we're back online rather than leaving the player dead in STATE_IDLE.
+	private var retryOnReconnect = false
+
 	init {
 		connectToService()
 	}
@@ -386,6 +406,23 @@ class AndroidMediaPlayerViewModel(
 				setupController()
 			}, MoreExecutors.directExecutor())
 		}
+	}
+
+	/**
+	 * Whether a downloaded copy should actually be played, given the current connection.
+	 *
+	 * Always yes off a metered link. On cellular it follows `preferDownloadsOnCellular`: on (the
+	 * default) plays the download and spends no data; off streams the server's original, which is
+	 * what you want when the downloads are space-saving transcodes and you'd rather have the
+	 * original away from Wi-Fi.
+	 */
+	private fun useDownloadFor(localPath: String?): Boolean {
+		if (localPath == null) return false
+		// A file we already have always beats a stream we can't fetch — "prefer the server's
+		// original" can't mean "play nothing" when there's no usable connection.
+		if (!connectivityManager.isOnline.value) return true
+		if (!connectivityManager.isCellular.value) return true
+		return preferenceManager.preferDownloadsOnCellular
 	}
 
 	private fun getStreamUrl(id: String): Uri {
@@ -404,12 +441,72 @@ class AndroidMediaPlayerViewModel(
 			.build()
 	}
 
+	/**
+	 * Re-point every queued item at the uri it *should* have right now — the download if
+	 * [useDownloadFor] says so, otherwise a stream url at the current network's quality.
+	 *
+	 * The playing item is deliberately exempt from remote re-pointing. Replacing its uri throws
+	 * away everything ExoPlayer has buffered and restarts the request, so a Wi-Fi→cellular handover
+	 * used to *stop the song*, ask the server for a fresh transcode, and stall until enough of it
+	 * arrived. Keeping the uri means the in-flight response (or, if it did drop, a Range retry of
+	 * the same one) just continues, and the new quality takes effect from the next track. Swapping
+	 * TO a local file is still allowed mid-track: that reads off disk, so it costs no stall and is
+	 * the thing that keeps playback alive when the connection goes away entirely.
+	 */
+	private fun reresolveQueueUris(downloadedMap: Map<String, String>) {
+		val player = controller ?: return
+		currentItemReresolvePending = false
+
+		for (i in 0 until player.mediaItemCount) {
+			val item = player.getMediaItemAt(i)
+			val id = item.mediaId
+			val localPath = downloadedMap[id].takeIf { useDownloadFor(it) }
+
+			val isCurrentlyLocal = item.localConfiguration?.uri?.scheme == "file"
+
+			val newItem = if (localPath != null) {
+				if (!isCurrentlyLocal) {
+					item.buildUpon()
+						.setUri(File(localPath).toUri())
+						.build()
+				} else null
+			} else {
+				val newUri = getStreamUrl(id)
+				if (isCurrentlyLocal || item.localConfiguration?.uri != newUri) {
+					item.buildUpon()
+						.setUri(newUri)
+						.build()
+				} else null
+			}
+
+			if (newItem == null) continue
+
+			if (i == player.currentMediaItemIndex) {
+				if (newItem.localConfiguration?.uri?.scheme != "file") {
+					// Remote→remote (quality change) or local→remote: defer, it would stall.
+					currentItemReresolvePending = true
+					continue
+				}
+				val currentPosition = player.currentPosition
+				player.replaceMediaItem(i, newItem)
+				player.seekTo(i, currentPosition)
+			} else {
+				player.replaceMediaItem(i, newItem)
+			}
+		}
+	}
+
 	private fun setupController() {
 		viewModelScope.launch {
 			controller?.apply {
 				addListener(object : Player.Listener {
 					override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
 						updatePlaybackState()
+
+						// The track we protected from a mid-song uri swap isn't playing any more,
+						// so apply the deferred quality/source change now — this is where a
+						// network handover actually lands.
+						if (currentItemReresolvePending) reresolveQueueUris(lastDownloadedMap)
 
 						if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
 							mediaItem?.mediaId?.let { id ->
@@ -457,6 +554,27 @@ class AndroidMediaPlayerViewModel(
 						updatePlaybackState()
 					}
 
+					override fun onPlayerError(error: PlaybackException) {
+						// A dropped connection surfaces as a source error and parks the player in
+						// STATE_IDLE, where nothing revives it. Remember to prepare() once we're
+						// online again (see the re-resolution collector) so the song resumes on
+						// its existing uri rather than needing a re-queue.
+						val isNetwork = when (error.errorCode) {
+							PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+							PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+							PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+
+							else -> false
+						}
+						if (isNetwork) {
+							// Only ever retried off a connectivity change, never immediately —
+							// an unconditional prepare() here would spin error→prepare→error.
+							retryOnReconnect = true
+						} else {
+							Logger.e("MediaPlayer", "playback error", error)
+						}
+					}
+
 					override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
 						_uiState.update { it.copy(isShuffleEnabled = shuffleModeEnabled) }
 					}
@@ -489,43 +607,23 @@ class AndroidMediaPlayerViewModel(
 					snapshotFlow { preferenceManager.streamingQualityCellular },
 					snapshotFlow { preferenceManager.isAdvancedTranscodingActive },
 					snapshotFlow { preferenceManager.customMaxBitrateWifi },
-					snapshotFlow { preferenceManager.customMaxBitrateCellular }
+					snapshotFlow { preferenceManager.customMaxBitrateCellular },
+					// So flipping the toggle (or moving on/off cellular) re-points the queue at the
+					// downloads or back at the server without needing a re-queue.
+					snapshotFlow { preferenceManager.preferDownloadsOnCellular },
+					connectivityManager.isOnline
 				) { it.toList() }.distinctUntilChanged().collectLatest { args ->
 					@Suppress("UNCHECKED_CAST")
 					val downloadedMap = args[0] as Map<String, String>
-					val player = controller ?: return@collectLatest
+					lastDownloadedMap = downloadedMap
+					reresolveQueueUris(downloadedMap)
 
-					for (i in 0 until player.mediaItemCount) {
-						val item = player.getMediaItemAt(i)
-						val id = item.mediaId
-						val localPath = downloadedMap[id]
-
-						val isCurrentlyLocal = item.localConfiguration?.uri?.scheme == "file"
-
-						val newItem = if (localPath != null) {
-							if (!isCurrentlyLocal) {
-								item.buildUpon()
-									.setUri(File(localPath).toUri())
-									.build()
-							} else null
-						} else {
-							val newUri = getStreamUrl(id)
-							if (isCurrentlyLocal || item.localConfiguration?.uri != newUri) {
-								item.buildUpon()
-									.setUri(newUri)
-									.build()
-							} else null
-						}
-
-						if (newItem != null) {
-							if (i == player.currentMediaItemIndex) {
-								val currentPosition = player.currentPosition
-								player.replaceMediaItem(i, newItem)
-								player.seekTo(i, currentPosition)
-							} else {
-								player.replaceMediaItem(i, newItem)
-							}
-						}
+					// Back online after a source error: resume the SAME uri from where the buffer
+					// ran out (prepare() re-requests with a Range header) instead of leaving the
+					// player dead until the user hits play.
+					if (retryOnReconnect && connectivityManager.isOnline.value) {
+						retryOnReconnect = false
+						controller?.prepare()
 					}
 				}
 			}
@@ -632,7 +730,8 @@ class AndroidMediaPlayerViewModel(
 		positionMs: Long,
 		play: Boolean,
 		savedQueueId: String?,
-		savedQueueKind: String
+		savedQueueKind: String,
+		savedQueueName: String?
 	) {
 		viewModelScope.launch {
 			val player = controller ?: return@launch
@@ -659,6 +758,9 @@ class AndroidMediaPlayerViewModel(
 					// history session instead.
 					savedQueueId = savedQueueId,
 					savedQueueKind = savedQueueKind,
+					// currentCollection is null on this path, so without an explicit name a locally
+					// started radio / Mood Flow / journey persisted as an unnamed row ("No name").
+					savedQueueName = savedQueueName,
 					progress = if (durationMs > 0) {
 						(positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
 					} else 0f
@@ -681,7 +783,16 @@ class AndroidMediaPlayerViewModel(
 			// Current track changed (or nothing loaded) → caller-visible
 			// behaviour is a plain reload; keep the position at zero.
 			if (currentId == null || newCurrent?.id != currentId || player.mediaItemCount == 0) {
-				loadRemoteQueue(songs, index, 0L, !_uiState.value.isPaused)
+				val st = _uiState.value
+				// Carry the saved-queue identity through. loadRemoteQueue defaults it to null
+				// ("a transient mirror of someone else's queue"), which is right for a do:load
+				// but wrong here: this is the SAME session being reconciled after an edit, and
+				// blanking the id mid-playback made the next publish mint a fresh one — forking
+				// a second Continue Listening card for one listening session.
+				loadRemoteQueue(
+					songs, index, 0L, !st.isPaused,
+					st.savedQueueId, st.savedQueueKind, st.savedQueueName
+				)
 				return@launch
 			}
 
@@ -898,10 +1009,14 @@ class AndroidMediaPlayerViewModel(
 					// Clearing ends the session: drop its saved-queue identity so the
 					// SavedQueues screen doesn't keep showing it as the active queue.
 					savedQueueId = null,
-					savedQueueKind = "manual"
+					savedQueueKind = "manual",
+					savedQueueName = null
 				)
 			}
 			controller?.clearMediaItems()
+			// The publish path bails on an empty queue, so without this the hub kept serving the
+			// queue we just threw away — open another client and the whole list was back.
+			remotePlaybackRouter?.takeIf { it.isHubConnected }?.clearSessionQueue()
 		}
 	}
 
@@ -940,10 +1055,17 @@ class AndroidMediaPlayerViewModel(
 					queue = newCollection,
 					currentIndex = startIndex,
 					currentSong = newCollection.getOrNull(startIndex),
-					// Fresh queue → new saved-queue session (see SavedQueueRepository). Minting the
-					// id here, synchronously with the queue swap, keeps it correct immediately.
-					savedQueueId = newSessionId(),
-					savedQueueKind = collection.toSavedQueueKind()
+					// Stamp the collection we're playing FROM. It was previously only ever
+					// derived asynchronously from the playing song's album, so at this moment
+					// (when the queue is published to the hub) it was null or the previous
+					// queue's — leaving shared history rows with no name.
+					currentCollection = collection,
+					// Fresh queue → saved-queue session (see SavedQueueRepository). Resolved here,
+					// synchronously with the queue swap, so it's correct immediately — and resolved
+					// rather than minted so replaying the same album refreshes its card.
+					savedQueueId = sessionIdFor(newCollection),
+					savedQueueKind = collection.toSavedQueueKind(),
+					savedQueueName = collection.name
 				)
 			}
 		}
@@ -1065,8 +1187,9 @@ class AndroidMediaPlayerViewModel(
 					currentIndex = 0,
 					currentSong = dummyRadioSong,
 					isLoading = true,
-					savedQueueId = newSessionId(),
-					savedQueueKind = SavedQueueSource.RADIO
+					savedQueueId = sessionIdFor(listOf(dummyRadioSong)),
+					savedQueueKind = SavedQueueSource.RADIO,
+					savedQueueName = radio.name
 				)
 			}
 		}
@@ -1091,8 +1214,12 @@ class AndroidMediaPlayerViewModel(
 					queue = shuffledSongs,
 					currentIndex = 0,
 					currentSong = shuffledSongs.firstOrNull(),
-					savedQueueId = newSessionId(),
-					savedQueueKind = collection.toSavedQueueKind()
+					// See playCollectionLocal: the source collection must be known at publish
+					// time, not resolved later from whatever song happens to be playing.
+					currentCollection = collection,
+					savedQueueId = sessionIdFor(shuffledSongs),
+					savedQueueKind = collection.toSavedQueueKind(),
+					savedQueueName = collection.name
 				)
 			}
 		}
@@ -1196,7 +1323,7 @@ class AndroidMediaPlayerViewModel(
 			}
 
 			else -> {
-				val localPath = downloadManager.getDownloadedFilePath(id)
+				val localPath = downloadManager.getDownloadedFilePath(id).takeIf { useDownloadFor(it) }
 				if (localPath != null) {
 					File(localPath).toUri()
 				} else {

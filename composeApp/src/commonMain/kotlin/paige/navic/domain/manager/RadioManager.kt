@@ -101,7 +101,7 @@ class RadioManager(
 					Logger.i("RadioManager", "no songs (incl. local) for $seedId")
 					return@launch
 				}
-				playMix(queue, SavedQueueSource.RADIO)
+				playMix(queue, SavedQueueSource.RADIO, seedSong?.title?.let { "$it radio" })
 			} catch (e: Exception) {
 				Logger.e("RadioManager", "failed to start radio for $seedId", e)
 			}
@@ -125,7 +125,10 @@ class RadioManager(
 					Logger.i("RadioManager", "no path from $fromId to $toId")
 					return@launch
 				}
-				playMix(queue, SavedQueueSource.JOURNEY)
+				playMix(
+					queue, SavedQueueSource.JOURNEY,
+					"${queue.first().title} → ${queue.last().title}"
+				)
 			} catch (e: Exception) {
 				Logger.e("RadioManager", "failed to start journey $fromId -> $toId", e)
 			}
@@ -246,17 +249,39 @@ class RadioManager(
 	 * Local mixes are saved to queue history as their [kind] (radio / journey / Mood Flow) so the
 	 * saved-queues list can group them; remote mixes are the hub's session (not local history).
 	 */
-	private fun playMix(songs: List<DomainSong>, kind: String = SavedQueueSource.RADIO) {
+	private fun playMix(
+		songs: List<DomainSong>,
+		kind: String = SavedQueueSource.RADIO,
+		name: String? = null
+	) {
 		mixSig.value = songs.joinToString(",") { it.id }
 		if (hubManager.isRemoteActive.value) {
-			hubManager.loadSessionQueue(songs)
+			// Tag the shared history record with what this mix IS. Without the kind/name the
+			// hub recorded remote-started mixes as anonymous "manual" queues.
+			hubManager.loadSessionQueue(
+				songs,
+				sourceKind = kind,
+				sourceName = name ?: defaultMixName(kind)
+			)
 		} else {
+			// The LOCAL branch needs the name just as much: this path has no source collection at
+			// all, so without it every locally started radio / Mood Flow / journey was saved as an
+			// unnamed row and the history read "No name".
 			mediaPlayer.loadRemoteQueue(
 				songs, 0, 0L, true,
-				savedQueueId = mediaPlayer.newQueueSessionId(),
-				savedQueueKind = kind
+				savedQueueId = mediaPlayer.newQueueSessionId(songs),
+				savedQueueKind = kind,
+				savedQueueName = name ?: defaultMixName(kind)
 			)
 		}
+	}
+
+	/** Fallback display name for a generated mix that has no more specific one. */
+	private fun defaultMixName(kind: String): String? = when (kind) {
+		SavedQueueSource.RADIO -> "Radio"
+		SavedQueueSource.MOOD_FLOW -> "Mood Flow"
+		SavedQueueSource.JOURNEY -> "Song Journey"
+		else -> null
 	}
 
 	/** Append a mood mix to the queue — to the session when remote, else locally. */

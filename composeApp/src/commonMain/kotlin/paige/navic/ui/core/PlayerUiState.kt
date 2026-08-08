@@ -31,5 +31,13 @@ data class PlayerUiState(
 	 * written onto the saved-queue history row so generated sessions can be grouped. Persisted with
 	 * the blob so it survives restart.
 	 */
-	val savedQueueKind: String = "manual"
+	val savedQueueKind: String = "manual",
+	/**
+	 * What this queue should be CALLED in the saved-queue history, announced by whoever replaced the
+	 * queue. [currentCollection] can't answer this on its own: generated mixes (radio / Mood Flow /
+	 * journey) have no collection at all, and for the ones that do it resolves asynchronously from the
+	 * playing song, so a title read from it drifted mid-session. Stamped at birth alongside
+	 * [savedQueueId], persisted with the blob.
+	 */
+	val savedQueueName: String? = null
 )

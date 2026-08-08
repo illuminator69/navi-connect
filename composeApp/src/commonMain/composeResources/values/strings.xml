@@ -225,6 +225,12 @@
 		<item quantity="other">%1$d songs</item>
 	</plurals>
 
+	<!-- Saved queues say "tracks" on both clients; Feishin has always used that word. -->
+	<plurals name="count_tracks">
+		<item quantity="one">%1$d track</item>
+		<item quantity="other">%1$d tracks</item>
+	</plurals>
+
 	<plurals name="count_albums">
 		<item quantity="one">%1$d album</item>
 		<item quantity="other">%1$d albums</item>
@@ -406,7 +412,17 @@
 	<string name="title_continue_listening">Continue listening</string>
 	<string name="banner_sync_failed_cached">Showing cached library — sync failed</string>
 	<string name="info_no_saved_queues">No saved queues yet</string>
+	<string name="info_no_saved_queues_hint">Queues you play are saved here automatically</string>
 	<string name="queue_unnamed">No name</string>
+	<string name="queue_now_playing">Now playing</string>
+	<string name="queue_from_source">from %1$s</string>
+	<string name="queue_resumes_here">Resumes here</string>
+	<string name="action_preview_queue">Preview queue</string>
+	<string name="action_close">Close</string>
+	<string name="action_clear_queue_history">Clear all</string>
+	<string name="title_clear_queue_history">Clear saved queues?</string>
+	<string name="message_clear_queue_history">This permanently removes every saved queue on every connected device.</string>
+	<string name="message_restore_queue_failed">Couldn\'t restore that queue</string>
 	<string name="queue_song_count">%1$d songs</string>
 	<string name="action_rename">Rename</string>
 	<string name="action_delete_queue">Delete</string>
@@ -422,7 +438,8 @@
 	<string name="message_saved_as_playlist">Saved as a Navidrome playlist</string>
 	<string name="message_save_playlist_failed">Couldn\'t save the playlist</string>
 	<string name="filter_all">All</string>
-	<string name="queue_kind_manual">Manual</string>
+	<!-- "Queue", not "Manual": Feishin labels this kind that way and the history is shared. -->
+	<string name="queue_kind_manual">Queue</string>
 	<string name="queue_kind_album">Album</string>
 	<string name="queue_kind_playlist">Playlist</string>
 	<string name="queue_kind_radio">Radio</string>
@@ -450,7 +467,9 @@
 	<string name="action_cancel_all">Cancel all</string>
 	<string name="info_download_attempts">Attempt %1$d</string>
 	<string name="title_download_quality">Downloads</string>
-	<string name="option_max_bitrate_download">Max bitrate (downloads)</string>
+	<string name="title_download_format">Download format</string>
+	<string name="title_cellular_playback_source">On mobile data</string>
+	<string name="option_prefer_downloads_cellular">Prefer downloaded songs</string>
 	<string name="action_download_queue">Download queue</string>
 	<string name="action_download_next">Download next %1$d</string>
 	<string name="action_repair_downloads">Repair</string>

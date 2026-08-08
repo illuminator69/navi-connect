@@ -25,10 +25,31 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.launch
 import org.koin.compose.koinInject
 import paige.navic.domain.manager.PreferenceManager
 import kotlin.math.abs
+
+/**
+ * Builds the letter -> grid-item-index map an [AlphabeticalScroller] needs from an
+ * already alphabetically-sorted list. [leadingItems] accounts for any non-item cells
+ * placed before the list (e.g. a count header). [key] extracts the grouping character.
+ * Only the first occurrence of each letter is kept, so tapping a letter jumps to the
+ * first matching entry.
+ */
+fun <T> alphabeticalHeaders(
+	items: List<T>,
+	leadingItems: Int = 0,
+	key: (T) -> Char
+): ImmutableList<Pair<String, Int>> {
+	val seen = LinkedHashMap<Char, Int>()
+	items.forEachIndexed { index, item ->
+		val c = key(item)
+		if (c !in seen) seen[c] = index + leadingItems
+	}
+	return seen.map { (letter, idx) -> letter.toString() to idx }.toImmutableList()
+}
 
 @Composable
 fun AlphabeticalScroller(

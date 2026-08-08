@@ -34,6 +34,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -44,11 +45,13 @@ import navic.composeapp.generated.resources.info_in_use
 import navic.composeapp.generated.resources.info_streaming_quality
 import navic.composeapp.generated.resources.option_enable_custom_bitrates
 import navic.composeapp.generated.resources.option_max_bitrate_cellular
-import navic.composeapp.generated.resources.option_max_bitrate_download
+import navic.composeapp.generated.resources.option_prefer_downloads_cellular
 import navic.composeapp.generated.resources.option_max_bitrate_wifi
 import navic.composeapp.generated.resources.subtitle_max_bitrates
 import navic.composeapp.generated.resources.title_advanced
 import navic.composeapp.generated.resources.title_cellular
+import navic.composeapp.generated.resources.title_cellular_playback_source
+import navic.composeapp.generated.resources.title_download_format
 import navic.composeapp.generated.resources.title_download_quality
 import navic.composeapp.generated.resources.title_streaming_quality
 import navic.composeapp.generated.resources.title_wifi
@@ -75,6 +78,11 @@ fun SettingsStreamingQualityScreen() {
 	val isCellular by connectivityManager.isCellular.collectAsStateWithLifecycle()
 
 	var isAdvancedActive by remember { mutableStateOf(preferenceManager.isAdvancedTranscodingActive) }
+	var downloadBitrate by remember { mutableStateOf(preferenceManager.downloadBitrate) }
+	var downloadFormat by remember { mutableStateOf(preferenceManager.downloadFormat) }
+	var preferDownloadsOnCellular by remember {
+		mutableStateOf(preferenceManager.preferDownloadsOnCellular)
+	}
 
 	Scaffold(
 		topBar = {
@@ -122,17 +130,78 @@ fun SettingsStreamingQualityScreen() {
 							)
 						}
 
-						// Downloads get their OWN quality. A stream is thrown away; a download is
-						// kept, so it shouldn't silently inherit the bitrate chosen to save mobile
-						// data. Changing this affects NEW downloads — existing files keep the
-						// quality they were fetched at, and a retry reuses that too.
-						FormTitle(stringResource(Res.string.title_download_quality))
-						Form(Modifier.selectableGroup()) {
-							RadioButtons(
-								value = preferenceManager.downloadQuality,
-								onChangeValue = { preferenceManager.downloadQuality = it }
+					}
+				}
+
+				// Downloads get their OWN quality. A stream is thrown away; a download is kept, so
+				// it shouldn't silently inherit the bitrate chosen to save mobile data. Bitrate and
+				// container are separate so "original FLAC" and "320 kbps MP3" are both sayable —
+				// the old single tier list stopped at 192 and always forced Opus. Outside the
+				// advanced-mode toggle above: this is independent of the streaming bitrates.
+				// Changing it affects NEW downloads; existing files keep what they were fetched at,
+				// and a retry reuses that too.
+				FormTitle(stringResource(Res.string.title_download_quality))
+				Form(Modifier.selectableGroup()) {
+					DownloadBitrateRadioButtons(
+						value = downloadBitrate,
+						onChangeValue = {
+							downloadBitrate = it
+							preferenceManager.downloadBitrate = it
+						}
+					)
+				}
+
+				FormTitle(stringResource(Res.string.title_download_format))
+				Form(Modifier.selectableGroup()) {
+					DownloadFormatRadioButtons(
+						value = downloadFormat,
+						enabled = downloadBitrate > 0,
+						onChangeValue = {
+							downloadFormat = it
+							preferenceManager.downloadFormat = it
+						}
+					)
+				}
+
+				// Which copy wins on a metered link. Only matters once downloads are transcodes:
+				// at Original bitrate the downloaded file IS the server file.
+				FormTitle(stringResource(Res.string.title_cellular_playback_source))
+				Form {
+					val interactionSource = remember { MutableInteractionSource() }
+					FormRow(
+						modifier = Modifier.clickable(
+							interactionSource = interactionSource,
+							indication = null,
+							onClick = {
+								preferDownloadsOnCellular = !preferDownloadsOnCellular
+								preferenceManager.preferDownloadsOnCellular = preferDownloadsOnCellular
+							}
+						),
+						horizontalArrangement = Arrangement.SpaceBetween,
+						contentPadding = PaddingValues(16.dp)
+					) {
+						Column(Modifier.weight(1f)) {
+							Text(
+								text = stringResource(Res.string.option_prefer_downloads_cellular),
+								style = MaterialTheme.typography.bodyLarge
+							)
+							Text(
+								text = if (preferDownloadsOnCellular) {
+									"Plays your downloaded copy on mobile data — uses no data."
+								} else {
+									"Streams the server's original on mobile data — uses data."
+								},
+								style = MaterialTheme.typography.bodyMedium,
+								color = MaterialTheme.colorScheme.onSurfaceVariant
 							)
 						}
+						Switch(
+							checked = preferDownloadsOnCellular,
+							onCheckedChange = {
+								preferDownloadsOnCellular = it
+								preferenceManager.preferDownloadsOnCellular = it
+							}
+						)
 					}
 				}
 
@@ -224,31 +293,6 @@ fun SettingsStreamingQualityScreen() {
 								singleLine = true
 							)
 
-							Spacer(Modifier.height(16.dp))
-
-							var downloadInput by remember {
-								val current = preferenceManager.customMaxBitrateDownload
-								mutableStateOf(if (current > 0) current.toString() else "")
-							}
-
-							OutlinedTextField(
-								value = downloadInput,
-								onValueChange = { newValue ->
-									if (newValue.isEmpty() || newValue.all { it.isDigit() }) {
-										downloadInput = newValue
-										preferenceManager.customMaxBitrateDownload =
-											newValue.toIntOrNull() ?: 0
-									}
-								},
-								label = { Text(stringResource(Res.string.option_max_bitrate_download)) },
-								placeholder = { Text("0") },
-								supportingText = {
-									Text(stringResource(Res.string.info_bitrate_default_zero))
-								},
-								keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-								modifier = Modifier.fillMaxWidth(),
-								singleLine = true
-							)
 						}
 					}
 				}
@@ -269,6 +313,86 @@ fun SettingsStreamingQualityScreen() {
 						style = MaterialTheme.typography.bodyMedium
 					)
 				}
+			}
+		}
+	}
+}
+
+/** Download bitrate. 0 = ask the server for the original file, so a FLAC stays a FLAC. */
+private val DOWNLOAD_BITRATES = listOf(0, 320, 256, 192, 128)
+
+/** Download container. "" = whatever the original is; otherwise an explicit transcode target. */
+private val DOWNLOAD_FORMATS = listOf("" to "Original", "opus" to "Opus", "mp3" to "MP3")
+
+@Composable
+private fun DownloadBitrateRadioButtons(
+	value: Int,
+	onChangeValue: (Int) -> Unit
+) {
+	DOWNLOAD_BITRATES.forEach { bitrate ->
+		val interactionSource = remember { MutableInteractionSource() }
+
+		FormRow(
+			modifier = Modifier.selectable(
+				selected = value == bitrate,
+				interactionSource = interactionSource,
+				onClick = { onChangeValue(bitrate) },
+				role = Role.RadioButton
+			),
+			horizontalArrangement = Arrangement.spacedBy(14.dp),
+			interactionSource = interactionSource,
+			contentPadding = PaddingValues(16.dp)
+		) {
+			RadioButton(selected = value == bitrate, onClick = null)
+
+			Column(Modifier.weight(1f)) {
+				Text(if (bitrate == 0) "Original" else "$bitrate kbps")
+
+				if (bitrate == 0) {
+					AnimatedVisibility(visible = value == bitrate) {
+						Text(
+							text = "The server's own file, untouched — FLAC stays FLAC.",
+							style = MaterialTheme.typography.bodyMedium,
+							color = MaterialTheme.colorScheme.onSurfaceVariant
+						)
+					}
+				}
+			}
+		}
+	}
+}
+
+@Composable
+private fun DownloadFormatRadioButtons(
+	value: String,
+	enabled: Boolean,
+	onChangeValue: (String) -> Unit
+) {
+	DOWNLOAD_FORMATS.forEach { (format, label) ->
+		val interactionSource = remember { MutableInteractionSource() }
+		val selected = value == format
+
+		FormRow(
+			modifier = Modifier.selectable(
+				selected = selected,
+				enabled = enabled,
+				interactionSource = interactionSource,
+				onClick = { onChangeValue(format) },
+				role = Role.RadioButton
+			),
+			horizontalArrangement = Arrangement.spacedBy(14.dp),
+			interactionSource = interactionSource,
+			contentPadding = PaddingValues(16.dp)
+		) {
+			RadioButton(selected = selected, enabled = enabled, onClick = null)
+
+			Column(Modifier.weight(1f)) {
+				Text(
+					label,
+					// Greyed at Original bitrate: there is no transcode to pick a container for.
+					color = if (enabled) Color.Unspecified
+					else MaterialTheme.colorScheme.onSurfaceVariant
+				)
 			}
 		}
 	}

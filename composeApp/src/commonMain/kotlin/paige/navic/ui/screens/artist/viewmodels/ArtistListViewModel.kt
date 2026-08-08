@@ -42,6 +42,9 @@ class ArtistListViewModel(
 	private val _listType = MutableStateFlow(initialListType)
 	val listType = _listType.asStateFlow()
 
+	private val _selectedReversed = MutableStateFlow(false)
+	val selectedReversed = _selectedReversed.asStateFlow()
+
 	val gridState = LazyGridState()
 
 	init {
@@ -52,7 +55,7 @@ class ArtistListViewModel(
 
 	fun refreshArtists(fullRefresh: Boolean) {
 		viewModelScope.launch {
-			repository.getArtistsFlow(fullRefresh, _listType.value).collect {
+			repository.getArtistsFlow(fullRefresh, _listType.value, _selectedReversed.value).collect {
 				_artistsState.value = it
 			}
 		}
@@ -108,9 +111,16 @@ class ArtistListViewModel(
 		}
 	}
 
-	// TODO: implement me
 	fun setListType(listType: DomainArtistListType) {
+		if (_listType.value == listType) return
 		_listType.value = listType
+		refreshArtists(false)
+	}
+
+	fun setReversed(reversed: Boolean) {
+		if (_selectedReversed.value == reversed) return
+		_selectedReversed.value = reversed
+		refreshArtists(false)
 	}
 
 	fun clearError() {

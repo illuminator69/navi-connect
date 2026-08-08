@@ -45,8 +45,6 @@ import paige.navic.domain.models.DomainSong
 import paige.navic.domain.models.DomainSongCollection
 import paige.navic.domain.repositories.LyricsRepository
 import paige.navic.util.core.Logger
-import paige.navic.util.core.PlatformType
-import paige.navic.util.core.currentPlatformType
 import kotlin.time.Clock
 import coil3.PlatformContext as CoilPlatformContext
 
@@ -200,15 +198,16 @@ class DownloadManager(
 	 * picked to save cellular data.
 	 */
 	fun preferredQuality(): DownloadQuality {
-		val quality = preferenceManager.downloadQuality
-		val isAndroid = currentPlatformType == PlatformType.Android
-		// The custom ceiling only applies when the quality isn't already "original" — an explicit
-		// Lossless choice must not be silently capped.
-		val defaultBitrate = if (isAndroid) quality.bitrateAndroid else quality.bitrateIos
-		val custom = preferenceManager.customMaxBitrateDownload
+		// 0 = ask the server for the original file, so a FLAC stays a FLAC. Any other value is a
+		// transcode ceiling in kbps. Same value model as a per-playlist policy, so the global
+		// setting and a policy can be compared and reasoned about together.
+		val bitrate = preferenceManager.downloadBitrate.coerceAtLeast(0)
 		return DownloadQuality(
-			bitrate = if (custom > 0 && defaultBitrate > 0) custom else defaultBitrate,
-			format = if (isAndroid) quality.containerAndroid else quality.containerIos
+			bitrate = bitrate,
+			// A container with no bitrate still means "transcode" to Subsonic (to that container at
+			// its default rate), so "Original" has to clear it — otherwise a format left over from
+			// an earlier choice would quietly keep re-encoding files the user asked to keep intact.
+			format = if (bitrate == 0) null else preferenceManager.downloadFormat.takeIf { it.isNotBlank() }
 		)
 	}
 
@@ -220,19 +219,29 @@ class DownloadManager(
 	fun downloadSong(
 		song: DomainSong,
 		quality: DownloadQuality? = null,
-		source: String = DownloadSource.MANUAL
+		source: String = DownloadSource.MANUAL,
+		// True when re-attempting a previously-failed row, so the attempt count advances toward
+		// [MAX_DOWNLOAD_RETRIES]. A first attempt (or a not-yet-failed song) passes false.
+		incrementRetry: Boolean = false
 	): Job {
 		val job = scope.launch(Dispatchers.IO) {
-			val alreadyActive = activeDownloadsMutex.withLock { activeDownloads.containsKey(song.id) }
-			if (alreadyActive) return@launch
+			// Check-and-claim in ONE critical section: two concurrent calls for the same songId must
+			// not both pass the "already active?" check before either claims it (would double-download).
+			val claimed = activeDownloadsMutex.withLock {
+				if (activeDownloads.containsKey(song.id)) {
+					false
+				} else {
+					activeDownloads[song.id] = coroutineContext[Job]!!
+					true
+				}
+			}
+			if (!claimed) return@launch
 
 			val resolved = quality ?: preferredQuality()
 			val bitrate = resolved.bitrate
 			val format = resolved.format
 
 			try {
-				activeDownloadsMutex.withLock { activeDownloads[song.id] = coroutineContext[Job]!! }
-
 				// Marked QUEUED *before* asking for a permit, so a 50-track album download shows 50
 				// queued rows and ~10 genuinely transferring — rather than 50 identical spinners.
 				val existing = downloadDao.getDownloadById(song.id)
@@ -243,8 +252,9 @@ class DownloadManager(
 						progress = 0f,
 						maxBitRate = bitrate,
 						format = format,
-						// Keep the original request time across retries; the attempt count too.
-						retryCount = existing?.retryCount ?: 0,
+						// Keep the original request time across retries; advance the attempt count
+						// only when this is an explicit re-attempt of a failed row.
+						retryCount = (existing?.retryCount ?: 0) + if (incrementRetry) 1 else 0,
 						sourcePolicy = source,
 						createdAt = existing?.createdAt?.takeIf { it > 0L } ?: now(),
 						updatedAt = now()
@@ -273,20 +283,14 @@ class DownloadManager(
 	fun retryDownload(song: DomainSong) {
 		scope.launch(Dispatchers.IO) {
 			val existing = downloadDao.getDownloadById(song.id)
-			downloadDao.insertDownload(
-				(existing ?: DownloadEntity(song.id, DownloadStatus.QUEUED)).copy(
-					status = DownloadStatus.QUEUED,
-					progress = 0f,
-					error = null,
-					retryCount = (existing?.retryCount ?: 0) + 1,
-					updatedAt = now()
-				)
-			)
+			// Delegate straight to downloadSong (which writes the QUEUED row) rather than pre-inserting
+			// our own — that avoided a redundant double-insert. `incrementRetry` advances the count.
 			downloadSong(
 				song,
 				// Retry with the settings it was ORIGINALLY requested at, not today's preference.
 				quality = existing?.let { DownloadQuality(it.maxBitRate, it.format) },
-				source = existing?.sourcePolicy ?: DownloadSource.MANUAL
+				source = existing?.sourcePolicy ?: DownloadSource.MANUAL,
+				incrementRetry = true
 			)
 		}
 	}
@@ -311,8 +315,10 @@ class DownloadManager(
 
 	/** Download an arbitrary list of songs (e.g. the current queue), skipping ones already held. */
 	suspend fun downloadSongs(songs: List<DomainSong>, source: String = DownloadSource.MANUAL) {
+		// One bulk fetch of downloaded ids instead of a point query per song.
+		val alreadyDownloaded = downloadDao.getSongIdsByStatus(DownloadStatus.DOWNLOADED).toSet()
 		songs
-			.filter { !isDownloaded(it.id) }
+			.filter { it.id !in alreadyDownloaded }
 			.forEach { downloadSong(it, source = source) }
 	}
 
@@ -350,7 +356,9 @@ class DownloadManager(
 				_isDownloadingLibrary.value = true
 				_libraryDownloadProgress.value = 0f
 
-				val songsToDownload = songs.filter { !isDownloaded(it.id) }
+				// One bulk fetch of downloaded ids instead of a point query per song.
+				val downloadedIds = downloadDao.getSongIdsByStatus(DownloadStatus.DOWNLOADED).toSet()
+				val songsToDownload = songs.filter { it.id !in downloadedIds }
 				val totalToDownload = songsToDownload.size
 
 				if (totalToDownload == 0) {
@@ -662,8 +670,22 @@ class DownloadManager(
 
 	private fun now(): Long = Clock.System.now().toEpochMilliseconds()
 
-	private companion object {
+	/**
+	 * songId -> attempt count for every FAILED row. Lets the auto-sync path (see
+	 * [PlaylistDownloadManager]) stop re-queuing a track that has exhausted its retries, instead of
+	 * hammering a permanently-failing download on every 6h sync (battery/data drain).
+	 */
+	suspend fun failedRetryCounts(): Map<String, Int> =
+		downloadDao.getDownloadsByStatus(DownloadStatus.FAILED).associate { it.songId to it.retryCount }
+
+	companion object {
 		/** Hard ceiling on the user-configurable max-concurrency setting. */
 		const val MAX_CONCURRENCY = 10
+
+		/**
+		 * How many times an auto-managed (playlist policy) download may be re-attempted before it's
+		 * left alone until the user retries it by hand. A manual retry is never blocked by this.
+		 */
+		const val MAX_DOWNLOAD_RETRIES = 3
 	}
 }

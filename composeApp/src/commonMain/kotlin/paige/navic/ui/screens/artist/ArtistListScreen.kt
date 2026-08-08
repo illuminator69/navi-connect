@@ -2,6 +2,7 @@ package paige.navic.ui.screens.artist
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -48,6 +49,7 @@ import paige.navic.ui.components.sheets.ArtistSheet
 import paige.navic.ui.core.UiState
 import paige.navic.ui.navigation.Screen
 import paige.navic.ui.screens.artist.components.ArtistListScreenContent
+import paige.navic.ui.screens.artist.components.ArtistListScreenSortButton
 import paige.navic.ui.screens.artist.viewmodels.ArtistListViewModel
 import paige.navic.ui.screens.playlist.dialogs.PlaylistUpdateDialog
 
@@ -67,16 +69,28 @@ fun ArtistListScreen(
 	val selectedArtist by viewModel.selectedArtist.collectAsState()
 	val selectedArtistAlbums by viewModel.selectedArtistAlbums.collectAsState()
 	val starred by viewModel.starred.collectAsState()
+	val selectedSorting by viewModel.listType.collectAsState()
+	val selectedReversed by viewModel.selectedReversed.collectAsState()
 	val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
 	val player = koinInject<MediaPlayerViewModel>()
 
+	val actions: @Composable RowScope.() -> Unit = {
+		ArtistListScreenSortButton(
+			nested = nested,
+			selectedSorting = selectedSorting,
+			onSetSorting = { viewModel.setListType(it) },
+			selectedReversed = selectedReversed,
+			onSetReversed = { viewModel.setReversed(it) }
+		)
+	}
+
 	Scaffold(
 		topBar = {
 			if (!nested) {
-				RootTopBar({ Text(stringResource(Res.string.title_artists)) }, scrollBehavior)
+				RootTopBar({ Text(stringResource(Res.string.title_artists)) }, scrollBehavior, actions)
 			} else {
-				NestedTopBar({ Text(stringResource(Res.string.title_artists)) })
+				NestedTopBar({ Text(stringResource(Res.string.title_artists)) }, actions = actions)
 			}
 		},
 		bottomBar = {

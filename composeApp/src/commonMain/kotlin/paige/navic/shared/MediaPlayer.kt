@@ -10,9 +10,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -21,12 +19,14 @@ import kotlinx.serialization.json.decodeFromJsonElement
 import paige.navic.domain.models.DomainRadio
 import paige.navic.domain.models.DomainSong
 import paige.navic.domain.models.DomainSongCollection
+import paige.navic.domain.models.toSavedQueueKind
 import paige.navic.domain.repositories.PlayerStateRepository
 import paige.navic.domain.repositories.SavedQueueRepository
 import paige.navic.domain.manager.ConnectivityManager
 import paige.navic.domain.manager.DownloadManager
 import paige.navic.ui.core.PlayerUiState
 import paige.navic.util.core.Logger
+import kotlin.random.Random
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.ExperimentalTime
@@ -41,8 +41,25 @@ import kotlin.time.ExperimentalTime
 interface RemotePlaybackRouter {
 	val isRemoteSessionActive: Boolean
 
-	/** Replace the session queue and play [startIndex] on the active device. */
-	fun setQueue(songs: List<DomainSong>, startIndex: Int)
+	/** True whenever the hub socket is up (independent of who's active). When connected, the hub
+	 *  owns the saved-queue history, so local capture stands down and mirrors the hub instead. */
+	val isHubConnected: Boolean
+
+	/**
+	 * Replace the session queue and play [startIndex] on the active device.
+	 *
+	 * [sourceKind]/[sourceName] describe what is being played (album/playlist/radio + its display
+	 * name) and are passed explicitly rather than read back off player state: the state's
+	 * `currentCollection` only resolves asynchronously from the *playing song's* album, so at
+	 * publish time it is almost always null or the PREVIOUS queue's — which is what left shared
+	 * history rows unnamed.
+	 */
+	fun setQueue(
+		songs: List<DomainSong>,
+		startIndex: Int,
+		sourceKind: String = "manual",
+		sourceName: String? = null
+	)
 
 	/** Append to the session queue, either next or at the end. */
 	fun enqueue(songs: List<DomainSong>, playNext: Boolean)
@@ -55,7 +72,32 @@ interface RemotePlaybackRouter {
 	 * [setQueue] (which always restarts at position 0), this carries the saved playhead so an
 	 * undone clear/remove/move lands the user exactly where they were.
 	 */
-	fun restoreQueue(songs: List<DomainSong>, index: Int, positionMs: Long, play: Boolean)
+	fun restoreQueue(
+		songs: List<DomainSong>,
+		index: Int,
+		positionMs: Long,
+		play: Boolean,
+		savedQueueId: String? = null,
+		sourceKind: String = "manual",
+		sourceName: String? = null
+	)
+
+	/**
+	 * Publish the local queue to the hub again even though its contents are unchanged. The publish
+	 * path dedupes on the queue signature, so after the live record is deleted out from under us
+	 * nothing would re-mint one — see [MediaPlayerViewModel.restartQueueSession].
+	 */
+	fun republishQueue()
+
+	/** Tell the hub the queue was emptied here, so the shared session doesn't keep serving it. */
+	fun clearSessionQueue()
+
+	/**
+	 * Swap hub-derived placeholder songs for the library's own rows, 1:1 and in order. Lives here
+	 * because the hub client is what already owns that resolution (it does the same for every queue
+	 * arriving over the wire).
+	 */
+	suspend fun resolveLibrarySongs(songs: List<DomainSong>): List<DomainSong>
 }
 
 /**
@@ -162,7 +204,13 @@ abstract class MediaPlayerViewModel(
 		val snap = undoStack.removeLastOrNull() ?: return
 		val router = routeRemotely
 		if (router != null) {
-			router.restoreQueue(snap.queue, snap.index, snap.positionMs, play = !snap.wasPaused)
+			// Carry the snapshot's history identity so the undone queue refreshes ITS record
+			// instead of the hub minting a duplicate for the same listening session.
+			router.restoreQueue(
+				snap.queue, snap.index, snap.positionMs, play = !snap.wasPaused,
+				savedQueueId = snap.savedQueueId,
+				sourceKind = snap.savedQueueKind
+			)
 		} else {
 			// Preserve the queue's saved-queue identity + kind so its history row isn't orphaned.
 			loadRemoteQueue(
@@ -187,6 +235,9 @@ abstract class MediaPlayerViewModel(
 	init {
 		viewModelScope.launch {
 			restoreState()
+			// Before any queue can be replaced: sessionIdFor answers from this index, and an empty one
+			// would mint a duplicate for the very first queue played after launch.
+			savedQueueRepository.primeIndex()
 			observeAndSaveState()
 		}
 	}
@@ -254,7 +305,11 @@ abstract class MediaPlayerViewModel(
 			// Send the WHOLE collection and tell the hub where to start, so the rest of the album
 			// is queued behind the tapped song exactly as it would be locally.
 			val start = collection.songs.indexOfFirst { it.id == startSong.id }.coerceAtLeast(0)
-			router.setQueue(collection.songs, start)
+			router.setQueue(
+				collection.songs, start,
+				sourceKind = collection.toSavedQueueKind(),
+				sourceName = collection.name
+			)
 		} else {
 			playCollectionLocal(collection, startSong)
 		}
@@ -266,7 +321,11 @@ abstract class MediaPlayerViewModel(
 		if (router != null) {
 			// Shuffle here rather than asking the hub to: the receiver gets a plain ordered queue,
 			// which keeps the session's own shuffle flag meaning what it already means.
-			router.setQueue(collection.songs.shuffled(), 0)
+			router.setQueue(
+				collection.songs.shuffled(), 0,
+				sourceKind = collection.toSavedQueueKind(),
+				sourceName = collection.name
+			)
 		} else {
 			shufflePlayLocal(collection)
 		}
@@ -300,7 +359,8 @@ abstract class MediaPlayerViewModel(
 		positionMs: Long,
 		play: Boolean,
 		savedQueueId: String? = null,
-		savedQueueKind: String = "manual"
+		savedQueueKind: String = "manual",
+		savedQueueName: String? = null
 	) {}
 	open fun setPlayerVolume(volume: Float) {}
 	open fun applyRemoteRepeat(mode: Int) {}
@@ -341,11 +401,18 @@ abstract class MediaPlayerViewModel(
 
 	@OptIn(FlowPreview::class)
 	private fun observeAndSaveState() {
-		// Single-slot persistence + periodic snapshot refresh. Debounced so a playing track's
-		// per-second progress ticks don't hammer either store.
+		// Single-slot persistence + periodic snapshot refresh, rate-limited so a playing track's
+		// progress ticks don't hammer either store.
+		//
+		// This MUST be sample, not debounce. The progress loop emits every 200 ms while playing, so
+		// `debounce(1s)` — which only fires after a gap with no emissions — never fired at all during
+		// playback: state was persisted solely when playback stopped for a second. That is why a queue
+		// you listened to straight through kept the cursor it was born with (track 1) while one you
+		// happened to pause in got saved. sample emits the LATEST value once per interval instead, so
+		// the cursor is written while you listen.
 		viewModelScope.launch {
 			_uiState
-				.debounce(1.seconds)
+				.sample(1.seconds)
 				.collect { state ->
 					try {
 						val jsonString = Json.encodeToString(state)
@@ -355,7 +422,7 @@ abstract class MediaPlayerViewModel(
 					}
 					try {
 						val id = state.savedQueueId
-						if (id != null && state.queue.isNotEmpty()) {
+						if (id != null && state.queue.isNotEmpty() && remotePlaybackRouter?.isHubConnected != true) {
 							savedQueueRepository.upsert(id, state)
 						}
 					} catch (e: Exception) {
@@ -364,23 +431,40 @@ abstract class MediaPlayerViewModel(
 				}
 		}
 
-		// Create/refresh the row the MOMENT a queue session begins, so it shows up immediately and
-		// the active-queue highlight matches without waiting for the debounce above. The session id
-		// is minted synchronously at the replace points, so it's already correct here.
+		// Queue-session handover. Two jobs, both on the un-sampled state so nothing is missed:
+		//
+		//  - FLUSH the outgoing record at the cursor it had when you left it. Sampling alone leaves
+		//    up to a second unwritten, which at a track boundary is the difference between resuming
+		//    where you were and resuming a track early; switching queues is exactly when that matters.
+		//  - OPEN the incoming record immediately, so it appears in the history and the active-queue
+		//    highlight matches without waiting for the next sample tick.
+		//
+		// The session id is minted synchronously at the replace points, so it's already correct here.
 		viewModelScope.launch {
-			_uiState
-				.map { it.savedQueueId }
-				.distinctUntilChanged()
-				.collect { id ->
-					if (id == null) return@collect
-					val state = _uiState.value
-					if (state.queue.isEmpty()) return@collect
+			var previous: PlayerUiState? = null
+			_uiState.collect { state ->
+				val outgoing = previous
+				previous = state
+				if (outgoing != null && outgoing.savedQueueId == state.savedQueueId) return@collect
+				if (remotePlaybackRouter?.isHubConnected == true) return@collect
+
+				val outgoingId = outgoing?.savedQueueId
+				if (outgoingId != null && outgoing.queue.isNotEmpty()) {
 					try {
-						savedQueueRepository.upsert(id, state)
+						savedQueueRepository.upsert(outgoingId, outgoing)
 					} catch (e: Exception) {
-						Logger.e("MediaPlayerViewModel", "Failed to open queue snapshot!", e)
+						Logger.e("MediaPlayerViewModel", "Failed to flush queue snapshot!", e)
 					}
 				}
+
+				val id = state.savedQueueId ?: return@collect
+				if (state.queue.isEmpty()) return@collect
+				try {
+					savedQueueRepository.upsert(id, state)
+				} catch (e: Exception) {
+					Logger.e("MediaPlayerViewModel", "Failed to open queue snapshot!", e)
+				}
+			}
 		}
 	}
 
@@ -391,43 +475,155 @@ abstract class MediaPlayerViewModel(
 	 */
 	fun swapToSavedQueue(id: String, play: Boolean = false) {
 		viewModelScope.launch {
-			val entity = savedQueueRepository.get(id) ?: return@launch
-			val songs = savedQueueRepository.decodeQueue(entity)
-			if (songs.isEmpty()) return@launch
-			val index = entity.currentIndex.coerceIn(0, songs.lastIndex)
+			try {
+				val entity = savedQueueRepository.get(id)
+					?: throw IllegalStateException("saved queue $id is gone")
+				val stored = savedQueueRepository.decodeQueue(entity)
+				if (stored.isEmpty()) throw IllegalStateException("saved queue $id decoded to nothing")
+				val songs = resolvePlaceholders(stored)
+				val index = entity.currentIndex.coerceIn(0, songs.lastIndex)
+				val name = entity.name ?: entity.sourceName
 
-			val router = routeRemotely
-			if (router != null) {
-				router.restoreQueue(songs, index, entity.positionMs, play)
-				_uiState.update { it.copy(savedQueueId = id, savedQueueKind = entity.sourceKind) }
-			} else {
-				// loadRemoteQueue carries the id + kind through the queue replacement, so the
-				// restored session keeps its history-row identity (and generated-session grouping).
-				loadRemoteQueue(
-					songs, index, entity.positionMs, play,
-					savedQueueId = id,
-					savedQueueKind = entity.sourceKind
-				)
+				val router = routeRemotely
+				if (router != null) {
+					// Reuse THIS record's id/kind/name remotely too, so resuming a saved queue on
+					// another device refreshes the same history row instead of forking a new one.
+					router.restoreQueue(
+						songs, index, entity.positionMs, play,
+						savedQueueId = id,
+						sourceKind = entity.sourceKind,
+						sourceName = name
+					)
+					_uiState.update {
+						it.copy(
+							savedQueueId = id,
+							savedQueueKind = entity.sourceKind,
+							savedQueueName = name
+						)
+					}
+				} else {
+					// loadRemoteQueue carries the id + kind through the queue replacement, so the
+					// restored session keeps its history-row identity (and generated-session grouping).
+					loadRemoteQueue(
+						songs, index, entity.positionMs, play,
+						savedQueueId = id,
+						savedQueueKind = entity.sourceKind,
+						savedQueueName = name
+					)
+				}
+				_restoreFailed.value = false
+			} catch (e: Exception) {
+				// Silent failure here used to be invisible: the surfaces close themselves on tap, so
+				// the user just saw the screen go away and nothing play.
+				Logger.e("MediaPlayerViewModel", "Failed to restore saved queue $id", e)
+				_restoreFailed.value = true
 			}
 		}
 	}
 
 	/**
+	 * Records captured from the hub hold placeholder songs — synthesized from the wire metadata, so
+	 * they have no album id, no mime type and (for anything the library hasn't synced) no real
+	 * duration. Swap in the library's own rows before playing, strictly 1:1: dropping a track that is
+	 * still missing would shift every index after it and resume on the wrong song.
+	 */
+	private suspend fun resolvePlaceholders(songs: List<DomainSong>): List<DomainSong> {
+		if (songs.none { it.albumId == null }) return songs
+		val router = remotePlaybackRouter ?: return songs
+		return try {
+			router.resolveLibrarySongs(songs)
+		} catch (e: Exception) {
+			Logger.e("MediaPlayerViewModel", "Failed to resolve saved-queue songs", e)
+			songs
+		}
+	}
+
+	/** One-shot "that queue wouldn't restore" signal for the saved-queue surfaces. */
+	private val _restoreFailed = MutableStateFlow(false)
+	val restoreFailed: StateFlow<Boolean> = _restoreFailed.asStateFlow()
+
+	fun clearRestoreFailed() { _restoreFailed.value = false }
+
+	/**
 	 * A fresh saved-queue session id. Called synchronously by the platform players' queue-REPLACE
 	 * paths (play collection / shuffle / radio), so [PlayerUiState.savedQueueId] always identifies
 	 * the current queue the instant it starts — mutations then preserve it via `.copy`.
+	 *
+	 * The random suffix is not decoration: the hub's union-merge is keyed purely by id, so two devices
+	 * that started a queue in the same millisecond used to mint the same `q_<t>_0` and have two
+	 * unrelated listening sessions silently fused into one record. The hub (`os.urandom(3).hex()`) and
+	 * Feishin (`crypto.randomUUID()`) both carry entropy for the same reason.
 	 */
 	@OptIn(ExperimentalTime::class)
 	protected fun newSessionId(): String =
-		"q_${Clock.System.now().toEpochMilliseconds()}_${sessionIdCounter++}"
+		"q_${Clock.System.now().toEpochMilliseconds()}_" +
+			Random.nextInt(0x1000000).toString(16).padStart(6, '0')
+
+	/**
+	 * The saved-queue session id for [songs]: the id of the record we ALREADY have for this queue when
+	 * one exists, else a fresh one. Without the lookup every replay of the same album, every relaunch
+	 * and every restore minted another near-identical history card until the 20-row cache was nothing
+	 * but duplicates. Feishin does the same (`findMatchingSavedQueueId`), so both clients converge on
+	 * one record per listening session.
+	 *
+	 * Synchronous by design — the queue-REPLACE paths that call it are not suspending, which is why
+	 * [SavedQueueRepository] keeps its membership index in memory.
+	 */
+	protected fun sessionIdFor(songs: List<DomainSong>): String =
+		savedQueueRepository.findMatching(songs.map { it.id }) ?: newSessionId()
 
 	/**
 	 * Public minter for callers outside the platform players (e.g. RadioManager starting a local
 	 * generated mix through [loadRemoteQueue]) that need a saved-queue session id.
 	 */
-	fun newQueueSessionId(): String = newSessionId()
+	fun newQueueSessionId(songs: List<DomainSong> = emptyList()): String =
+		if (songs.isEmpty()) newSessionId() else sessionIdFor(songs)
 
-	private var sessionIdCounter: Int = 0
+	/**
+	 * Start a NEW session for the queue that's playing right now, re-deriving its identity from the
+	 * queue itself. Used when the record the live queue was writing into disappears (the user deleted
+	 * it, or cleared the whole history): without this the session id points at nothing, the publish
+	 * dedupe means nothing re-mints, and what you are listening to has no card until you play something
+	 * else. Feishin's `restartQueueSession` does the same.
+	 */
+	fun restartQueueSession() {
+		val state = _uiState.value
+		if (state.queue.isEmpty()) {
+			_uiState.update { it.copy(savedQueueId = null) }
+			return
+		}
+		// Bypass the membership lookup: the record it would find is the one just deleted.
+		val fresh = newSessionId()
+		_uiState.update { it.copy(savedQueueId = fresh) }
+		val router = remotePlaybackRouter
+		if (router?.isHubConnected == true) {
+			// The hub owns the history while connected, and its publish dedupes on the queue's
+			// contents — which haven't changed — so it needs telling explicitly.
+			router.republishQueue()
+			return
+		}
+		viewModelScope.launch {
+			try {
+				savedQueueRepository.upsert(fresh, _uiState.value)
+			} catch (e: Exception) {
+				Logger.e("MediaPlayerViewModel", "Failed to restart the queue session", e)
+			}
+		}
+	}
+
+	/**
+	 * Remember the saved-queue id a publish just used, so a re-publish of the same queue reuses it.
+	 *
+	 * The hub-publish path derives an id when the state carries none (`HubManager.hubSavedQueueIdFor`)
+	 * but that id lived only inside the frame it was sent in. The claim-republish loop then re-derived
+	 * it on every pass and — until the hub's broadcast round-tripped back into the local index — could
+	 * mint a *different* one each time, forking a history card per republish.
+	 *
+	 * Only fills a hole: a queue-replace that raced with the publish owns the id it set.
+	 */
+	fun adoptQueueSessionId(id: String) {
+		_uiState.update { if (it.savedQueueId == null) it.copy(savedQueueId = id) else it }
+	}
 
 	companion object {
 		private const val MAX_UNDO = 10

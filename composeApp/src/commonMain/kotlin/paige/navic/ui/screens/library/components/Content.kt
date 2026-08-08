@@ -70,7 +70,10 @@ fun LibraryScreenContent(
 
 	// continue listening (recent saved queues, most-recent first)
 	continueListening: List<SavedQueueEntity>,
-	onResumeQueue: (String) -> Unit,
+	activeQueueId: String?,
+	onResumeQueue: (SavedQueueEntity) -> Unit,
+	onPreviewQueue: (SavedQueueEntity) -> Unit,
+	onRemoveQueue: (SavedQueueEntity) -> Unit,
 	// true when the last full sync failed and we're showing the cached library
 	syncFailed: Boolean,
 
@@ -197,7 +200,10 @@ fun LibraryScreenContent(
 			ContinueListeningCard(
 				modifier = Modifier.animateItem().width(150.dp),
 				queue = queue,
-				onClick = { onResumeQueue(queue.id) }
+				isActive = queue.id == activeQueueId,
+				onClick = { onResumeQueue(queue) },
+				onPreview = { onPreviewQueue(queue) },
+				onRemove = { onRemoveQueue(queue) }
 			)
 		}
 
@@ -210,7 +216,7 @@ fun LibraryScreenContent(
 		) { album ->
 			AlbumListScreenItem(
 				modifier = Modifier.animateItem().width(150.dp),
-				tab = "library",
+				tab = "library-recent",
 				album = album,
 				selected = album == selectedAlbum,
 				starred = selectedAlbumIsStarred,
@@ -234,7 +240,7 @@ fun LibraryScreenContent(
 		) { album ->
 			AlbumListScreenItem(
 				modifier = Modifier.animateItem().width(150.dp),
-				tab = "library",
+				tab = "library-frequent",
 				album = album,
 				selected = album == selectedAlbum,
 				starred = selectedAlbumIsStarred,
@@ -258,7 +264,7 @@ fun LibraryScreenContent(
 		) { album ->
 			AlbumListScreenItem(
 				modifier = Modifier.animateItem().width(150.dp),
-				tab = "library",
+				tab = "library-newest",
 				album = album,
 				selected = album == selectedAlbum,
 				starred = selectedAlbumIsStarred,
@@ -282,7 +288,7 @@ fun LibraryScreenContent(
 		) { playlist ->
 			PlaylistListScreenItem(
 				modifier = Modifier.animateItem().width(150.dp),
-				tab = "library",
+				tab = "library-playlists",
 				playlist = playlist,
 				selected = playlist == selectedPlaylist,
 				onSelect = { onSelectPlaylist(playlist) },
@@ -303,7 +309,7 @@ fun LibraryScreenContent(
 		) { artist ->
 			ArtistsScreenItem(
 				modifier = Modifier.animateItem().width(150.dp),
-				tab = "library",
+				tab = "library-artists",
 				artist = artist,
 				selected = artist == selectedArtist,
 				selectedArtistAlbums = selectedArtistAlbums,

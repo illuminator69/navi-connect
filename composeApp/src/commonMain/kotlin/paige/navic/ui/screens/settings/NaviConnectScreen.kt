@@ -11,12 +11,16 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -41,6 +45,14 @@ fun NaviConnectScreen() {
 	val devices by hubManager.devices.collectAsState()
 	val myDeviceId by hubManager.myDeviceId.collectAsState()
 	val activeDeviceId by hubManager.activeDeviceId.collectAsState()
+	val connectionError by hubManager.connectionError.collectAsState()
+
+	// Surface a hub-side error (bad token, target offline, …) the moment it arrives, so a wrong
+	// token reads as an actual error instead of "just never connects".
+	val snackbarHostState = remember { SnackbarHostState() }
+	LaunchedEffect(connectionError) {
+		connectionError?.let { snackbarHostState.showSnackbar(it) }
+	}
 
 	var enabled by rememberSaveable { mutableStateOf(preferenceManager.hubEnabled) }
 	var url by rememberSaveable { mutableStateOf(preferenceManager.hubUrl) }
@@ -64,7 +76,8 @@ fun NaviConnectScreen() {
 	}
 
 	Scaffold(
-		topBar = { NestedTopBar({ Text("navi-connect") }) }
+		topBar = { NestedTopBar({ Text("navi-connect") }) },
+		snackbarHost = { SnackbarHost(snackbarHostState) }
 	) { innerPadding ->
 		Column(
 			modifier = Modifier
@@ -81,9 +94,14 @@ fun NaviConnectScreen() {
 				Column(Modifier.weight(1f)) {
 					Text("Enable navi-connect", style = MaterialTheme.typography.titleMedium)
 					Text(
-						if (connected) "Connected to hub" else "Not connected",
+						when {
+							connected -> "Connected to hub"
+							connectionError != null -> connectionError!!
+							else -> "Not connected"
+						},
 						style = MaterialTheme.typography.bodySmall,
-						color = MaterialTheme.colorScheme.onSurfaceVariant
+						color = if (!connected && connectionError != null) MaterialTheme.colorScheme.error
+							else MaterialTheme.colorScheme.onSurfaceVariant
 					)
 				}
 				Switch(
@@ -123,15 +141,17 @@ fun NaviConnectScreen() {
 
 			Text("AudioMuse-AI (Tier 2)", style = MaterialTheme.typography.titleMedium)
 			Text(
-				"Optional. Unlocks Sonic Fingerprint autoplay. Point at the AudioMuse " +
-					"core API and paste its API token.",
+				"Unlocks Sonic Fingerprint autoplay, Mood Flow and mood search. Normally " +
+					"routed through the hub above, which holds the AudioMuse address and " +
+					"token server-side — leave these blank. Fill them in only to reach " +
+					"the core API directly, for a LAN setup with no hub.",
 				style = MaterialTheme.typography.bodySmall,
 				color = MaterialTheme.colorScheme.onSurfaceVariant
 			)
 			OutlinedTextField(
 				value = audioMuseUrl,
 				onValueChange = { audioMuseUrl = it },
-				label = { Text("AudioMuse URL") },
+				label = { Text("AudioMuse URL (direct, optional)") },
 				placeholder = { Text("http://192.168.1.10:8000") },
 				singleLine = true,
 				modifier = Modifier.fillMaxWidth()
@@ -139,7 +159,7 @@ fun NaviConnectScreen() {
 			OutlinedTextField(
 				value = audioMuseToken,
 				onValueChange = { audioMuseToken = it },
-				label = { Text("API token") },
+				label = { Text("AudioMuse API token (direct, optional)") },
 				singleLine = true,
 				modifier = Modifier.fillMaxWidth()
 			)

@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kyant.capsule.ContinuousRoundedRectangle
 import navic.composeapp.generated.resources.Res
+import navic.composeapp.generated.resources.action_cancel
 import navic.composeapp.generated.resources.action_clear_queue
 import navic.composeapp.generated.resources.action_undo
 import navic.composeapp.generated.resources.count_songs
@@ -309,8 +310,7 @@ fun QueueScreen() {
 					// Downloads are local files, so this is meaningless while another device holds
 					// the session (its queue can be remote placeholders not in our library).
 					if (!isRemoteActive) {
-						QueueDownloadButton(queue = queue)
-						QueueDownloadNextButton(
+						QueueDownloadMenuButton(
 							queue = queue,
 							fromIndex = playerState.currentIndex
 						)
@@ -334,7 +334,8 @@ fun QueueScreen() {
 		LazyColumn(
 			modifier = Modifier
 				.padding(horizontal = 12.dp)
-				.fillMaxSize(),
+				.fillMaxWidth()
+				.weight(1f),
 			state = draggableState.listState,
 			verticalArrangement = if (queue.isNotEmpty())
 				Arrangement.spacedBy(ListItemDefaults.SegmentedGap)
@@ -488,28 +489,77 @@ private fun RelatedTab() {
 	}
 }
 
+private const val DOWNLOAD_NEXT_COUNT = 10
+
 /**
- * "Download next N": queues the upcoming [DOWNLOAD_NEXT_COUNT] songs from the current playhead for
- * offline, without touching what's already behind it. A lightweight complement to the whole-queue
- * download button — handy on a long generated mix where only the near future matters.
+ * A single download control for the queue: one icon (reflecting the whole-queue download state) that
+ * opens a menu with "Download whole queue" (download → cancel while in flight → delete once held) and
+ * "Download next N". Consolidates what used to be two adjacent icon buttons.
  */
 @Composable
-private fun QueueDownloadNextButton(queue: List<DomainSong>, fromIndex: Int) {
+private fun QueueDownloadMenuButton(queue: List<DomainSong>, fromIndex: Int) {
 	val downloadManager = koinInject<DownloadManager>()
 	val scope = rememberCoroutineScope()
+	val songIds = remember(queue) { queue.map { it.id }.distinct() }
+	val status by downloadManager
+		.getCollectionDownloadStatus(songIds)
+		.collectAsState(initial = DownloadStatus.NOT_DOWNLOADED)
 	var menuOpen by remember { mutableStateOf(false) }
+
 	Box {
 		IconButton(enabled = queue.isNotEmpty(), onClick = { menuOpen = true }) {
-			Icon(
-				Icons.Outlined.Download,
-				contentDescription = stringResource(Res.string.action_download_next, DOWNLOAD_NEXT_COUNT),
-				modifier = Modifier.size(18.dp)
-			)
+			when (status) {
+				DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED ->
+					CircularProgressIndicator(
+						modifier = Modifier.size(20.dp),
+						strokeWidth = 2.dp
+					)
+
+				DownloadStatus.DOWNLOADED -> Icon(
+					Icons.Outlined.Delete,
+					contentDescription = stringResource(Res.string.action_delete_download),
+					modifier = Modifier.size(22.dp)
+				)
+
+				else -> Icon(
+					Icons.Outlined.Download,
+					contentDescription = stringResource(Res.string.action_download_queue),
+					modifier = Modifier.size(22.dp)
+				)
+			}
 		}
 		paige.navic.ui.components.common.Dropdown(
 			expanded = menuOpen,
 			onDismissRequest = { menuOpen = false }
 		) {
+			// Whole-queue action — label + behaviour follow the current state.
+			val (wholeLabel, wholeIcon) = when (status) {
+				DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED ->
+					Res.string.action_cancel to Icons.Outlined.Close
+				DownloadStatus.DOWNLOADED ->
+					Res.string.action_delete_download to Icons.Outlined.Delete
+				else -> Res.string.action_download_queue to Icons.Outlined.Download
+			}
+			paige.navic.ui.components.common.DropdownItem(
+				text = { Text(stringResource(wholeLabel)) },
+				onClick = {
+					menuOpen = false
+					scope.launch {
+						when (status) {
+							DownloadStatus.NOT_DOWNLOADED, DownloadStatus.FAILED ->
+								downloadManager.downloadSongs(
+									queue.distinctBy { it.id },
+									source = DownloadSource.QUEUE
+								)
+							DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED ->
+								downloadManager.cancelDownloads(songIds)
+							DownloadStatus.DOWNLOADED ->
+								downloadManager.deleteDownloads(songIds)
+						}
+					}
+				},
+				leadingIcon = { Icon(wholeIcon, null) }
+			)
 			paige.navic.ui.components.common.DropdownItem(
 				text = { Text(stringResource(Res.string.action_download_next, DOWNLOAD_NEXT_COUNT)) },
 				onClick = {
@@ -519,69 +569,6 @@ private fun QueueDownloadNextButton(queue: List<DomainSong>, fromIndex: Int) {
 					}
 				},
 				leadingIcon = { Icon(Icons.Outlined.Download, null) }
-			)
-		}
-	}
-}
-
-private const val DOWNLOAD_NEXT_COUNT = 10
-
-/**
- * Download the whole current queue, tagged so the download center shows these as queue-owned.
- * Mirrors the collection download button's state machine: download → cancel (while in flight) →
- * delete (once held).
- */
-@Composable
-private fun QueueDownloadButton(queue: List<DomainSong>) {
-	val downloadManager = koinInject<DownloadManager>()
-	val scope = rememberCoroutineScope()
-	val songIds = remember(queue) { queue.map { it.id }.distinct() }
-	val status by downloadManager
-		.getCollectionDownloadStatus(songIds)
-		.collectAsState(initial = DownloadStatus.NOT_DOWNLOADED)
-
-	IconButton(
-		enabled = queue.isNotEmpty(),
-		onClick = {
-			scope.launch {
-				when (status) {
-					DownloadStatus.NOT_DOWNLOADED, DownloadStatus.FAILED ->
-						downloadManager.downloadSongs(
-							queue.distinctBy { it.id },
-							source = DownloadSource.QUEUE
-						)
-					DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED ->
-						downloadManager.cancelDownloads(songIds)
-					DownloadStatus.DOWNLOADED ->
-						downloadManager.deleteDownloads(songIds)
-				}
-			}
-		}
-	) {
-		when (status) {
-			DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED ->
-				Box(contentAlignment = Alignment.Center) {
-					CircularProgressIndicator(
-						modifier = Modifier.size(20.dp),
-						strokeWidth = 2.dp
-					)
-					Icon(
-						Icons.Outlined.Close,
-						contentDescription = stringResource(Res.string.action_clear_queue),
-						modifier = Modifier.size(10.dp)
-					)
-				}
-
-			DownloadStatus.DOWNLOADED -> Icon(
-				Icons.Outlined.Delete,
-				contentDescription = stringResource(Res.string.action_delete_download),
-				modifier = Modifier.size(22.dp)
-			)
-
-			else -> Icon(
-				Icons.Outlined.Download,
-				contentDescription = stringResource(Res.string.action_download_queue),
-				modifier = Modifier.size(22.dp)
 			)
 		}
 	}

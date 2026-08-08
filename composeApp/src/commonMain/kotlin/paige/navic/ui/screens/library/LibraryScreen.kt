@@ -58,6 +58,10 @@ import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
 import paige.navic.domain.repositories.AlbumRepository
 import paige.navic.domain.repositories.SavedQueueRepository
+import paige.navic.data.database.entities.SavedQueueEntity
+import paige.navic.ui.screens.savedqueues.components.SavedQueuePreviewSheet
+import paige.navic.ui.screens.savedqueues.rememberSavedQueueActions
+import paige.navic.ui.screens.savedqueues.viewmodels.SavedQueuesViewModel
 import paige.navic.ui.core.LoginUiState
 import paige.navic.ui.core.UiState
 import kotlin.time.Duration
@@ -117,14 +121,30 @@ fun LibraryScreen() {
 	val allSavedQueues by savedQueueRepository.observeAll()
 		.collectAsStateWithLifecycle(initialValue = emptyList())
 	val playerLocalState by player.localUiState.collectAsStateWithLifecycle()
-	val continueListening = remember(allSavedQueues, playerLocalState.savedQueueId) {
+	// What's playing may be on ANOTHER device, in which case only the hub session knows the
+	// queue's identity — keying this on local state alone left a remotely-playing queue
+	// listed as "continue listening" (and unmarked as current). Same rule as SavedQueuesScreen.
+	val hubManager = koinInject<paige.navic.domain.manager.HubManager>()
+	val hubConnected by hubManager.connected.collectAsStateWithLifecycle()
+	val hubSession by hubManager.remoteSession.collectAsStateWithLifecycle()
+	val playingQueueId = (if (hubConnected) hubSession.savedQueueId else null)
+		?: playerLocalState.savedQueueId
+	// The queue that's playing is pinned FIRST and marked, rather than hidden: this is one shared
+	// history rendered on two clients, and Feishin's carousel puts it first — a row that silently
+	// omitted whatever you were listening to disagreed with the desktop about what the list even is.
+	val continueListening = remember(allSavedQueues, playingQueueId) {
 		allSavedQueues
-			.filter { it.id != playerLocalState.savedQueueId }
+			.sortedByDescending { it.id == playingQueueId }
 			.take(10)
 	}
 
 	// Stale-library signal: when a full sync last failed at the top level (server unreachable), tell
 	// the user the grid below is the cached copy instead of implying it's empty/broken.
+	// Same hub-routed edits the Saved Queues screen uses, so the card menu here can't drift from it.
+	val savedQueuesViewModel = koinViewModel<SavedQueuesViewModel>()
+	val savedQueueActions = rememberSavedQueueActions(savedQueuesViewModel, player)
+	var previewQueue by remember { mutableStateOf<SavedQueueEntity?>(null) }
+
 	val syncManager = koinInject<paige.navic.domain.manager.SyncManager>()
 	val syncState by syncManager.syncState.collectAsStateWithLifecycle()
 
@@ -202,7 +222,10 @@ fun LibraryScreen() {
 				onSetShareId = { shareId = it },
 
 				continueListening = continueListening,
-				onResumeQueue = { player.swapToSavedQueue(it, play = true) },
+				activeQueueId = playingQueueId,
+				onResumeQueue = { savedQueueActions.resume(it) },
+				onPreviewQueue = { previewQueue = it },
+				onRemoveQueue = { savedQueueActions.delete(it) },
 				syncFailed = syncState.lastSyncFailed && !syncState.isSyncing,
 
 				albumsState = albumsState,
@@ -249,6 +272,17 @@ fun LibraryScreen() {
 		(artistsState as? UiState.Error)?.error,
 		(genresState as? UiState.Error)?.error
 	).mapNotNull { it?.stackTraceToString() }.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+
+	previewQueue?.let { target ->
+		SavedQueuePreviewSheet(
+			queue = target,
+			onResume = {
+				previewQueue = null
+				savedQueueActions.resume(target)
+			},
+			onDismissRequest = { previewQueue = null }
+		)
+	}
 
 	ErrorSnackbar(
 		error = flattenedErrors?.let { Error(it) },

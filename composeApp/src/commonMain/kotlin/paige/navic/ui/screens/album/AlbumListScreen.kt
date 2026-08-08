@@ -2,6 +2,7 @@ package paige.navic.ui.screens.album
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -15,10 +16,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.collections.immutable.persistentListOf
 import navic.composeapp.generated.resources.Res
 import navic.composeapp.generated.resources.title_albums
 import org.jetbrains.compose.resources.stringResource
@@ -31,7 +34,9 @@ import paige.navic.domain.models.DomainAlbumListType
 import paige.navic.domain.models.DomainSongCollection
 import paige.navic.domain.models.settings.BottomBarVisibilityMode
 import paige.navic.shared.MediaPlayerViewModel
+import paige.navic.ui.components.common.AlphabeticalScroller
 import paige.navic.ui.components.common.ErrorSnackbar
+import paige.navic.ui.components.common.alphabeticalHeaders
 import paige.navic.ui.components.layouts.ArtGrid
 import paige.navic.ui.components.layouts.NestedTopBar
 import paige.navic.ui.components.layouts.PullToRefreshBox
@@ -105,31 +110,54 @@ fun AlbumListScreen(
 			onRefresh = { viewModel.refreshAlbums(true) },
 			key = albumsState
 		) {
-			ArtGrid(
-				modifier = if (!nested)
-					Modifier.nestedScroll(scrollBehavior.nestedScrollConnection)
-				else Modifier,
-				state = viewModel.gridState,
-				contentPadding = innerPadding.withoutTop(),
-				verticalArrangement = if ((albumsState as? UiState.Success)?.data?.isEmpty() == true)
-					Arrangement.Center
-				else Arrangement.spacedBy(12.dp)
-			) {
-				albumListScreenContent(
-					state = albumsState,
-					starred = starred,
-					selectedAlbum = selectedAlbum,
-					selectedAlbumRating = rating,
-					onPlayNext = { if (selectedAlbum != null) player.playNext(selectedAlbum as DomainSongCollection) },
-					onAddToQueue = { if (selectedAlbum != null) player.addToQueue(selectedAlbum as DomainSongCollection) },
-					onUpdateSelection = { viewModel.selectAlbum(it) },
-					onClearSelection = { viewModel.clearSelection() },
-					onSetShareId = { newShareId ->
-						shareId = newShareId
-					},
-					onSetStarred = { viewModel.starAlbum(it) },
-					onRateSelectedAlbum = { viewModel.setRating(it) }
-				)
+			Box {
+				ArtGrid(
+					modifier = if (!nested)
+						Modifier.nestedScroll(scrollBehavior.nestedScrollConnection)
+					else Modifier,
+					state = viewModel.gridState,
+					contentPadding = innerPadding.withoutTop(),
+					verticalArrangement = if ((albumsState as? UiState.Success)?.data?.isEmpty() == true)
+						Arrangement.Center
+					else Arrangement.spacedBy(12.dp)
+				) {
+					albumListScreenContent(
+						state = albumsState,
+						starred = starred,
+						selectedAlbum = selectedAlbum,
+						selectedAlbumRating = rating,
+						onPlayNext = { if (selectedAlbum != null) player.playNext(selectedAlbum as DomainSongCollection) },
+						onAddToQueue = { if (selectedAlbum != null) player.addToQueue(selectedAlbum as DomainSongCollection) },
+						onUpdateSelection = { viewModel.selectAlbum(it) },
+						onClearSelection = { viewModel.clearSelection() },
+						onSetShareId = { newShareId ->
+							shareId = newShareId
+						},
+						onSetStarred = { viewModel.starAlbum(it) },
+						onRateSelectedAlbum = { viewModel.setRating(it) }
+					)
+				}
+
+				// Alphabetical jump rail — only when the list is actually sorted by a name, so a
+				// letter maps to a contiguous run. albumListScreenContent places items with no
+				// leading cells, so the item index is the album's position in the list.
+				val alphaHeaders = remember(albumsState, selectedSorting) {
+					val data = albumsState.data.orEmpty()
+					when (selectedSorting) {
+						DomainAlbumListType.AlphabeticalByName ->
+							alphabeticalHeaders(data) { it.name.firstOrNull()?.uppercaseChar() ?: '#' }
+						DomainAlbumListType.AlphabeticalByArtist ->
+							alphabeticalHeaders(data) { it.artistName.firstOrNull()?.uppercaseChar() ?: '#' }
+						else -> persistentListOf<Pair<String, Int>>()
+					}
+				}
+				if (alphaHeaders.isNotEmpty()) {
+					AlphabeticalScroller(
+						state = viewModel.gridState,
+						headers = alphaHeaders,
+						modifier = Modifier.align(Alignment.TopEnd)
+					)
+				}
 			}
 		}
 	}

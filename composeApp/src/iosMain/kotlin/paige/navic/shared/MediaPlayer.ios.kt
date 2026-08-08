@@ -20,6 +20,8 @@ import paige.navic.domain.models.DomainExplicitStatus
 import paige.navic.domain.models.DomainRadio
 import paige.navic.domain.models.DomainSong
 import paige.navic.domain.models.DomainSongCollection
+import paige.navic.domain.models.SavedQueueSource
+import paige.navic.domain.models.toSavedQueueKind
 import paige.navic.domain.repositories.PlayerStateRepository
 import paige.navic.domain.repositories.SavedQueueRepository
 import paige.navic.ui.core.PlayerUiState
@@ -250,9 +252,13 @@ class IOSMediaPlayerViewModel(
 				queue = newCollection,
 				currentIndex = startIndex,
 				currentSong = newCollection.getOrNull(startIndex),
+				currentCollection = collection,
 				isLoading = true,
-				// Fresh queue → new saved-queue session (see SavedQueueRepository).
-				savedQueueId = newSessionId()
+				// Fresh queue → saved-queue session (see SavedQueueRepository). Resolved rather than
+				// minted so replaying the same collection refreshes its card instead of cloning it.
+				savedQueueId = sessionIdFor(newCollection),
+				savedQueueKind = collection.toSavedQueueKind(),
+				savedQueueName = collection.name
 			)
 		}
 
@@ -349,7 +355,9 @@ class IOSMediaPlayerViewModel(
 				currentIndex = 0,
 				currentSong = dummyRadioSong,
 				isLoading = true,
-				savedQueueId = newSessionId()
+				savedQueueId = sessionIdFor(listOf(dummyRadioSong)),
+				savedQueueKind = SavedQueueSource.RADIO,
+				savedQueueName = radio.name
 			)
 		}
 
@@ -431,7 +439,16 @@ class IOSMediaPlayerViewModel(
 		player.pause()
 		player.replaceCurrentItemWithPlayerItem(null)
 		_uiState.update {
-			it.copy(queue = emptyList(), currentSong = null, currentIndex = -1, progress = 0f, isPaused = true)
+			it.copy(
+				queue = emptyList(),
+				currentSong = null,
+				currentIndex = -1,
+				progress = 0f,
+				isPaused = true,
+				savedQueueId = null,
+				savedQueueKind = "manual",
+				savedQueueName = null
+			)
 		}
 		scrobbleManager.onIsPlayingChanged(false)
 		updateNowPlayingInfo(null)
@@ -482,7 +499,10 @@ class IOSMediaPlayerViewModel(
 				queue = shuffledSongs,
 				currentIndex = 0,
 				currentSong = shuffledSongs.firstOrNull(),
-				savedQueueId = newSessionId()
+				currentCollection = collection,
+				savedQueueId = sessionIdFor(shuffledSongs),
+				savedQueueKind = collection.toSavedQueueKind(),
+				savedQueueName = collection.name
 			)
 		}
 		playAt(0)

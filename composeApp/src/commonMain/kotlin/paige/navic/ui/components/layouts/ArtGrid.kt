@@ -85,6 +85,14 @@ fun ArtGridItem(
 	// this parameter is a shitty workaround for shared element
 	// transitions being performed when switching between tabs
 	// this can just be an empty string if the tab is unknown
+	//
+	// It also has to be unique per LIST, not just per tab: `"$tab-$id-cover"` is the shared-element
+	// key, and two visible elements claiming one key is undefined behaviour. The library home shows
+	// three album rows at once and an album can be in all three, so they pass "library-recent" /
+	// "library-frequent" / "library-newest" rather than a single "library". With a duplicate key,
+	// opening one copy dragged the OTHER row's copy into the transition too, and one of the two
+	// popped into place instead of animating. Whatever is passed here must match what's handed to
+	// `Screen.CollectionDetail`, since the detail header rebuilds the same key from it.
 	tab: String
 ) {
 	val interactionSource = remember { MutableInteractionSource() }

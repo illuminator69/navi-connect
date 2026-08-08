@@ -25,8 +25,12 @@ class SavedQueuesViewModel(
 	private val playlistDao: PlaylistDao
 ) : ViewModel() {
 
+	/**
+	 * Null until Room has emitted for the first time. Distinguishing "not loaded yet" from "you have
+	 * no saved queues" is what stops the empty state flashing on every entry to the screen.
+	 */
 	val queues = savedQueueRepository.observeAll()
-		.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<SavedQueueEntity>())
+		.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null as List<SavedQueueEntity>?)
 
 	/** One-shot user feedback (e.g. "Saved as playlist") the screen shows then clears. */
 	private val _message = MutableStateFlow<SavedQueueMessage?>(null)
@@ -42,8 +46,14 @@ class SavedQueuesViewModel(
 		viewModelScope.launch { savedQueueRepository.delete(id) }
 	}
 
-	fun deleteOthers(keepId: String) {
-		viewModelScope.launch { savedQueueRepository.deleteOthers(keepId) }
+	/** [removedIds] are the rows being dropped, so they can be tombstoned for the next hub sync. */
+	fun deleteOthers(keepId: String, removedIds: Collection<String>) {
+		viewModelScope.launch { savedQueueRepository.deleteOthers(keepId, removedIds) }
+	}
+
+	/** Drop the whole history. The hub-side delete is issued by the screen as one batched act. */
+	fun clearAll(removedIds: Collection<String>) {
+		viewModelScope.launch { savedQueueRepository.clearAll(removedIds) }
 	}
 
 	/**

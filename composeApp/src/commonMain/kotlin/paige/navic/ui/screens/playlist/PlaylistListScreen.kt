@@ -11,6 +11,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -30,12 +31,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.collections.immutable.persistentListOf
 import navic.composeapp.generated.resources.Res
 import navic.composeapp.generated.resources.title_create_playlist
 import navic.composeapp.generated.resources.title_playlists
@@ -46,6 +49,7 @@ import paige.navic.LocalBottomBarScrollManager
 import paige.navic.LocalNavStack
 import paige.navic.LocalPlatformContext
 import paige.navic.domain.manager.PreferenceManager
+import paige.navic.domain.models.DomainPlaylistListType
 import paige.navic.domain.models.DomainSongCollection
 import paige.navic.domain.models.settings.BottomBarCollapseMode
 import paige.navic.domain.models.settings.BottomBarVisibilityMode
@@ -54,6 +58,8 @@ import paige.navic.icons.outlined.Add
 import paige.navic.shared.MediaPlayerViewModel
 import paige.navic.ui.components.common.ErrorSnackbar
 import paige.navic.ui.components.dialogs.DeletionDialog
+import paige.navic.ui.components.common.AlphabeticalScroller
+import paige.navic.ui.components.common.alphabeticalHeaders
 import paige.navic.ui.components.dialogs.DeletionEndpoint
 import paige.navic.ui.components.layouts.ArtGrid
 import paige.navic.ui.components.layouts.NestedTopBar
@@ -172,6 +178,7 @@ fun PlaylistListScreen(
 			onRefresh = { viewModel.refreshPlaylists(true) },
 			key = playlistsState
 		) {
+			Box {
 			ArtGrid(
 				modifier = if (!nested)
 					Modifier.nestedScroll(scrollBehavior.nestedScrollConnection)
@@ -196,6 +203,22 @@ fun PlaylistListScreen(
 					onPlayNext = { if (selectedPlaylist != null) player.playNext(selectedPlaylist as DomainSongCollection)},
 					onAddToQueue = { if (selectedPlaylist != null) player.addToQueue(selectedPlaylist as DomainSongCollection)}
 				)
+			}
+
+			// Alphabetical jump rail — only in name-sorted mode (items have no leading cells).
+			val alphaHeaders = remember(playlistsState, selectedSorting) {
+				val data = playlistsState.data.orEmpty()
+				if (selectedSorting == DomainPlaylistListType.Name)
+					alphabeticalHeaders(data) { it.name.firstOrNull()?.uppercaseChar() ?: '#' }
+				else persistentListOf<Pair<String, Int>>()
+			}
+			if (alphaHeaders.isNotEmpty()) {
+				AlphabeticalScroller(
+					state = gridState,
+					headers = alphaHeaders,
+					modifier = Modifier.align(Alignment.TopEnd)
+				)
+			}
 			}
 		}
 	}

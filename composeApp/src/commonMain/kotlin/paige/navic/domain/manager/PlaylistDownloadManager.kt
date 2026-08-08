@@ -141,18 +141,30 @@ class PlaylistDownloadManager(
 
 		// Download what's missing, at the policy's quality.
 		val downloaded = downloadManager.downloadedSongs.value.keys
-		val toDownload = target.filter { it.song.songId !in downloaded }
+		// A song that has already failed MAX_DOWNLOAD_RETRIES times is left alone until the user
+		// retries it by hand — otherwise a permanently-failing track (deleted server-side, transcode
+		// error, …) is re-queued on every 6h sync forever, draining battery and data.
+		val failedRetryCounts = downloadManager.failedRetryCounts()
+		val toDownload = target.filter { item ->
+			val id = item.song.songId
+			id !in downloaded &&
+				(failedRetryCounts[id] ?: 0) < DownloadManager.MAX_DOWNLOAD_RETRIES
+		}
+		val quality = DownloadManager.DownloadQuality(
+			policy.maxBitRate,
+			policy.format.ifBlank { null }
+		)
 		toDownload.forEach {
 			downloadManager.downloadSong(
 				it.song.toDomainModel(),
 				// The policy's own quality wins over the global download preference.
-				quality = DownloadManager.DownloadQuality(
-					policy.maxBitRate,
-					policy.format.ifBlank { null }
-				),
+				quality = quality,
 				// Tagged so the download center can show these as playlist-managed rather than
 				// manual — the user didn't ask for each of these files individually.
-				source = DownloadSource.PLAYLIST
+				source = DownloadSource.PLAYLIST,
+				// A re-attempt of a previously-failed track counts toward the retry cap; a fresh
+				// download does not.
+				incrementRetry = it.song.songId in failedRetryCounts
 			)
 		}
 

@@ -60,6 +60,7 @@ import org.koin.core.parameter.parametersOf
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
 import paige.navic.domain.manager.AudioMuseManager
+import paige.navic.domain.manager.ClapAvailability
 import paige.navic.domain.manager.RadioManager
 import paige.navic.ui.components.sheets.MoodSearchSheet
 import paige.navic.LocalBottomBarScrollManager
@@ -149,10 +150,15 @@ fun SearchScreen(
 	var selectedCategory by remember { mutableStateOf(SearchCategory.ALL) }
 	var songToQueue by remember { mutableStateOf<DomainSong?>(null) }
 
-	// CLAP text→mood search (AudioMuse Tier 2): probe once so the entry only shows
-	// when usable (enabled + library analyzed). Fail-soft → stays hidden otherwise.
-	var clapAvailable by remember { mutableStateOf(false) }
-	LaunchedEffect(Unit) { clapAvailable = audioMuseManager.isClapAvailable() }
+	// CLAP text→mood search (AudioMuse Tier 2). Probed for availability AND reason: when
+	// Tier 2 is configured but unusable the entry is shown disabled with what's wrong,
+	// rather than vanishing — a dead hub route and "this feature doesn't exist" used to
+	// look identical, which is how a hub that wasn't routing /sonic/* went unnoticed.
+	// Keyed on the route config so changing it re-probes instead of caching a stale miss.
+	var clapState by remember { mutableStateOf(ClapAvailability.NOT_CONFIGURED) }
+	LaunchedEffect(audioMuseManager.routeSignature) {
+		clapState = audioMuseManager.clapAvailability()
+	}
 
 	// Mood-search preview sheet: clicking the entry fetches the proposed queue
 	// and shows it (Feishin-style) instead of immediately playing.
@@ -223,7 +229,7 @@ fun SearchScreen(
 						verticalArrangement = Arrangement.spacedBy(8.dp)
 					) {
 						if (query.text.isNotBlank()) {
-							if (clapAvailable) {
+							if (clapState.usable) {
 								item(span = { GridItemSpan(maxLineSpan) }) {
 									ListItem(
 										modifier = Modifier
@@ -244,6 +250,51 @@ fun SearchScreen(
 										content = { Text("Mood search") },
 										supportingContent = {
 											Text("Play tracks matching \"${query.text}\"")
+										}
+									)
+								}
+							} else if (clapState != ClapAvailability.NOT_CONFIGURED) {
+								// Configured but unusable — say so. Hidden entirely only when
+								// there's no Tier-2 route at all, so users who never set up
+								// AudioMuse don't get a permanently dead row.
+								item(span = { GridItemSpan(maxLineSpan) }) {
+									ListItem(
+										modifier = Modifier
+											.background(MaterialTheme.colorScheme.surface),
+										// Tapping re-probes: these failures are transient (a hub
+										// restarting, analysis still running), so the row doubles
+										// as the retry rather than being inert.
+										onClick = {
+											platformContext.clickSound()
+											moodScope.launch {
+												clapState = audioMuseManager.clapAvailability()
+											}
+										},
+										content = {
+											Text(
+												"Mood search",
+												color = MaterialTheme.colorScheme.onSurfaceVariant
+											)
+										},
+										supportingContent = {
+											Text(
+												when (clapState) {
+													ClapAvailability.HUB_UNREACHABLE ->
+														"Unavailable — the hub isn't answering " +
+															"AudioMuse requests, and no direct " +
+															"AudioMuse server is configured."
+													ClapAvailability.UNREACHABLE ->
+														"Unavailable — can't reach the AudioMuse server."
+													ClapAvailability.DISABLED_ON_SERVER ->
+														"Unavailable — CLAP is switched off on the " +
+															"AudioMuse server."
+													ClapAvailability.NOT_ANALYZED ->
+														"Unavailable — your library hasn't been " +
+															"analyzed by AudioMuse yet."
+													else -> "Unavailable."
+												},
+												color = MaterialTheme.colorScheme.onSurfaceVariant
+											)
 										}
 									)
 								}

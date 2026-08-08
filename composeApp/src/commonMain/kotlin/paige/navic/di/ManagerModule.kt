@@ -27,7 +27,7 @@ val managerModule = module {
 	singleOf(::PreferenceManager)
 	singleOf(::AudioMuseManager)
 	single(createdAtStart = true) {
-		HubManager(get(), get(), get(), get()).apply { start() }
+		HubManager(get(), get(), get(), get(), get()).apply { start() }
 	}
 	// createdAtStart so the autoplay observer is running before the first radio use.
 	single(createdAtStart = true) { RadioManager(get(), get(), get(), get(), get(), get()) }

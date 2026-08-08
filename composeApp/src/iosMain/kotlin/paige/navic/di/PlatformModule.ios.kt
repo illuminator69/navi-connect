@@ -11,6 +11,7 @@ import paige.navic.data.database.DownloadDatabase
 import paige.navic.data.database.MIGRATION_CACHE_15_16
 import paige.navic.data.database.MIGRATION_CACHE_16_17
 import paige.navic.data.database.MIGRATION_CACHE_17_18
+import paige.navic.data.database.MIGRATION_CACHE_18_19
 import paige.navic.data.database.MIGRATION_DOWNLOAD_3_4
 import paige.navic.domain.manager.CastManager
 import paige.navic.domain.manager.ConnectivityManager
@@ -34,7 +35,12 @@ actual val platformModule = module {
 			.setDriver(BundledSQLiteDriver())
 			// See the Android module: without this the DownloadEntity change would wipe the
 			// cached library.
-			.addMigrations(MIGRATION_CACHE_15_16, MIGRATION_CACHE_16_17, MIGRATION_CACHE_17_18)
+			.addMigrations(
+				MIGRATION_CACHE_15_16,
+				MIGRATION_CACHE_16_17,
+				MIGRATION_CACHE_17_18,
+				MIGRATION_CACHE_18_19
+			)
 			.fallbackToDestructiveMigration(true)
 			.build()
 	}

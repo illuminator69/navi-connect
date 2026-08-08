@@ -46,6 +46,7 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 	val castManager = koinInject<CastManager>()
 	val preferenceManager = koinInject<PreferenceManager>()
 	val connected by hubManager.connected.collectAsState()
+	val connectionError by hubManager.connectionError.collectAsState()
 	val devices by hubManager.devices.collectAsState()
 	val myDeviceId by hubManager.myDeviceId.collectAsState()
 	val activeDeviceId by hubManager.activeDeviceId.collectAsState()
@@ -146,9 +147,10 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 			)
 			if (!connected) {
 				Text(
-					"Not connected to the hub",
+					connectionError ?: "Not connected to the hub",
 					style = MaterialTheme.typography.bodyMedium,
-					color = MaterialTheme.colorScheme.onSurfaceVariant
+					color = if (connectionError != null) MaterialTheme.colorScheme.error
+						else MaterialTheme.colorScheme.onSurfaceVariant
 				)
 			} else if (visibleDevices.isEmpty() && extraDevices.isEmpty()) {
 				Text(

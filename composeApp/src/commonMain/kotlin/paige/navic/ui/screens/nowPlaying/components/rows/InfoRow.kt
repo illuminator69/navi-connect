@@ -73,25 +73,21 @@ fun NowPlayingInfoRow(
 					},
 					inlineContent = InlineExplicitIconLarge,
 					modifier = Modifier.clickable(onClick = dropUnlessResumed {
-						song.albumId?.let {
-							backStack.removeLastOrNull()
+						// Navigate by the SONG's album. This used to close the player first and
+						// only then resolve `currentCollection`, bailing on the elvis when it was
+						// null — exactly the remote case (the queue is a mirror of another device's
+						// session, so there is no local collection), so the player shut instantly
+						// and went nowhere. `currentCollection` was the wrong target anyway: it is
+						// whatever the queue was started from, which can be a playlist or a
+						// generated mix rather than this song's album.
+						val albumId = song.albumId ?: return@dropUnlessResumed
+						backStack.remove(Screen.NowPlaying)
 
-							val lastScreen = backStack.lastOrNull()
+						val lastScreen = backStack.lastOrNull()
+						val isSameAlbum = lastScreen is Screen.CollectionDetail &&
+							lastScreen.collectionId == albumId
 
-							val isSameAlbum = if (lastScreen is Screen.CollectionDetail) {
-								lastScreen.collectionId == song.albumId
-							} else {
-								false
-							}
-
-							if (!isSameAlbum)
-								backStack.add(
-									Screen.CollectionDetail(
-										playerState.currentCollection?.id ?: return@dropUnlessResumed,
-										""
-									)
-								)
-						}
+						if (!isSameAlbum) backStack.add(Screen.CollectionDetail(albumId, ""))
 					}),
 					style = MaterialTheme.typography.bodyLarge
 						.copy(

@@ -23,7 +23,9 @@ fun ContentUnavailable(
 	modifier: Modifier = Modifier.fillMaxSize(),
 	icon: ImageVector,
 	label: String,
-	color: Color = MaterialTheme.colorScheme.onSurface
+	color: Color = MaterialTheme.colorScheme.onSurface,
+	/** Optional second line, for when the headline alone doesn't say how the list gets filled. */
+	description: String? = null
 ) {
 	Column(
 		modifier = modifier.fillMaxWidth().alpha(.6f),
@@ -43,5 +45,14 @@ fun ContentUnavailable(
 			textAlign = TextAlign.Center,
 			modifier = Modifier.widthIn(max = 400.dp)
 		)
+		description?.let {
+			Text(
+				it,
+				style = MaterialTheme.typography.bodyMedium,
+				color = color,
+				textAlign = TextAlign.Center,
+				modifier = Modifier.widthIn(max = 400.dp)
+			)
+		}
 	}
 }

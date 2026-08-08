@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -35,9 +37,11 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import paige.navic.data.database.dao.SongDao
+import paige.navic.data.database.entities.SavedQueueEntity
 import paige.navic.data.database.mappers.toDomainModel
 import paige.navic.domain.models.DomainExplicitStatus
 import paige.navic.domain.models.DomainSong
+import paige.navic.domain.repositories.SavedQueueRepository
 import paige.navic.shared.MediaPlayerViewModel
 import paige.navic.shared.RemotePlaybackRouter
 import paige.navic.ui.core.PlayerUiState
@@ -75,7 +79,9 @@ data class RemoteSessionState(
 	val positionMs: Long = 0,
 	val positionAtMs: Long = 0,
 	val repeat: String = "none",
-	val shuffle: Boolean = false
+	val shuffle: Boolean = false,
+	/** Saved-queue history id of the current session (the "Now Playing" record), or null. */
+	val savedQueueId: String? = null
 ) {
 	val nowPlaying: RemoteTrack? get() = tracks.getOrNull(index)
 }
@@ -94,7 +100,8 @@ class HubManager(
 	private val preferenceManager: PreferenceManager,
 	private val sessionManager: SessionManager,
 	private val songDao: SongDao,
-	private val mediaPlayer: MediaPlayerViewModel
+	private val mediaPlayer: MediaPlayerViewModel,
+	private val savedQueueRepository: SavedQueueRepository
 ) : RemotePlaybackRouter {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 	private val client = HttpClient {
@@ -164,6 +171,9 @@ class HubManager(
 
 	// Mirrors of the Feishin client's guards:
 	private var lastQueueSig = ""        // dedupe for publishing our queue
+	// Have we ever put a non-empty queue on the wire? Gates the clear-propagation below, so the empty
+	// queue that exists for a moment during startup hydration can't wipe another device's session.
+	private var publishedNonEmptyQueue = false
 	private var hubDrivenUntilMs = 0L    // player events caused by `do`, not the user
 	private var lastReportedIndex = -2
 	private var lastReportedPaused: Boolean? = null
@@ -181,8 +191,15 @@ class HubManager(
 	override val isRemoteSessionActive: Boolean
 		get() = isRemoteActive.value
 
-	override fun setQueue(songs: List<DomainSong>, startIndex: Int) =
-		loadSessionQueue(songs, startIndex)
+	override val isHubConnected: Boolean
+		get() = _connected.value
+
+	override fun setQueue(
+		songs: List<DomainSong>,
+		startIndex: Int,
+		sourceKind: String,
+		sourceName: String?
+	) = loadSessionQueue(songs, startIndex, sourceKind = sourceKind, sourceName = sourceName)
 
 	override fun enqueue(songs: List<DomainSong>, playNext: Boolean) =
 		enqueueSessionQueue(songs, playNext)
@@ -191,12 +208,66 @@ class HubManager(
 		songs: List<DomainSong>,
 		index: Int,
 		positionMs: Long,
-		play: Boolean
-	) = loadSessionQueue(songs, index, positionMs, play)
+		play: Boolean,
+		savedQueueId: String?,
+		sourceKind: String,
+		sourceName: String?
+	) = loadSessionQueue(
+		songs, index, positionMs, play,
+		savedQueueId = savedQueueId, sourceKind = sourceKind, sourceName = sourceName
+	)
 
 	override fun seek(positionMs: Long) = actSeek(positionMs)
 
+	/**
+	 * Force the local queue back onto the hub even though its contents are unchanged. Clearing the
+	 * dedupe signature is the whole trick: the publish path exists to send one frame per queue change,
+	 * which is exactly wrong when what changed is the queue's *identity* (its record was deleted).
+	 */
+	override fun republishQueue() {
+		lastQueueSig = ""
+		scope.launch {
+			try {
+				val state = mediaPlayer.localUiState.value
+				if (state.queue.isEmpty()) return@launch
+				publishQueueIfOurs(state, positionMs = 0, now = nowMs())
+			} catch (e: Exception) {
+				Logger.e("HubManager", "queue republish failed", e)
+			}
+		}
+	}
+
+	/**
+	 * Tell the hub the queue was emptied here. `publishQueueIfOurs` can't: it returns early on an empty
+	 * queue (and on a paused one), so a local clear never left the device and the hub went on serving
+	 * a session the user had thrown away. Guarded on having actually published something, so the
+	 * momentarily-empty queue during startup can't wipe a session another device is playing.
+	 */
+	override fun clearSessionQueue() {
+		if (!_connected.value || !publishedNonEmptyQueue) return
+		publishedNonEmptyQueue = false
+		lastQueueSig = ""
+		actClearQueue()
+	}
+
+	override suspend fun resolveLibrarySongs(songs: List<DomainSong>): List<DomainSong> {
+		if (songs.isEmpty()) return songs
+		val byId = songDao.getSongsByIds(songs.map { it.id }).associateBy { it.songId }
+		// 1:1 and in order — a missing song keeps its placeholder rather than being dropped, or every
+		// index after it (including the one we're about to resume at) would shift.
+		return songs.map { byId[it.id]?.toDomainModel() ?: it }
+	}
+
 	private fun nowMs(): Long = Clock.System.now().toEpochMilliseconds()
+
+	/** Clear the reporter/publish dedupe state (new socket, or we just handed off). */
+	private fun resetReporterGuards() {
+		lastQueueSig = ""
+		lastReportedIndex = -2
+		lastReportedPaused = null
+		lastTickMs = 0L
+		lastClaimPublishAtMs = 0L
+	}
 
 	private fun isActiveDevice(): Boolean {
 		val me = _myDeviceId.value
@@ -230,6 +301,9 @@ class HubManager(
 
 	/** Controller action: hand playback to another device (state preserved). */
 	fun transfer(targetDeviceId: String) {
+		// Transferring to the device that's already active is a no-op. (The hub guards
+		// this too; not sending at all also keeps the picker from flickering.)
+		if (targetDeviceId == _activeDeviceId.value) return
 		sendAsync(buildJsonObject {
 			put("t", "act")
 			put("action", "transfer")
@@ -275,17 +349,28 @@ class HubManager(
 		songs: List<DomainSong>,
 		startIndex: Int = 0,
 		positionMs: Long = 0,
-		play: Boolean = true
+		play: Boolean = true,
+		savedQueueId: String? = null,
+		sourceKind: String = "manual",
+		sourceName: String? = null
 	) {
 		if (songs.isEmpty()) return
 		// Pre-set the publish signature so our own reporter doesn't re-publish this.
 		lastQueueSig = queueSig(songs)
+		publishedNonEmptyQueue = true
 		sendAsync(buildJsonObject {
 			put("t", "act")
 			put("action", "setQueue")
 			put("index", startIndex.coerceIn(0, songs.lastIndex))
 			put("positionMs", positionMs.coerceAtLeast(0))
 			put("play", play)
+			// Identity comes from the CALLER (the album/playlist/mix being played), not from
+			// local player state — that describes the queue we're replacing, so reading it here
+			// stamped every remote-routed queue with the previous one's name (usually none).
+			// A genuinely new queue mints an id; a restore/undo passes the record's own id.
+			put("savedQueueId", savedQueueId ?: mediaPlayer.newQueueSessionId(songs))
+			put("sourceKind", sourceKind)
+			sourceName?.let { put("sourceName", it) }
 			putJsonArray("tracks") {
 				songs.forEach { song ->
 					addJsonObject {
@@ -571,14 +656,197 @@ class HubManager(
 		wsSession?.send(Frame.Text(obj.toString()))
 	}
 
+	// Frames sent fire-and-forget still have to reach the hub IN ORDER: each sendAsync is its own
+	// coroutine, so without this a burst (say a batch of deletes racing a setQueue) could arrive
+	// reordered and the hub would apply them in the wrong sequence.
+	private val sendMutex = Mutex()
+
 	private fun sendAsync(obj: JsonObject) {
 		scope.launch {
 			try {
-				sendFrame(obj)
+				sendMutex.withLock { sendFrame(obj) }
 			} catch (e: Exception) {
 				Logger.e("HubManager", "hub send failed", e)
 			}
 		}
+	}
+
+	// ------------------------------------------------------------------ //
+	// Saved-queue history (Continue Listening) — hub-owned + shared.
+	// ------------------------------------------------------------------ //
+
+	/** Rename a shared saved-queue record (propagates to every client). */
+	fun actRenameSavedQueue(id: String, name: String?) {
+		sendAsync(buildJsonObject {
+			put("t", "act"); put("action", "renameSavedQueue"); put("id", id)
+			name?.let { put("name", it) }
+		})
+	}
+
+	/** Delete a shared saved-queue record (propagates to every client). */
+	fun actDeleteSavedQueue(id: String) {
+		sendAsync(buildJsonObject {
+			put("t", "act"); put("action", "deleteSavedQueue"); put("id", id)
+		})
+	}
+
+	/**
+	 * Delete several records in one act. Clear-all and delete-others used to send one frame per row,
+	 * and the hub answers each with a full history broadcast plus a state write — twenty deletions
+	 * meant twenty of both, all of which every client then re-applied to its local table.
+	 */
+	fun actDeleteSavedQueues(ids: List<String>) {
+		if (ids.isEmpty()) return
+		sendAsync(buildJsonObject {
+			put("t", "act"); put("action", "deleteSavedQueues")
+			putJsonArray("ids") { ids.forEach { add(it) } }
+		})
+	}
+
+	private fun intToRepeat(mode: Int): String = when (mode) {
+		1 -> "one"; 2 -> "all"; else -> "none"
+	}
+
+	/**
+	 * What to call this queue in the shared history. [PlayerUiState.savedQueueName] is stamped by
+	 * whoever replaced the queue and is therefore always right; `currentCollection` is the older,
+	 * weaker guess (it resolves asynchronously from the playing song, and is null for every generated
+	 * mix) and stays only as a fallback for queues built before the stamp existed.
+	 */
+	private fun savedQueueNameFor(state: PlayerUiState): String? =
+		state.savedQueueName ?: state.currentCollection?.name
+
+	// NOTE: we deliberately do NOT publish `coverImageUrl`. Card art is now derived by each client
+	// from the record's resume track, rendered by id with that client's own credentials — a URL
+	// carrying OUR server address and OUR auth token is not something the other client can display.
+
+	/**
+	 * Adopt the hub's authoritative saved-queue history into the local Room store (a REPLACE — that's
+	 * what lets a delete on one client propagate here). Hub tracks are minimal, so they're resolved
+	 * 1:1 to DomainSong placeholders, same as the live mirror.
+	 */
+	private suspend fun applySavedQueues(records: List<JsonObject>) {
+		// One library lookup for the WHOLE broadcast. Resolving per record meant twenty queries every
+		// time any client edited any queue, since the hub rebroadcasts the entire list each time.
+		val allTracks = records.flatMap { it["songs"]?.asObjectList() ?: emptyList() }
+		val byId = songDao
+			.getSongsByIds(allTracks.mapNotNull { it["id"]?.jsonPrimitive?.content }.distinct())
+			.associateBy { it.songId }
+		val out = records.mapNotNull { rec ->
+			val id = rec["id"]?.jsonPrimitive?.content ?: return@mapNotNull null
+			// A broadcast built before our sync-up frame landed still carries rows we deleted while
+			// offline; adopting them would put the deleted card back for a render.
+			if (savedQueueRepository.isDeleted(id)) return@mapNotNull null
+			val tracks = rec["songs"]?.asObjectList() ?: emptyList()
+			if (tracks.isEmpty()) return@mapNotNull null
+			val songs = tracks.mapNotNull { track ->
+				val songId = track["id"]?.jsonPrimitive?.content ?: return@mapNotNull null
+				byId[songId]?.toDomainModel() ?: remoteTrackToDomainSong(track)
+			}
+			if (songs.isEmpty()) return@mapNotNull null
+			val idx = (rec["currentIndex"]?.jsonPrimitive?.intOrNull ?: 0)
+				.coerceIn(0, (songs.size - 1).coerceAtLeast(0))
+			SavedQueueRepository.RemoteSavedQueue(
+				id = id,
+				name = rec["name"]?.jsonPrimitive?.contentOrNullSafe(),
+				sourceName = rec["sourceName"]?.jsonPrimitive?.contentOrNullSafe(),
+				songs = songs,
+				currentIndex = idx,
+				currentSongId = songs.getOrNull(idx)?.id,
+				currentSongName = songs.getOrNull(idx)?.title,
+				// Art comes from the queue's FIRST track — its birth — not from the resume cursor:
+				// the hub and Feishin freeze `coverImageUrl` at birth (PROTOCOL.md §8.3), so deriving
+				// it from the cursor here made one shared record look different on each client. The
+				// record's own `coverImageUrl` stays ignored: it's the other client's authed URL
+				// against its own server, which is exactly why those covers wouldn't load.
+				coverArtId = songs.firstOrNull()?.coverArtId,
+				positionMs = rec["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L,
+				shuffle = rec["shuffle"]?.jsonPrimitive?.booleanOrNull ?: false,
+				repeatMode = repeatToInt(rec["repeat"]?.jsonPrimitive?.contentOrNullSafe() ?: "none"),
+				sourceKind = rec["sourceKind"]?.jsonPrimitive?.contentOrNullSafe() ?: "manual",
+				createdAt = rec["createdAt"]?.jsonPrimitive?.longOrNull ?: nowMs(),
+				updatedAt = rec["updatedAt"]?.jsonPrimitive?.longOrNull ?: nowMs(),
+				songCount = rec["songCount"]?.jsonPrimitive?.intOrNull ?: songs.size
+			)
+		}
+		savedQueueRepository.replaceFromHub(out)
+	}
+
+	/**
+	 * Push our local (possibly offline-accumulated) history up so it survives + propagates — including
+	 * deletions, which the hub tombstones. Without those a delete made while offline was silently
+	 * undone: the row went from Room, then this sync pushed the survivors up and the hub's reply
+	 * (which still had the deleted record) put it straight back.
+	 */
+	private suspend fun syncLocalSavedQueuesUp() {
+		// Decoded up front so a row whose blob is unreadable is dropped here (decodeQueue logs it)
+		// rather than uploaded with an empty `songs`, which the hub silently rejects — the record
+		// would then look synced while never actually reaching the shared history.
+		val rows = savedQueueRepository.allForSync()
+			.map { it to savedQueueRepository.decodeQueue(it) }
+			.filter { (_, songs) -> songs.isNotEmpty() }
+		val deleted = savedQueueRepository.pendingTombstoneIds()
+		if (rows.isEmpty() && deleted.isEmpty()) return
+		sendFrame(buildJsonObject {
+			put("t", "act"); put("action", "syncSavedQueues")
+			if (deleted.isNotEmpty()) {
+				putJsonArray("deleted") { deleted.forEach { add(it) } }
+			}
+			putJsonArray("queues") {
+				rows.forEach { (row, songs) ->
+					addJsonObject {
+						put("id", row.id)
+						row.name?.let { put("name", it) }
+						row.sourceName?.let { put("sourceName", it) }
+						put("sourceKind", row.sourceKind)
+						put("currentIndex", row.currentIndex)
+						put("positionMs", row.positionMs)
+						put("shuffle", row.shuffle)
+						put("repeat", intToRepeat(row.repeatMode))
+						put("songCount", row.songCount)
+						put("createdAt", row.createdAt)
+						put("updatedAt", row.updatedAt)
+						putJsonArray("songs") {
+							songs.forEach { song ->
+								addJsonObject {
+									put("id", song.id)
+									put("title", song.title)
+									put("artist", song.artistName)
+									song.albumTitle?.let { put("album", it) }
+									put("durationMs", song.duration.inWholeMilliseconds)
+									song.coverArtId?.let {
+										put("imageUrl", sessionManager.getCoverArtUrl(it))
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		})
+	}
+
+	/**
+	 * The saved-queue id to publish for [state]'s queue: reuse the local session id when present,
+	 * else the hub's current record id when it's substantially the same queue (adopt/transfer-in),
+	 * else the id of a record we already hold for this queue, else a fresh one.
+	 *
+	 * The hub-adopt test is deliberately **set overlap**, not the ordered prefix it used to be: a
+	 * reorder, a removal, a play-next or a shuffle all fail a prefix test, so every one of them forked
+	 * a brand-new record for a queue the user never stopped playing. Half the queue in common is
+	 * enough — the same threshold Feishin uses.
+	 */
+	private fun hubSavedQueueIdFor(state: PlayerUiState): String {
+		state.savedQueueId?.let { return it }
+		val ids = state.queue.map { it.id }
+		val hub = _remoteSession.value
+		val hubIds = hub.tracks.map { it.id }.toSet()
+		val hubId = hub.savedQueueId
+		if (hubId != null && hubIds.isNotEmpty() && ids.isNotEmpty()) {
+			val shared = ids.toSet().count { it in hubIds }
+			if (shared.toDouble() / hubIds.size >= HUB_QUEUE_ADOPT_OVERLAP) return hubId
+		}
+		return mediaPlayer.newQueueSessionId(state.queue)
 	}
 
 	// ------------------------------------------------------------------ //
@@ -597,6 +865,27 @@ class HubManager(
 				msg["devices"]?.let { parseDevices(it.asObjectList()) }
 				_connected.value = true
 				_connectionError.value = null
+				// A new socket means the reporter's dedupe state describes a session
+				// that no longer exists — clear it so the first tick after reconnect
+				// actually reports instead of being swallowed as "unchanged".
+				resetReporterGuards()
+				// Reconcile saved-queue history: push OUR local (possibly offline)
+				// rows up first, then adopt the hub's authoritative list. The hub
+				// union-merges our rows and rebroadcasts the complete set.
+				// Isolated: a Room/serialization failure here must not skip the adopt
+				// below, which is what actually re-syncs playback.
+				try {
+					syncLocalSavedQueuesUp()
+				} catch (e: Exception) {
+					Logger.e("HubManager", "saved-queue sync-up failed", e)
+				}
+				// Isolated for the same reason: a failure adopting history must not take
+				// down the reconnect handshake.
+				try {
+					applySavedQueues(msg["savedQueues"]?.asObjectList() ?: emptyList())
+				} catch (e: Exception) {
+					Logger.e("HubManager", "saved-queue adopt failed", e)
+				}
 				// Hub is authoritative: adopt its session rather than re-publishing ours.
 				adoptIfNoLiveReceiver()
 				Logger.i("HubManager", "connected to hub as $id")
@@ -624,6 +913,12 @@ class HubManager(
 			}
 
 			"devices" -> msg["devices"]?.let { parseDevices(it.asObjectList()) }
+
+			"savedQueues" -> try {
+				applySavedQueues(msg["queues"]?.asObjectList() ?: emptyList())
+			} catch (e: Exception) {
+				Logger.e("HubManager", "saved-queue broadcast adopt failed", e)
+			}
 
 			"do" -> handleDo(msg)
 
@@ -658,7 +953,8 @@ class HubManager(
 			positionMs = obj["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L,
 			positionAtMs = nowMs(),
 			repeat = obj["repeat"]?.jsonPrimitive?.contentOrNullSafe() ?: "none",
-			shuffle = obj["shuffle"]?.jsonPrimitive?.booleanOrNull ?: false
+			shuffle = obj["shuffle"]?.jsonPrimitive?.booleanOrNull ?: false,
+			savedQueueId = obj["savedQueueId"]?.jsonPrimitive?.contentOrNullSafe()
 		)
 	}
 
@@ -694,14 +990,38 @@ class HubManager(
 			lastQueueSig = ""
 			return
 		}
-		// Already adopted this exact queue — nothing to do (repeated session frames).
-		if (hubSig == lastQueueSig && hubSig == localSig) return
+		// We already hold this exact queue, paused, at (about) the hub's cursor — repeated
+		// session frames must not reload it. Only reload when the cursor genuinely differs:
+		// that's the "the other device was force-stopped, resume where IT left off" case,
+		// and it's what makes a takeover continue from the right spot.
+		if (hubSig == localSig) {
+			val localPositionMs = local.currentSong?.duration?.inWholeMilliseconds
+				?.let { (local.progress * it).toLong() } ?: 0L
+			val inSync = local.currentIndex == session.index &&
+				(localPositionMs - session.positionMs) in -2_000..2_000
+			if (inSync) return
+		}
 
 		val songs = resolveRemoteTracks(session.tracks)
 		if (songs.isEmpty()) return
 		hubDrivenUntilMs = nowMs() + 2000
-		lastQueueSig = hubSig
-		mediaPlayer.loadRemoteQueue(songs, session.index, session.positionMs, play = false)
+		// Do NOT pin the signature to the hub's: publishQueueIfOurs bails while sig ==
+		// lastQueueSig, so pinning it here meant a reopened app could never publish and
+		// therefore never be promoted back to active — it sat connected but mute.
+		lastQueueSig = ""
+		// Carry the hub's record identity into local state so the "Now Playing" highlight
+		// survives the adopt (a null id here read as "this queue isn't in history").
+		mediaPlayer.loadRemoteQueue(
+			songs, session.index, session.positionMs, play = false,
+			savedQueueId = session.savedQueueId,
+			savedQueueKind = savedQueueKindFor(session.savedQueueId)
+		)
+	}
+
+	/** The kind stored on the hub record with this id, if we know it (else "manual"). */
+	private suspend fun savedQueueKindFor(id: String?): String {
+		if (id == null) return "manual"
+		return savedQueueRepository.get(id)?.sourceKind ?: "manual"
 	}
 
 	private fun parseDevices(arr: List<JsonObject>) {
@@ -792,6 +1112,9 @@ class HubManager(
 				// Final position report, THEN released — the hub uses that
 				// report to resume the next device at our exact spot.
 				mediaPlayer.pause()
+				// We're no longer the active device; the next time we claim it, the
+				// guards must not still describe this handed-off session.
+				resetReporterGuards()
 				val state = mediaPlayer.localUiState.value
 				val positionMs = state.currentSong?.duration
 					?.inWholeMilliseconds?.let { (state.progress * it).toLong() } ?: 0L
@@ -964,6 +1287,7 @@ class HubManager(
 	}
 
 	private var lastRoutedAtMs = 0L
+	private var lastClaimPublishAtMs = 0L
 
 	// uiState emits every ~200ms while playing (progress ticks) but keeps the
 	// SAME queue list instance — cache the joined-ids signature by reference so
@@ -1007,12 +1331,18 @@ class HubManager(
 
 		lastRoutedAtMs = now
 		lastQueueSig = queueSig(state.queue)
+		publishedNonEmptyQueue = true
+		val savedQueueId = hubSavedQueueIdFor(state)
+		mediaPlayer.adoptQueueSessionId(savedQueueId)
 		sendFrame(buildJsonObject {
 			put("t", "act")
 			put("action", "setQueue")
 			put("index", state.currentIndex.coerceAtLeast(0))
 			put("positionMs", 0)
 			put("play", true)
+			put("savedQueueId", savedQueueId)
+			put("sourceKind", state.savedQueueKind)
+			savedQueueNameFor(state)?.let { put("sourceName", it) }
 			putJsonArray("tracks") {
 				state.queue.forEach { song ->
 					addJsonObject {
@@ -1054,15 +1384,31 @@ class HubManager(
 		if (!(active == null || (me != null && active == me))) return
 
 		val sig = queueSig(state.queue)
-		if (sig == lastQueueSig) return
+		// Normally one publish per queue change. But when NOBODY is active and we're
+		// playing, publishing is also how we CLAIM the session — and after adopting the
+		// hub's queue our signature already equals it, so the dedupe would block the
+		// claim forever (connected, playing locally, but never promoted → no reports).
+		// Re-publish in that state, throttled so the ~5 Hz state flow doesn't spam.
+		val unclaimed = active == null
+		if (sig == lastQueueSig && !(unclaimed && now - lastClaimPublishAtMs >= CLAIM_REPUBLISH_MS)) return
+		if (unclaimed) lastClaimPublishAtMs = now
 		lastQueueSig = sig
+		publishedNonEmptyQueue = true
 
+		// Remembered on the player, or the claim re-publish loop above would re-derive it every
+		// pass and — before the hub's broadcast round-trips back into the local index — could mint
+		// a different id each time, forking one history card per republish.
+		val savedQueueId = hubSavedQueueIdFor(state)
+		mediaPlayer.adoptQueueSessionId(savedQueueId)
 		sendFrame(buildJsonObject {
 			put("t", "act")
 			put("action", "setQueue")
 			put("index", state.currentIndex.coerceAtLeast(0))
 			put("positionMs", positionMs)
 			put("play", true)
+			put("savedQueueId", savedQueueId)
+			put("sourceKind", state.savedQueueKind)
+			savedQueueNameFor(state)?.let { put("sourceName", it) }
 			putJsonArray("tracks") {
 				state.queue.forEach { song ->
 					addJsonObject {
@@ -1096,6 +1442,16 @@ class HubManager(
 		 * back rather than stranding the user in a session they can't drive.
 		 */
 		const val REMOTE_HOLD_MS = 30_000L
+
+		/** Throttle for the unclaimed-session re-publish (the "claim active" path). */
+		const val CLAIM_REPUBLISH_MS = 2_000L
+
+		/**
+		 * Share of the hub session's tracks our queue must contain for it to count as the same
+		 * listening session (so we refresh the hub's record instead of forking one). Half, matching
+		 * Feishin — a shuffle or a heavy edit still leaves that much in common.
+		 */
+		const val HUB_QUEUE_ADOPT_OVERLAP = 0.5
 	}
 }
 
