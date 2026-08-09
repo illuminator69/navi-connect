@@ -6,8 +6,9 @@ services:
     image: navi-connect-hub
     container_name: navi-connect-hub
     restart: unless-stopped
-    # Same Docker network as Navidrome/the bot so the savePlayQueue mirror can
-    # reach Navidrome internally; clients reach the hub on 4790.
+    # Same Docker network as Navidrome/AudioMuse/lb-bot so the savePlayQueue mirror
+    # and both proxies can reach them internally (none of those needs to be
+    # exposed); clients reach the hub — WebSocket, /sonic/* and /lb/* alike — on 4790.
     networks: [media]
     ports:
       - "4790:4790"

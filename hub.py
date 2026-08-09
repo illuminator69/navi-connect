@@ -276,17 +276,26 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
     },
 }
 
-# lb-bot's library-gap intelligence. Read-mostly; the three writes (index an
-# artist, download an album, allow mp3 for one album) are all things the clients
-# offer explicitly. Everything else lb-bot exposes — the whole Fill-gaps
-# workspace, delete-file, trash, prefs, the beets import paths — stays off the
-# wire, which is the entire point of a whitelist in front of an API with no auth.
+# lb-bot's library-gap intelligence. Read-mostly; the writes are all things the
+# clients offer explicitly — index an artist, download an album, allow mp3 for one
+# album, and (below) act on ONE partly-owned album's gap. Everything else lb-bot
+# exposes — the placement/match workspace, delete-file, trash, prefs, the beets
+# import paths — stays off the wire, which is the entire point of a whitelist in
+# front of an API with no auth.
 #
 # Two notes that decide the TTLs. `artist/discography` GET is an instant SQLite
 # read, so a short TTL is right and a stale answer is cheap. `album/releases`,
 # `album/tracklist` and `album/similar` sit on rate-limited MusicBrainz /
 # ListenBrainz calls and return effectively immutable data — a long TTL and a
 # longer timeout. `album/status` is the download-progress poll: never cached.
+#
+# The `gap/*` group fills the holes in an album the library already partly has.
+# Every one of them is scoped to a single review group whose id the client got
+# from an `incomplete` discography row — lb-bot's discography scan builds the
+# review group as it goes, so that id is a live handle. Two things stay out on
+# purpose: `/api/gaps` with no id (the whole-library list, unbounded, and no
+# client needs it — the id always arrives via the discography row), and
+# `/api/gaps/<id>/duplicate-files`.
 LB_ROUTES: dict[tuple[str, str], dict] = {
     ("GET", "/lb/status"): {
         "method": "GET", "path": "/api/summary",
@@ -319,9 +328,29 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": ("artist_mbid", "artist_name", "rgid", "limit"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
+    ("GET", "/lb/album/sources"): {
+        # Ranked slskd folders for a release-group, so a client can show what it is
+        # about to download instead of taking lb-bot's top pick on faith. Coverage
+        # here is matched against the canonical MusicBrainz tracklist, not a file
+        # count, which is what makes "a folder with enough files in it" stop
+        # reading as a complete match for a completely different album.
+        #
+        # Deliberately NOT stripped, unlike `/lb/gap`. That one is polled every 5s,
+        # so the peer file listings are pure weight; this is a one-shot read the
+        # user asked for, and the per-file `matchedTo` rows are the actual evidence
+        # they are judging. Different cost profile, different rule — don't
+        # "unify" the two.
+        #
+        # A live slskd search fanning out to peers: slow, and worth a short cache
+        # so re-opening the sheet doesn't start another one.
+        "method": "GET", "path": "/api/album/sources",
+        "params": ("rgid",), "cache": True,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
     ("POST", "/lb/album/download"): {
         "method": "POST", "path": "/api/album/download",
-        "body": ("rgid", "sourceUsername", "sourceFolder"), "cache": False,
+        "body": ("rgid", "sourceUsername", "sourceFolder", "quality"),
+        "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/album/status"): {
@@ -333,6 +362,42 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # the hub route table can stay a table of exact paths.
         "method": "POST", "path": "/api/gaps/{group_id}/allow-mp3",
         "path_args": ("group_id",), "body": ("group_id", "allow"), "cache": False,
+    },
+    ("GET", "/lb/gap"): {
+        # The gap progress poll — never cached, same reasoning as album/status.
+        #
+        # `strip` is why this route is affordable: lb-bot embeds each source's
+        # entire peer file listing, ten sources to a page, which is hundreds of KB
+        # on a path a phone polls every 5s into a cache bounded by entry count
+        # rather than bytes. The clients' picker shows per-source summaries
+        # (peer, format, bitrate, coverage, flags, score), never the filenames, so
+        # dropping them here also keeps other people's file paths off the device.
+        "method": "GET", "path": "/api/gaps/{group_id}",
+        "path_args": ("group_id",), "params": ("group_id", "sourcePage"),
+        "cache": False, "timeout": PROXY_SLOW_TIMEOUT,
+        "strip": (("sources", "files"), ("sources", "filesTruncated")),
+    },
+    ("POST", "/lb/gap/auto"): {
+        # Search, rank and enqueue the best source in one shot. Answers with a task
+        # id the clients discard: the GET above carries `sourceTask` precisely so
+        # nobody needs /api/tasks, which is not whitelisted and must stay that way.
+        "method": "POST", "path": "/api/gaps/{group_id}/auto",
+        "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+    },
+    ("POST", "/lb/gap/fetch"): {
+        "method": "POST", "path": "/api/gaps/{group_id}/fetch",
+        "path_args": ("group_id",), "body": ("group_id", "sourceId"), "cache": False,
+    },
+    ("POST", "/lb/gap/cancel"): {
+        "method": "POST", "path": "/api/gaps/{group_id}/cancel",
+        "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+    },
+    ("POST", "/lb/gap/rescan"): {
+        # Re-reads the album from Navidrome and walks its folder for files
+        # Navidrome hasn't indexed — slow enough to need the long timeout.
+        "method": "POST", "path": "/api/gaps/{group_id}/rescan",
+        "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
     },
 }
 
@@ -420,6 +485,32 @@ class HttpProxy:
 
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         return status, data, "application/json"
+
+    @staticmethod
+    def _strip(spec: dict, status: int, data: bytes) -> bytes:
+        """Drop fields the clients never render from a successful response.
+
+        Not a security control — the whitelist is that — but a bandwidth one, for
+        the case where an upstream view is shaped for a local web UI and carries a
+        payload nobody on a phone wants. Each rule is (list_key, field): the field
+        is removed from every object in that top-level list. Anything unexpected
+        (a non-200, a non-JSON body, a shape that doesn't match) passes through
+        untouched, because a projection failing must never fail the request.
+        """
+        rules = spec.get("strip") or ()
+        if not rules or status != 200:
+            return data
+        try:
+            payload = json.loads(data)
+            if not isinstance(payload, dict):
+                return data
+            for list_key, field in rules:
+                for row in payload.get(list_key) or []:
+                    if isinstance(row, dict):
+                        row.pop(field, None)
+            return json.dumps(payload).encode()
+        except Exception:  # noqa: BLE001 — never fail a request over a projection
+            return data
 
     # ----- cache ----------------------------------------------------------- #
     def _cache_get(self, key: str) -> Optional[tuple[int, bytes, str]]:
@@ -524,6 +615,7 @@ class HttpProxy:
 
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
+        data = self._strip(spec, status, data)
         if spec.get("cache"):
             self._cache_put(key, status, data, ctype,
                             spec.get("ttl", PROXY_CACHE_TTL))
@@ -632,10 +724,19 @@ class LbProxy(HttpProxy):
         """`/lb/status` is the liveness probe. lb-bot has no cheap dedicated health
         route, so it rides on `/api/summary`, and only the reachability verdict is
         passed on — the summary itself is a large object about the Fill-gaps
-        workspace that no client renders."""
+        workspace that no client renders.
+
+        `routes` is what this hub can actually proxy. A client ships independently
+        of the hub and the hub is a long-running process, so "my client is newer
+        than the hub it is talking to" is a permanent condition, not an edge case —
+        and without this it surfaces as a button that does nothing, because a 404
+        from an unknown route is a perfectly ordinary HTTP response. Advertising
+        the list lets a client say which feature its hub is too old for.
+        """
         return 200, json.dumps({
             "configured": True,
             "upstreamReachable": status == 200,
+            "routes": sorted(f"{method} {path}" for method, path in self.routes),
         }).encode(), "application/json"
 
 
@@ -701,6 +802,61 @@ LB = LbProxy()
 # Order matters only in that each returns None for paths outside its own prefix;
 # the first one that claims the path answers it.
 PROXIES: tuple[HttpProxy, ...] = (SONIC, LB)
+
+# Set once main() builds the hub, so the inbound notify handler below can reach
+# the connected devices. The proxy protocol class is constructed by `websockets`
+# per connection and has no other handle on it.
+HUB_INSTANCE: Optional["Hub"] = None
+
+# The one inbound path: lb-bot telling the hub an album just landed. Not a proxy
+# route — nothing is forwarded — so it lives outside LB_ROUTES, and it answers
+# whether or not LBBOT_URL is configured, because this direction doesn't need it.
+LB_NOTIFY_PATH = "/lb/notify"
+_LB_NOTIFY_STR_MAX = 200
+
+
+async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
+                            method: str) -> Optional[tuple]:
+    """Fan an lb-bot library change out to every connected client.
+
+    Same bearer as everything else, so a device token is enough to send one. That
+    is deliberate and harmless: the frame carries no authority — it only tells
+    clients to re-read data they can already read — and the alternative is a
+    second shared secret for a notification.
+    """
+    path, _, _query = raw_path.partition("?")
+    if (path.rstrip("/") or "/") != LB_NOTIFY_PATH:
+        return None
+    if method != "POST":
+        return _http_json(405, {"error": "method not allowed"})
+
+    auth = (headers.get("Authorization") or "") if headers is not None else ""
+    supplied = auth[7:] if auth.startswith("Bearer ") else ""
+    if not TOKEN or not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+        return _http_json(401, {"error": "unauthorized"})
+
+    raw = await _read_body(protocol, headers)
+    if raw is None:
+        return _http_json(413, {"error": "request body too large"})
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:  # noqa: BLE001
+        return _http_json(400, {"error": "malformed JSON body"})
+    if not isinstance(payload, dict):
+        return _http_json(400, {"error": "malformed JSON body"})
+
+    # Rebuilt field by field rather than relayed: this goes straight out to every
+    # client, so it carries only what the wire format promises, bounded in size.
+    frame = {"t": "library", "event": "albumPlaced"}
+    for key in ("event", "release_mbid", "rgid", "artist", "album"):
+        value = _as_str(payload.get(key), _LB_NOTIFY_STR_MAX)
+        if value:
+            frame["releaseMbid" if key == "release_mbid" else key] = value
+
+    if HUB_INSTANCE is not None:
+        await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
+    dlog("LB notify ->", frame)
+    return _http_json(200, {"ok": True})
 
 
 # --------------------------------------------------------------------------- #
@@ -1909,12 +2065,16 @@ def _build_proxy_protocol() -> Optional[type]:
             return path, headers
 
         async def process_request(self, path, request_headers):  # type: ignore[override]
-            result = None
-            for proxy in PROXIES:
-                result = await proxy.handle(self, path, request_headers,
-                                            self.http_method)
-                if result is not None:
-                    break
+            # Checked ahead of the proxies: /lb/notify sits under the lb prefix
+            # but is inbound, so LbProxy would 404 it against its route table.
+            result = await _handle_lb_notify(self, path, request_headers,
+                                             self.http_method)
+            if result is None:
+                for proxy in PROXIES:
+                    result = await proxy.handle(self, path, request_headers,
+                                                self.http_method)
+                    if result is not None:
+                        break
             if result is None and self.http_method != "GET":
                 # Not a proxy route and not a handshake — don't fall through into the
                 # WS upgrade with a method it can't answer.
@@ -1966,7 +2126,9 @@ async def main() -> None:
         log("WARNING: LBBOT_URL is set but HUB_TOKEN is empty — the lb-bot proxy is "
             "DISABLED. lb-bot's API has no auth of its own, so relaying it without "
             "a hub token would publish every route on the whitelist.")
+    global HUB_INSTANCE
     hub = Hub()
+    HUB_INSTANCE = hub
     log(f"navi-connect hub on ws://{HOST}:{PORT}  "
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "
         f"mirror={'on' if MIRROR_PLAYQUEUE and NAVIDROME_URL else 'off'})")

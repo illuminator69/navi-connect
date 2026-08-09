@@ -33,10 +33,50 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `HUB_STATE` | `/data/state.json` | persisted session + device registry |
 | `NAVIDROME_URL` | *(empty)* | your Navidrome base URL; required for the savePlayQueue mirror |
 | `HUB_MIRROR_PLAYQUEUE` | `true` | mirror the queue to Navidrome so unmodified Subsonic clients can resume |
-| `HUB_ND_USER` / `HUB_ND_PASS` | *(empty)* | Navidrome creds the mirror authenticates with (single-user) |
+| `HUB_ND_USER` / `HUB_ND_PASS` | *(empty)* | Navidrome creds the mirror authenticates with (single-user); the AudioMuse proxy reuses them |
+| `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
+| `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
+| `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client |
 
 If the mirror creds are unset the hub still works fully; it just skips the
 Navidrome write.
+
+### AudioMuse Tier-2 proxy (`/sonic/*`)
+
+With `AUDIOMUSE_URL` set, the same port also answers plain HTTP on a whitelist of
+five AudioMuse routes, authenticated with `Authorization: Bearer $HUB_TOKEN` — so
+no client holds the AudioMuse address, its token or the Navidrome password, and the
+core API needs no exposure of its own. Routes, limits and the probe contract:
+`../PROTOCOL.md` §14. Disabled (503) when `HUB_TOKEN` is empty, which would make it
+an open relay.
+
+```bash
+curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/sonic/clap/stats
+```
+
+### lb-bot proxy (`/lb/*`)
+
+With `LBBOT_URL` set, the same port proxies a whitelist of lb-bot's library-gap
+routes: the artist discography read and scan, album editions/tracklist/sources,
+the download and its progress poll, and the per-album gap actions
+(`/lb/gap` + `auto`/`fetch`/`cancel`/`rescan`). Routes and rationale:
+`../PROTOCOL.md` §15.
+
+**This whitelist is the only access control that exists.** lb-bot's Flask API has
+no authentication at all and binds `0.0.0.0:8899`, and it exposes delete-file,
+trash and preference-writing routes — so there is deliberately no direct-LAN
+fallback in any client, no wildcard in the table, and `/api/tasks*` and the
+whole-library `/api/gaps` list stay off it. Disabled (503) when `HUB_TOKEN` is
+empty, for the same reason as the AudioMuse proxy.
+
+`GET /lb/status` answers even when `LBBOT_URL` is unset, and lists the routes this
+hub can proxy — a client that ships ahead of the hub can then say so instead of
+failing on a silent 404. **Restart the hub after updating it**, or new routes stay
+unrouted.
+
+```bash
+curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/lb/status
+```
 
 ## Test it without real clients
 
