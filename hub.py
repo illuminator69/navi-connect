@@ -396,8 +396,14 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # album: these tracks land inside a record the user already owns, so a
         # different pressing contaminates rather than merely disappoints.
         # Answers with a task id the clients ignore, same as `auto`.
+        #
+        # The long timeout is not about the search — that is a background task and
+        # the POST returns at once. It is about `_review_lock`: a search already in
+        # flight holds it in bursts, so a second press blocks in the handler, and on
+        # the default 20s that surfaced as a bare 502 for what is really "busy".
         "method": "POST", "path": "/api/groups/{group_id}/sources",
         "path_args": ("group_id",), "body": ("group_id", "force"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("POST", "/lb/gap/auto"): {
         # Search, rank and enqueue the best source in one shot. Answers with a task
