@@ -377,6 +377,28 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "cache": False, "timeout": PROXY_SLOW_TIMEOUT,
         "strip": (("sources", "files"), ("sources", "filesTruncated")),
     },
+    ("GET", "/lb/gap/source-files"): {
+        # One source's real folder listing, each file tagged with the track it
+        # would fill. This is the counterpart to `strip` on `/lb/gap`: the poll
+        # can't afford these, but the user still has to be able to answer "does
+        # this peer actually have my 17 missing tracks, or 12 from a different
+        # pressing" — so they are fetched once, on demand, when a source is
+        # opened. Upstream expands the peer's directory for real, so it is slow.
+        "method": "GET", "path": "/api/groups/{group_id}/sources/{source_index}/files",
+        "path_args": ("group_id", "source_index"),
+        "params": ("group_id", "source_index"), "cache": True,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/gap/search"): {
+        # Find sources WITHOUT enqueuing any — the review step. `auto` does this
+        # and then commits to the top pick; splitting them is what lets a client
+        # show the candidates first, which matters more here than for a whole
+        # album: these tracks land inside a record the user already owns, so a
+        # different pressing contaminates rather than merely disappoints.
+        # Answers with a task id the clients ignore, same as `auto`.
+        "method": "POST", "path": "/api/groups/{group_id}/sources",
+        "path_args": ("group_id",), "body": ("group_id", "force"), "cache": False,
+    },
     ("POST", "/lb/gap/auto"): {
         # Search, rank and enqueue the best source in one shot. Answers with a task
         # id the clients discard: the GET above carries `sourceTask` precisely so
