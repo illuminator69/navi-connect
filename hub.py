@@ -343,13 +343,25 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         #
         # A live slskd search fanning out to peers: slow, and worth a short cache
         # so re-opening the sheet doesn't start another one.
+        #
+        # `release_mbid`/`artist`/`album`/`total` are the caller's own resolution
+        # of the release-group, forwarded so lb-bot can skip re-asking
+        # MusicBrainz. Its resolver caches a transient failure for five minutes
+        # and answers {} without retrying inside that window, which made one 503
+        # a hard 400 on that album for everyone who asked next. The client got
+        # these values from /lb/album/releases, so they cost nothing and no new
+        # route is involved.
         "method": "GET", "path": "/api/album/sources",
-        "params": ("rgid",), "cache": True,
+        "params": ("rgid", "release_mbid", "artist", "album", "total"), "cache": True,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("POST", "/lb/album/download"): {
+        # `release_mbid` + its metadata: the edition the user actually picked,
+        # which also spares lb-bot a resolve that may be inside its MusicBrainz
+        # failure cooldown. See /lb/album/sources above.
         "method": "POST", "path": "/api/album/download",
-        "body": ("rgid", "sourceUsername", "sourceFolder", "quality"),
+        "body": ("rgid", "release_mbid", "artist", "title", "total_tracks",
+                 "sourceUsername", "sourceFolder", "quality"),
         "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
