@@ -19,6 +19,7 @@ running and what to expect once it is.
 - [3. Step 1 — the hub (start here)](#3-step-1--the-hub-start-here)
 - [4. Step 2 — AudioMuse (optional, for recommendations)](#4-step-2--audiomuse-optional-for-recommendations)
 - [5. Step 3 — lb-bot (optional, for library-gap filling)](#5-step-3--lb-bot-optional-for-library-gap-filling)
+  - [5.1 Library tagging — recommended](#51-library-tagging--recommended)
 - [6. Step 4 — the clients](#6-step-4--the-clients)
   - [Option A: download prebuilt (recommended for testing)](#option-a-download-prebuilt-recommended-for-testing)
   - [Option B: build from source](#option-b-build-from-source)
@@ -93,6 +94,7 @@ them the features they power grey out or disappear entirely, by design. Start wi
 | **A publicly reachable HTTPS URL for Navidrome** | only for Chromecast | See §2.3 — this is the single most common setup failure. |
 | **AudioMuse-AI** | no | Two tiers, see §4. Tier 1 is a Navidrome plugin; Tier 2 is its own container. |
 | **slskd** | only for lb-bot | Soulseek client; lb-bot's acquisition backend. |
+| **A MusicBrainz-tagged library** (Picard or similar) | **recommended** for lb-bot | Not required to run, but per-track gap filling only works on tagged albums, and artist names have to match. See §5.1. |
 | **lb-bot** | no | Its own repository (linked from the README). Needs slskd + a writable library mount. |
 
 ### 2.2 Build machine (Windows, for the clients)
@@ -243,6 +245,32 @@ The variables that matter:
   `chown -R 99:100 /mnt/user/appdata/lb-bot`.
 - Set `ND_RECENTLYADDEDBYMODTIME=true` **on the Navidrome container**, or gap-filled albums never
   surface in "newest" — Navidrome derives `album.created_at` from the oldest file in the folder.
+
+
+### 5.1 Library tagging — recommended
+
+lb-bot resolves your library against MusicBrainz in two passes: albums carrying a `musicBrainzId`
+claim their release-group exactly, and anything untagged falls back to fuzzy title matching at a
+0.92 similarity threshold. So it **runs fine on an untagged library** — but what you get out of it
+changes, and nothing on screen announces the difference.
+
+| Your library | What lb-bot can do |
+|---|---|
+| **MusicBrainz-tagged** (Picard or equivalent) | Everything: missing albums **and** per-track gap filling — the `9/12` badges and the Fill-gaps workspace. |
+| **Untagged, but consistently named** | Missing whole albums only. Owned albums come back flagged `untagged`, and completeness is deliberately **not** guessed — so no partial-album detection at all. |
+| **Album-artist names that don't match MusicBrainz** | That artist's whole catalog reads as **missing**. |
+
+The middle row is the one that surprises people: an untagged album is matched, then skipped before
+missing-track detection ever runs, because judging completeness off an unverified match produces
+confident nonsense. The bot flags it distinctly instead of guessing.
+
+The third row is worth understanding too. The library bucket for an artist is built by **exact**
+normalized album-artist match — a fuzzy fallback used to live there and was removed, because a
+near-miss handed the scan a *different* artist's catalog and produced confidently wrong ownership
+verdicts. Empty bucket is the safer failure, but it looks like "I own none of this".
+
+**Recommendation:** tag with Picard before a first run. If you'd rather not, lb-bot is still useful
+for finding whole albums you're missing — just expect the gap-filling half to stay quiet.
 
 ---
 
