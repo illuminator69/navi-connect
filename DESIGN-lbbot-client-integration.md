@@ -5,7 +5,7 @@ implemented the same day. Assumes lb-bot's `DOWNLOAD_RELIABILITY_PLAN.md` is imp
 auto-fill matches and downloads succeed in the common case, and a failed fill carries a named
 reason.*
 
-> **lb-bot lives at `C:\Users\icher\Lb-bot-missing`.** The copy that used to sit in this repo at
+> **lb-bot lives at `the lb-bot repo`.** The copy that used to sit in this repo at
 > `lb-bot/` was a June snapshot missing every endpoint below; it has been deleted.
 
 **Status.** Phase 1.5 (lb-bot), phase 1 (hub `/lb/*`), phase 2 (Feishin) and phase 4
@@ -263,7 +263,7 @@ client that finds no entry reads `unknown`, which renders as the plain "not in y
 
 0. ✅ **Delete the stale in-repo lb-bot copy.** Its state JSONs and an orphaned `staging/` holding
    ~330 MB of downloaded-but-never-placed FLACs were moved to
-   `C:\Users\icher\lb-bot-old-state-2026-06-21\` first.
+   `~\lb-bot-old-state-2026-06-21\` first.
 1.5 ✅ **lb-bot**: idempotent `album/download`; new `GET /api/album/status`; failure reason +
    `mp3_would_help` on the album path.
 1. ✅ **Hub**: `/lb/*` proxy + whitelist + per-route TTL + `/lb/status` probe (shared `HttpProxy`
@@ -291,7 +291,7 @@ client that finds no entry reads `unknown`, which renders as the plain "not in y
   frame is handled in `features/hub/hooks/use-hub.tsx`.
 - Navic: new `domain/manager/LbBotManager.kt` next to `AudioMuseManager.kt` (Ktor, same
   fail-soft pattern); Room cache; artist screen + home rows. Reuse `LB_ROUTES` unchanged.
-- lb-bot (`C:\Users\icher\Lb-bot-missing\listenbrainz_bot.py`): the fill-status ledger
+- lb-bot (`the lb-bot repo\listenbrainz_bot.py`): the fill-status ledger
   (`_album_fill_set` / `_album_fill_view` / `_start_album_fill_verification`), the idempotency
   check in `api_album_download`, `api_album_status`, `_index_mark_release_present` and
   `_notify_hub_library_change` (both called from `_finalize_group`'s success path). All of it stays

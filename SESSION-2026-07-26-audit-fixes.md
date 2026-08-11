@@ -2,7 +2,7 @@
 
 Implements the full audit of the hub-managed saved-queue work (`SESSION-2026-07-26-hub-saved-queues.md`):
 the four user-reported bugs plus the ~30 secondary defects found tracing them. Plan:
-`~/.claude/plans/check-c-users-icher-navi-connect-readme-cuddly-floyd.md`.
+`~/.claude/plans/check-navi-connect-readme-cuddly-floyd.md`.
 
 ## Verification status
 | Area | Verified? |

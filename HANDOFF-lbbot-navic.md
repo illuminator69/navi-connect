@@ -5,7 +5,7 @@ either shipped and running or a decision that round forced. Read `DESIGN-lbbot-c
 for the original design and its twelve corrections; read `PROTOCOL.md` §15 for the wire contract.
 This document is the part that matters when writing the Kotlin.*
 
-**lb-bot lives at `C:\Users\icher\Lb-bot-missing`** and is *not* in this repo.
+**lb-bot lives at `the lb-bot repo`** and is *not* in this repo.
 
 ---
 

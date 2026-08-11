@@ -8,7 +8,7 @@ metadata:
 ---
 
 AudioMuse-AI integration surface for [[navi-connect-project]]. Source zips were at
-`C:\Users\icher\Downloads\AudioMuse-AI-main.zip` (core) + `AudioMuse-AI-NV-plugin-main.zip`
+`~\Downloads\AudioMuse-AI-main.zip` (core) + `AudioMuse-AI-NV-plugin-main.zip`
 (Navidrome plugin), extracted to `Downloads\_am_src\`.
 
 **Two tiers (decided: build Tier 1 first, Tier 2-ready behind a capability probe):**
@@ -45,7 +45,7 @@ slow call delays time-to-playlist, never tap/scroll/audio. Three rules for the S
 first" → grey the feature out + fall back to Tier 1, don't error; (2) short connect timeout +
 cancel-in-flight + debounce; (3) cache results by seed id/query.
 
-**Full design doc written** at `C:\Users\icher\navi-connect\DESIGN-adaptive-audiomuse.md`
+**Full design doc written** at `DESIGN-adaptive-audiomuse.md`
 (companion to ROADMAP-V2.md) — read it before building. Covers everything below plus the
 adaptive mode + visualizer.
 

@@ -38,7 +38,7 @@ important for Chromecast, which must fetch stream URLs directly).
 | **Navic** (fork) | Mobile client (controller + receiver) + native Chromecast | Kotlin Multiplatform / Compose, **Android only** | `navic/` |
 | **Navidrome** | The music server (not in this repo) | Go, Subsonic/OpenSubsonic API | `https://music.example.com` |
 | **AudioMuse-AI** | Recommendation engine (not in this repo) | Navidrome plugin (Tier 1) + core HTTP API (Tier 2) | server-side |
-| **lb-bot** | Library-gap filler (missing-album discography + Soulseek acquisition). Separate repo, reached **through the hub** on `/lb/*` | Python/Flask, port 8899 | `C:\Users\icher\Lb-bot-missing` |
+| **lb-bot** | Library-gap filler (missing-album discography + Soulseek acquisition). Separate repo, reached **through the hub** on `/lb/*` | Python/Flask, port 8899 | own repo |
 
 **Scope boundaries:** iOS is out of scope (Navic's commonMain must still *compile* for iOS, but no
 iOS features/testing). The web build of Feishin falls back gracefully (Tier-2 AudioMuse is desktop-only
@@ -174,7 +174,7 @@ All AudioMuse calls are **fail-soft**: a cold index, missing plugin or unreachab
 feature out and falls back to Tier 1, never errors.
 
 ### lb-bot — library-gap intelligence
-A separate self-hosted service (`C:\Users\icher\Lb-bot-missing`) that indexes each artist's full
+A separate self-hosted service (its own repository) that indexes each artist's full
 MusicBrainz discography, knows which releases the library lacks, and can acquire one from Soulseek
 and place it. Reached **only through the hub** (`<hub>/lb/*`, `PROTOCOL.md` §15,
 `DESIGN-lbbot-client-integration.md`): its own Flask API has no authentication and binds
@@ -414,11 +414,18 @@ navi-connect/
   SESSION-2026-07-26-audit-fixes.md  saved-queue/takeover/transfer audit fixes
   CHANGES-2026-07-18-symfonium.md Symfonium-plan finishing pass (queue undo, history typing, QoL)
   TODO-PROMPTS.md                pickup-ready implementation prompts
-  MEMORY.md                      (stale index — prefer HANDOFF)
   hub/                           Python relay hub + tools/
-  feishin/                       Feishin fork (Electron)
   navic/                         Navic fork (Kotlin Multiplatform / Compose)
 ```
-lb-bot is **not in this repo** — it lives at `C:\Users\icher\Lb-bot-missing`. (A June 2026 snapshot
-used to sit here as `lb-bot/`; it predated every endpoint the integration uses and was deleted.
-Its leftover state JSONs and staging audio are in `C:\Users\icher\lb-bot-old-state-2026-06-21\`.)
+
+### Sibling repositories
+
+Two components live in their own repositories rather than here:
+
+| Component | Why it's separate |
+|---|---|
+| **Feishin fork** | Carries ~4,700 commits of upstream history so that new upstream releases can still be merged with `git merge upstream/<tag>` — flattening it into this tree would destroy that. It is GPL-3.0, and keeping it public is also what makes the distributed binaries' source available. |
+| **lb-bot** | An independent service with its own release cycle, useful on its own, and entirely optional here. |
+
+Prebuilt Feishin and Navic binaries are attached to this repository's **Releases** —
+see `TESTING-SETUP.md` §6 if you'd rather not build them yourself.

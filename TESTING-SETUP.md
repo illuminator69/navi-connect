@@ -13,14 +13,14 @@ running and what to expect once it is.
 - **This is a single-user, personal-infrastructure project.** There is no multi-tenant story, no
   account system, no hosted instance. Every component assumes it is the only one, talking to one
   Navidrome account.
-- **Nothing here is signed or packaged for distribution.** The Feishin installer is quarantined by
-  Windows Defender (see §5); the Navic APK is signed with the debug key unless you supply your own.
+- **Nothing here is signed.** The Feishin binary is unsigned, so Windows Defender objects and the
+  NSIS installer is unusable (§6); the Navic APK is signed with a debug key unless you supply your
+  own.
 - **Several major subsystems are built but not yet field-tested** — most of the Chromecast recovery
   work and the whole lb-bot client surface. §8 lists exactly which. If you are testing, those are
   the interesting parts.
-- **A chunk of the tree is uncommitted.** Everything in Navic since `f4b1327`, plus some hub and
-  Feishin files, exists only in the working tree. Don't `git clean`, and don't assume a fresh clone
-  of any sub-repo matches what's described here.
+- **Two components live in sibling repositories** — the Feishin fork and lb-bot. See the README for
+  why, and §6 for prebuilt binaries if you'd rather not build them.
 
 ---
 
@@ -67,7 +67,7 @@ them the features they power grey out or disappear entirely, by design. Start wi
 | **A publicly reachable HTTPS URL for Navidrome** | only for Chromecast | See §2.3 — this is the single most common setup failure. |
 | **AudioMuse-AI** | no | Two tiers, see §4. Tier 1 is a Navidrome plugin; Tier 2 is its own container. |
 | **slskd** | only for lb-bot | Soulseek client; lb-bot's acquisition backend. |
-| **lb-bot** | no | Separate repo at `Lb-bot-missing`. Needs slskd + a writable library mount. |
+| **lb-bot** | no | Its own repository (linked from the README). Needs slskd + a writable library mount. |
 
 ### 2.2 Build machine (Windows, for the clients)
 
@@ -163,7 +163,7 @@ password server-side, so no phone or desktop ever holds them. Leave `AUDIOMUSE_U
 
 ## 5. Step 3 — lb-bot (optional, for library-gap filling)
 
-lb-bot is a **separate repo** (`Lb-bot-missing`), not part of this one. It indexes each artist's full
+lb-bot is a **separate repository**, not part of this one. It indexes each artist's full
 MusicBrainz discography, knows what your library is missing, and can acquire it from Soulseek.
 
 Its own Flask API **has no authentication and binds `0.0.0.0:8899`**. Because of that there is
@@ -201,6 +201,32 @@ On lb-bot (its own env — see its `README.md` §Configuration for the full list
 ---
 
 ## 6. Step 4 — the clients
+
+### Option A: download prebuilt (recommended for testing)
+
+Both clients are attached to this repository's **Releases** page, so you don't need Node, a JDK, or
+the Android SDK just to try the thing:
+
+| Asset | What it is |
+|---|---|
+| `Feishin-portable-win-x64.zip` | Unzip anywhere, run `Feishin.exe`. No installer — see the note below. |
+| `Navic.apk` | Sideload it. Signed with a debug key, so Android will warn about an unknown source. |
+
+Two things to expect, both benign and both consequences of not paying for code-signing certificates:
+
+- **Windows Defender / SmartScreen will complain** about the unsigned Feishin binary. This is also
+  why there's no installer at all — see Option B.
+- **Android will warn** about installing from an unknown source, and you may need to allow it for
+  whatever app you're sideloading from.
+
+Then skip to the configuration bullets at the end of each Option B subsection below — you still need
+to point each client at your hub.
+
+> **Source availability:** both clients are **GPL-3.0**. Navic's source is in `navic/` in this repo;
+> Feishin's is in its own repository, linked from the README. The GPL entitles you to the
+> corresponding source for any binary here, and that's where it is.
+
+### Option B: build from source
 
 ### Feishin (Windows desktop)
 
@@ -362,38 +388,20 @@ Some specifics worth knowing before you deploy it anywhere:
 - **The hub is the right place for credentials.** It holds the AudioMuse token and the Navidrome
   password server-side so no device carries them. Prefer the proxied routes over the direct-client
   fallbacks for exactly this reason.
-- **⚠️ Rotate your slskd API key.** An earlier commit in the public `Lb-bot-missing` repo history
-  contains a real slskd API key and a personal contact email. They are gone from the current code,
-  but they remain in the published git history. See §10.
 
 ---
 
-## 10. What was scrubbed, and what still needs your action
+## 10. Credential hygiene when you deploy this
 
-The working trees have been cleaned of personal identifiers:
+Everything in this repository is configured from the environment — there are no credentials in the
+source, and every secret-bearing variable defaults to empty or to a Docker service name. When you
+stand up your own instance, keep it that way:
 
-| Where | Was | Now |
-|---|---|---|
-| `navic/…/PreferenceManager.kt` | `hubUrl` defaulted to a real LAN IP | `""` (blank; safely handled everywhere) |
-| `navic/…/NaviConnectScreen.kt` | Two placeholders with a real LAN IP | `192.168.1.10` examples |
-| `feishin/…/hub-settings.tsx` | Setting description with a real LAN IP | `192.168.1.10` example |
-| `Lb-bot-missing/listenbrainz_bot.py` | `NAVIDROME_URL`/`SLSKD_URL` defaulted to a real LAN IP | `http://navidrome:4533`, `http://slskd:5030` |
-| `Lb-bot-missing/{README,CLAUDE,AGENTS}.md` | Same LAN IP in docs | Same service-name placeholders |
-| navi-connect `*.md` | A personal domain, 19 occurrences across 5 files | `music.example.com` |
-
-Verified clean: no API keys, tokens, or passwords are hardcoded anywhere in either working tree —
-every credential is read from the environment with an empty default. The hub's `.env.example` is
-placeholders only, and no real `.env` is tracked.
-
-**Two things remain, and they're yours to decide:**
-
-1. **Rotate the slskd API key.** Commits `4183838` and `b74410e` in `Lb-bot-missing` — a **public**
-   GitHub repo — contain a real slskd API key and a personal email address in
-   `listenbrainz_bot.py`. Removing them from the current code does not remove them from published
-   history. Rotating the key in the slskd UI is the fix that actually works; history rewriting is
-   optional cleanup on top, and it's destructive, so it wasn't done for you.
-2. **Push the scrub.** The fixes above are uncommitted working-tree changes in repos whose current
-   published `HEAD` still carries the LAN IP.
-
-A private LAN IP is low-severity on its own — it reveals a subnet, not a way in. The API key is the
-one that matters.
+- **Never commit your `.env`.** `hub/.env.example` is the template; the real file is gitignored.
+- **Don't hardcode your server address** in client defaults or placeholders. The clients ship with a
+  blank hub URL and generic `192.168.1.10` examples on purpose.
+- **`hub/data/` is gitignored** and should stay that way — it holds session state including
+  credentialed stream URLs (see §9).
+- If you fork this and push, **set a GitHub noreply address** on the repo
+  (`git config user.email <id>+<user>@users.noreply.github.com`) before your first commit, or every
+  commit will publish your real email.

@@ -29,13 +29,13 @@ Decisions: port 4790; hub computes shuffle order; mirror to Navidrome `savePlayQ
 hub in Python; no iOS v1. Chromecast + local-output-device = Phase 2 (Cast via Navic
 `media3-cast` as a bridged "virtual receiver").
 
-Spec at `C:\Users\icher\navi-connect\PROTOCOL.md`. **Hub BUILT** at
-`C:\Users\icher\navi-connect\hub\` (Python/asyncio/websockets, port 4790): hub.py,
+Spec at `PROTOCOL.md`. **Hub BUILT** at
+`hub\` (Python/asyncio/websockets, port 4790): hub.py,
 Dockerfile, docker-compose.yml (separate container, `media` network), .env.example,
 README, and tools/ (fake_receiver.py, controller.py, test_transfer.py). Navidrome URL
 = https://music.example.com; savePlayQueue mirror ON (needs HUB_ND_USER/PASS). Transfer-
 with-resume **verified PASS** via tools/test_transfer.py (resumes same index+position).
-**Feishin fork now lives at `C:\Users\icher\navi-connect\feishin\`** (moved out of Temp).
+**Feishin fork now lives at `feishin\`** (moved out of Temp).
 Node/pnpm are NOT installed on the machine — user must install Node 20 LTS + `corepack enable`,
 then `pnpm install` && `pnpm dev`. NOT yet typechecked here (no Electron toolchain in sandbox).
 Engine + settings UI + device picker all BUILT, typecheck PASSES (pinned @types/react
@@ -100,7 +100,7 @@ fake_receiver.py now also reports immediately on every state change like a real 
 e2e has a stale-report race regression test. Fake receiver doesn't auto-advance tracks
 (sim limitation).
 NAVIC CLIENT v1 BUILT (not compiled — no JDK/Android SDK on machine; user builds in Android
-Studio). Navic fork moved to C:\Users\icher\navi-connect\navic. Files: (1) libs.versions.toml
+Studio). Navic fork moved to navic. Files: (1) libs.versions.toml
 + ktor-client-websockets in ktor bundle; (2) PreferenceManager + hubEnabled/hubUrl/hubToken/
 hubDeviceName/hubDeviceId prefs; (3) MediaPlayer.kt base + OPEN no-op hooks loadRemoteQueue/
 setPlayerVolume/applyRemoteRepeat/applyRemoteShuffle (iOS untouched); (4) MediaPlayer.android.kt
@@ -156,7 +156,7 @@ throttle). CAVEATS: downloaded tracks cast as file:// URIs → won't play on chr
 URLs fine); Chromecast is bridged by Navic (hub still sees Navic as active device, not the
 TV); CastPlayer(CastContext) ctor may warn deprecated on media3 1.10. Chromecast build SUCCEEDED (user hasn't tested cast yet).
 
-V2 ROADMAP defined by user, written to C:\Users\icher\navi-connect\ROADMAP-V2.md (phased,
+V2 ROADMAP defined by user, written to ROADMAP-V2.md (phased,
 grounded in source surveys). KEY FINDINGS: AudioMuse-AI-NV-plugin = standard Subsonic
 getSimilarSongs2/getArtistInfo (so Navic radio == AudioMuse support, one feature);
 Feishin ALREADY has smart playlists (query-builder → rules JSON → Navidrome native API,
