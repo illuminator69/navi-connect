@@ -1,3 +1,51 @@
+# Navic — navi-connect fork
+
+> ### This is a modified version of **[ssalggnikool/Navic](https://github.com/ssalggnikool/Navic)**
+> **Modified by [illuminator69](https://github.com/illuminator69), starting July 2026, based on
+> upstream `v1.0.0-alpha40`.** All credit for Navic itself belongs to
+> [paige](https://github.com/ssalggnikool) and its contributors. Licensed **GPL-3.0**, same as
+> upstream.
+>
+> ⚠️ **The download badges further down are upstream's, not this fork's.** They install the
+> original Navic. Builds of *this* fork are published in
+> [navi-connect's releases](https://github.com/illuminator69/navi-connect/releases).
+>
+> Bugs in Navic itself belong [upstream](https://github.com/ssalggnikool/Navic/issues); bugs in the
+> hub, cast, lb-bot or AudioMuse layers belong in
+> [navi-connect](https://github.com/illuminator69/navi-connect/issues).
+
+## What this fork adds
+
+It makes Navic a client for **[navi-connect](https://github.com/illuminator69/navi-connect)** — a
+shared playback session across devices — and a front end for
+**[lb-bot](https://github.com/illuminator69/lb-bot)**, which knows what your library is missing.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illuminator69/navi-connect/main/docs/screenshots/navic-artist-missing-albums.png" width="45%" alt="Artist page with albums marked 7 missing, 3 missing and Not in your library" />
+  <img src="https://raw.githubusercontent.com/illuminator69/navi-connect/main/docs/screenshots/navic-missing-album-review.png" width="45%" alt="Bottom sheet showing edition options, tracklist, quality preference and Find sources" />
+</p>
+
+- **The albums you don't own**, shown on the artist page beside the ones you do, with a review sheet
+  that checks a release against the canonical MusicBrainz tracklist before downloading it.
+- **Remote control + transfer with resume** — a blended player state mirrors the shared session
+  across mini-player, now-playing, queue and artwork pager, and the Android notification, lock
+  screen and Bluetooth controls drive the *remote* session.
+- **Native Chromecast**, via `NsdManager` and a hand-rolled castv2 client — no Cast SDK, no Play
+  Services.
+- **AudioMuse-AI**: Sonic Fingerprint autoplay, adaptive Mood Flow, character presets, a
+  mood-reactive visualizer, and CLAP text→mood search.
+- **Saved Queues / Continue Listening** and a **Download Center**, synced through the hub and shared
+  with the desktop client.
+
+**Setup:** don't start here — see the
+**[navi-connect setup guide](https://github.com/illuminator69/navi-connect/blob/main/TESTING-SETUP.md)**.
+
+---
+
+<sub>Upstream README follows, unmodified.</sub>
+
+---
+
 <div align="center">
 
 # Navic
