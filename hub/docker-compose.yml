@@ -2,8 +2,11 @@
 # `docker run` form below (compose `volumes:` are honored here, unlike the bot).
 services:
   navi-connect-hub:
-    build: .
-    image: navi-connect-hub
+    # Published to GHCR by .github/workflows/hub-docker.yml (at the repo root).
+    # `docker compose pull && docker compose up -d` picks up a new build.
+    # To build locally instead, comment the image line and uncomment `build: .`.
+    image: ghcr.io/illuminator69/navi-connect-hub:latest
+    # build: .
     container_name: navi-connect-hub
     restart: unless-stopped
     # Same Docker network as Navidrome/AudioMuse/lb-bot so the savePlayQueue mirror

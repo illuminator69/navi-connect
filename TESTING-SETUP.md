@@ -100,6 +100,15 @@ cp .env.example .env      # then edit it
 docker compose up -d      # or: pip install -r requirements.txt && python hub.py
 ```
 
+The compose file pulls a prebuilt image from **GHCR** (`ghcr.io/<owner>/navi-connect-hub`), published
+automatically on every push to `main`. To update:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+To build from source instead, comment out the `image:` line and uncomment `build: .`.
+
 Minimum viable `.env` — everything else can stay commented out:
 
 ```ini
@@ -169,6 +178,9 @@ MusicBrainz discography, knows what your library is missing, and can acquire it 
 Its own Flask API **has no authentication and binds `0.0.0.0:8899`**. Because of that there is
 deliberately **no direct-LAN fallback** in the clients: they reach it only through the hub, or not at
 all. Don't expose port 8899 beyond your LAN.
+
+lb-bot also publishes a prebuilt image to **GHCR** (`ghcr.io/<owner>/lb-bot`), so it updates the same
+way the hub does — `docker compose pull && docker compose up -d`.
 
 On the hub:
 ```ini
