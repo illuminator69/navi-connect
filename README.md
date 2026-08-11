@@ -1,14 +1,69 @@
 # navi-connect
 
-A Spotify-Connect–style remote-control layer over a personal **Navidrome** music server, plus an
-**AudioMuse-AI**–powered recommendation/adaptive-radio layer. Multiple client apps act as both
-controllers and receivers; a small headless **hub** holds the shared session and routes commands.
-Audio never flows through the hub — each receiver streams directly from Navidrome by track id.
+**Your music library, finished and shared.** navi-connect joins two self-hosted projects into one:
+a Spotify-Connect–style **shared playback session** across every device, and **lb-bot**, which knows
+every album your library is missing and can fetch it — from inside the player, on the artist page
+you're already looking at.
 
-> **Start here.** This file is the single source of truth for *what the project is and how it fits
-> together*. Companion docs: `TESTING-SETUP.md` (prerequisites, setup, known issues),
-> `PROTOCOL.md` (wire protocol), `ROADMAP-V2.md` / `DESIGN-*.md` (feature plans and designs),
-> `TODO-PROMPTS.md` (pickup-ready task prompts).
+### ▶ [**Setup & testing guide →**](TESTING-SETUP.md)
+
+**If you want to run this, start there, not here.** It covers prerequisites, step-by-step setup, a
+smoke test that isolates failures, and every known bug and caveat. Prebuilt clients are on the
+[Releases](../../releases) page — no toolchain required.
+
+This file explains *what the project is and how it fits together*. `PROTOCOL.md` has the wire spec.
+
+---
+
+## What you get
+
+- **The missing half of your library, visible.** Open an artist and the albums you *don't* have sit
+  right there among the ones you do — faded and dashed, a partly-owned album carrying its `9/12`.
+  One tap reviews real Soulseek sources against the canonical tracklist and fetches the right one.
+- **One playback session, every device.** Control what's playing on one device from another; move
+  playback mid-song to your desktop, your phone, or a Chromecast, and it resumes on the same beat.
+- **Recommendations that follow you.** AudioMuse-AI similar-songs radio, artist radio, Song Journey,
+  text→mood search, and an adaptive "Mood Flow" that reacts to what you skip — playing on whichever
+  device is currently active.
+- **Continue Listening across clients.** A shared, hub-owned queue history, so what you started on
+  your phone is waiting on your desktop.
+
+Both halves are optional and fail soft: no lb-bot means the discography surface simply isn't there,
+no AudioMuse means those features grey out. The core remote-control layer needs neither.
+
+---
+
+## Contents
+
+- [What you get](#what-you-get)
+- [1. What it is / the problem it solves](#1-what-it-is--the-problem-it-solves)
+- [2. Components](#2-components)
+- [3. Architecture](#3-architecture)
+  - [Roles](#roles)
+  - [Transfer-with-resume](#transfer-with-resume)
+  - [Chromecast](#chromecast)
+  - [Data/theming philosophy](#datatheming-philosophy)
+- [4. The wire protocol (summary)](#4-the-wire-protocol-summary)
+- [5. External APIs used](#5-external-apis-used)
+  - [Navidrome — Subsonic / OpenSubsonic](#navidrome--subsonic--opensubsonic)
+  - [AudioMuse-AI — two tiers](#audiomuse-ai--two-tiers)
+  - [lb-bot — library-gap intelligence](#lb-bot--library-gap-intelligence)
+- [6. Features (current)](#6-features-current)
+  - [Core remote-control (confirmed working)](#core-remote-control-confirmed-working)
+  - [Library & playback features](#library--playback-features)
+  - [AudioMuse recommendation layer](#audiomuse-recommendation-layer)
+  - [Known open items (see TESTING-SETUP.md §8)](#known-open-items-see-testing-setupmd-8)
+- [7. Where the code lives (integration points)](#7-where-the-code-lives-integration-points)
+  - [Hub — hub/hub.py](#hub--hubhubpy)
+  - [Feishin (renderer unless noted)](#feishin-renderer-unless-noted)
+  - [Navic (commonMain unless noted)](#navic-commonmain-unless-noted)
+- [8. Build & run](#8-build--run)
+  - [Hub](#hub)
+  - [Feishin (Electron / Windows)](#feishin-electron--windows)
+  - [Navic (Android / KMP)](#navic-android--kmp)
+- [9. Conventions & gotchas](#9-conventions--gotchas)
+- [10. Directory map](#10-directory-map)
+  - [Sibling repositories](#sibling-repositories)
 
 ---
 
@@ -38,7 +93,7 @@ important for Chromecast, which must fetch stream URLs directly).
 | **Navic** (fork) | Mobile client (controller + receiver) + native Chromecast | Kotlin Multiplatform / Compose, **Android only** | `navic/` |
 | **Navidrome** | The music server (not in this repo) | Go, Subsonic/OpenSubsonic API | `https://music.example.com` |
 | **AudioMuse-AI** | Recommendation engine (not in this repo) | Navidrome plugin (Tier 1) + core HTTP API (Tier 2) | server-side |
-| **lb-bot** | Library-gap filler (missing-album discography + Soulseek acquisition). Separate repo, reached **through the hub** on `/lb/*` | Python/Flask, port 8899 | own repo |
+| **lb-bot** | Library-gap filler (missing-album discography + Soulseek acquisition). Separate repo, reached **through the hub** on `/lb/*` | Python/Flask, port 8899 | [own repo](https://github.com/illuminator69/lb-bot) |
 
 **Scope boundaries:** iOS is out of scope (Navic's commonMain must still *compile* for iOS, but no
 iOS features/testing). The web build of Feishin falls back gracefully (Tier-2 AudioMuse is desktop-only
@@ -157,7 +212,7 @@ require the AudioMuse plugin loaded — probe with `getOpenSubsonicExtensions` a
 
 **Tier 2 — AudioMuse core HTTP API** (synchronous in-memory lookups, so fast; only ML jobs are queued
 off the client path). **Reached through the hub**, not directly: `<hub>/sonic/*` with the hub token
-(plain HTTP on the WebSocket port — `PROTOCOL.md` §14, `DESIGN-hub-audiomuse-proxy.md`). The hub holds
+(plain HTTP on the WebSocket port — `PROTOCOL.md` §14). The hub holds
 the AudioMuse address, its API token and the Navidrome password server-side, so no device carries
 them and the core API needs no internet exposure; it whitelists the five routes below, injects the
 credentials, caps concurrency and caches results for both clients. Each client keeps its old direct
@@ -177,7 +232,7 @@ feature out and falls back to Tier 1, never errors.
 A separate self-hosted service (its own repository) that indexes each artist's full
 MusicBrainz discography, knows which releases the library lacks, and can acquire one from Soulseek
 and place it. Reached **only through the hub** (`<hub>/lb/*`, `PROTOCOL.md` §15,
-`DESIGN-lbbot-client-integration.md`): its own Flask API has no authentication and binds
+its own Flask API has no authentication and binds
 `0.0.0.0:8899`, so unlike AudioMuse there is deliberately **no direct-LAN fallback**. `LBBOT_URL`
 unset = the whole surface hides. Whitelisted routes cover the instant discography read, the
 explicit "index this artist" scan, album editions/tracklist/similar, the one-tap download, a
@@ -271,7 +326,7 @@ download succeeded.
 - Autoplay modes (one control, four): **Off / Similar / Sonic Fingerprint / Adaptive** — modes needing
   Tier 2 grey out until configured.
 
-### Known open items (see `TESTING-SETUP.md` §8 + `TODO-PROMPTS.md`)
+### Known open items (see `TESTING-SETUP.md` §8)
 - Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow re-splice loop + character-param wiring
   landed 2026-07-20 — bounded re-centroid passes + Echo/Steady/Transition presets.)*
 - Navic **native cast lifecycle re-adoption** after a process restart (crash is fixed; lifecycle isn't).
@@ -393,14 +448,6 @@ navi-connect/
   README.md                      ← this file (start here)
   TESTING-SETUP.md               prerequisites, step-by-step setup, smoke test, known bugs/caveats
   PROTOCOL.md                    wire protocol spec
-  ROADMAP-V2.md                  phased feature roadmap
-  DESIGN-adaptive-audiomuse.md   AudioMuse recommendation/adaptive design
-  DESIGN-hub-audiomuse-proxy.md  routing AudioMuse Tier 2 through the hub
-  DESIGN-lbbot-client-integration.md  lb-bot discography/download in the clients
-  DESIGN-expressive-blur.md      Haze/blur plan (Navic)
-  NAVIC-SYMFONIUM-PLAN.md        reliability/queue/offline/polish plan
-  audiomuse-api.md               AudioMuse API capability + throttling notes
-  TODO-PROMPTS.md                pickup-ready implementation prompts
   hub/                           Python relay hub + tools/
   navic/                         Navic fork (Kotlin Multiplatform / Compose)
 ```
@@ -411,8 +458,8 @@ Two components live in their own repositories rather than here:
 
 | Component | Why it's separate |
 |---|---|
-| **Feishin fork** | Carries ~4,700 commits of upstream history so that new upstream releases can still be merged with `git merge upstream/<tag>` — flattening it into this tree would destroy that. It is GPL-3.0, and keeping it public is also what makes the distributed binaries' source available. |
-| **lb-bot** | An independent service with its own release cycle, useful on its own, and entirely optional here. |
+| **[Feishin fork](https://github.com/illuminator69/feishin)** | Carries ~4,700 commits of upstream history so that new upstream releases can still be merged with `git merge upstream/<tag>` — flattening it into this tree would destroy that. It is GPL-3.0, and keeping it public is also what makes the distributed binaries' source available. |
+| **[lb-bot](https://github.com/illuminator69/lb-bot)** | An independent service with its own release cycle, useful on its own, and entirely optional here. |
 
 Prebuilt Feishin and Navic binaries are attached to this repository's **Releases** —
 see `TESTING-SETUP.md` §6 if you'd rather not build them yourself.

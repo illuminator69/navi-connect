@@ -535,7 +535,7 @@ id keeps the saved-queue history record from forking (§8.3).
 Not part of the WebSocket message catalog: these are plain HTTP requests served on
 the **same port** (`4790`) by the same listener, so the clients can reach the
 AudioMuse-AI core through the one component that is already authenticated and
-remotely reachable. Design + rationale: `DESIGN-hub-audiomuse-proxy.md`.
+remotely reachable.
 
 Enabled when `AUDIOMUSE_URL` is set **and** `HUB_TOKEN` is non-empty (an empty
 token would make it an open relay). Otherwise `/sonic/*` answers `503` — except
@@ -584,7 +584,7 @@ cached — it is stochastic and Mood Flow re-asks with the same seeds.
 
 The same mechanism as §14 — plain HTTP on port `4790`, whitelist, `HUB_TOKEN`
 bearer, shared cache — pointed at lb-bot, which knows what is *missing* from the
-library. Design: `DESIGN-lbbot-client-integration.md`. Both proxies subclass one
+library. Both proxies subclass one
 `HttpProxy`; `process_request` tries each in turn and falls through to the
 WebSocket handshake when neither claims the path.
 

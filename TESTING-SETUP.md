@@ -8,6 +8,32 @@ running and what to expect once it is.
 
 ---
 
+## Contents
+
+- [0. Read this first](#0-read-this-first)
+- [1. The shape of the thing](#1-the-shape-of-the-thing)
+- [2. Prerequisites](#2-prerequisites)
+  - [2.1 Server side (a NAS, a Linux box, Unraid — anything that runs Docker)](#21-server-side-a-nas-a-linux-box-unraid--anything-that-runs-docker)
+  - [2.2 Build machine (Windows, for the clients)](#22-build-machine-windows-for-the-clients)
+  - [2.3 The public-URL requirement (read this one)](#23-the-public-url-requirement-read-this-one)
+- [3. Step 1 — the hub (start here)](#3-step-1--the-hub-start-here)
+- [4. Step 2 — AudioMuse (optional, for recommendations)](#4-step-2--audiomuse-optional-for-recommendations)
+- [5. Step 3 — lb-bot (optional, for library-gap filling)](#5-step-3--lb-bot-optional-for-library-gap-filling)
+- [6. Step 4 — the clients](#6-step-4--the-clients)
+  - [Option A: download prebuilt (recommended for testing)](#option-a-download-prebuilt-recommended-for-testing)
+  - [Option B: build from source](#option-b-build-from-source)
+  - [Feishin (Windows desktop)](#feishin-windows-desktop)
+  - [Navic (Android)](#navic-android)
+- [7. Smoke test — the order that isolates failures](#7-smoke-test--the-order-that-isolates-failures)
+- [8. Known issues, caveats, and what's untested](#8-known-issues-caveats-and-whats-untested)
+  - [8.1 Confirmed working](#81-confirmed-working)
+  - [8.2 Known bugs and limitations](#82-known-bugs-and-limitations)
+  - [8.3 Built but NOT yet tested — the highest-value places to look](#83-built-but-not-yet-tested--the-highest-value-places-to-look)
+- [9. Security notes](#9-security-notes)
+- [10. Credential hygiene when you deploy this](#10-credential-hygiene-when-you-deploy-this)
+
+---
+
 ## 0. Read this first
 
 - **This is a single-user, personal-infrastructure project.** There is no multi-tenant story, no
