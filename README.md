@@ -5,10 +5,10 @@ A Spotify-Connect–style remote-control layer over a personal **Navidrome** mus
 controllers and receivers; a small headless **hub** holds the shared session and routes commands.
 Audio never flows through the hub — each receiver streams directly from Navidrome by track id.
 
-> **For agents:** this file is the single source of truth for *what the project is and how it fits
-> together*. Companion docs: `HANDOFF.md` (durable engineering summary + integration points),
-> `PROTOCOL.md` (wire protocol), `ROADMAP-V2.md` / `DESIGN-adaptive-audiomuse.md` (feature plans),
-> `PROJECT-SUMMARY-2026-07-18.md` (done vs. to-do), `TODO-PROMPTS.md` (pickup-ready task prompts).
+> **Start here.** This file is the single source of truth for *what the project is and how it fits
+> together*. Companion docs: `TESTING-SETUP.md` (prerequisites, setup, known issues),
+> `PROTOCOL.md` (wire protocol), `ROADMAP-V2.md` / `DESIGN-*.md` (feature plans and designs),
+> `TODO-PROMPTS.md` (pickup-ready task prompts).
 
 ---
 
@@ -83,7 +83,7 @@ watching controllers both counting the play.
 
 ### Data/theming philosophy
 Both clients derive dynamic UI color from album art (kmpalette → materialKolor scheme in Navic).
-AudioMuse "Mood Flow" drives an adaptive visualizer. See `HANDOFF-theming.md`.
+AudioMuse "Mood Flow" drives an adaptive visualizer.
 
 ---
 
@@ -271,7 +271,7 @@ download succeeded.
 - Autoplay modes (one control, four): **Off / Similar / Sonic Fingerprint / Adaptive** — modes needing
   Tier 2 grey out until configured.
 
-### Known open items (see `PROJECT-SUMMARY-2026-07-18.md` + `TODO-PROMPTS.md`)
+### Known open items (see `TESTING-SETUP.md` §8 + `TODO-PROMPTS.md`)
 - Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow re-splice loop + character-param wiring
   landed 2026-07-20 — bounded re-centroid passes + Echo/Steady/Transition presets.)*
 - Navic **native cast lifecycle re-adoption** after a process restart (crash is fixed; lifecycle isn't).
@@ -279,7 +279,7 @@ download succeeded.
 - Deferred Navic library QoL (need a compiler in the loop): alphabet fast-scroll jump list, recently-added
   **songs** row (no local added-date column), downloaded-only filters on artist/album/playlist lists.
 - The bulk of the Symfonium plan (queue undo, session-typed history, download & library QoL) landed
-  2026-07-18 — see `CHANGES-2026-07-18-symfonium.md`; **not yet compiled/verified** (Navic).
+  2026-07-18; **not yet compiled/verified** (Navic).
 
 ---
 
@@ -384,8 +384,6 @@ debug key.
 - Same for lb-bot, but stricter: not configured / unreachable / unindexed all render **nothing**.
   The artist page must look exactly as it does today whenever that layer is absent.
 - Cast requires **publicly reachable** stream/cover URLs (`https://music.example.com`, not Tailscale/LAN IPs).
-- `MEMORY.md`'s index line ("building hub next") and `STATUS-2026-06-19.md` predate Tier-2 completion —
-  treat `HANDOFF.md` + `PROJECT-SUMMARY-2026-07-18.md` as current instead.
 
 ---
 
@@ -394,25 +392,14 @@ debug key.
 navi-connect/
   README.md                      ← this file (start here)
   TESTING-SETUP.md               prerequisites, step-by-step setup, smoke test, known bugs/caveats
-  HANDOFF.md                     durable engineering summary + integration points
   PROTOCOL.md                    wire protocol spec
   ROADMAP-V2.md                  phased feature roadmap
   DESIGN-adaptive-audiomuse.md   AudioMuse recommendation/adaptive design
   DESIGN-hub-audiomuse-proxy.md  routing AudioMuse Tier 2 through the hub
   DESIGN-lbbot-client-integration.md  lb-bot discography/download in the clients
-  HANDOFF-lbbot-navic.md         porting the lb-bot surface to Navic (phase 3)
-  HANDOFF-lbbot-feishin.md       bringing Feishin up to the same workflow (source picker + gaps)
-  HANDOFF-navic-lbbot-cast-parity.md  lb-bot safeguards + cast scrobbling Navic still lacks (latest)
   DESIGN-expressive-blur.md      Haze/blur plan (Navic)
-  HANDOFF-theming.md             dynamic cover-color theming state
   NAVIC-SYMFONIUM-PLAN.md        reliability/queue/offline/polish plan
   audiomuse-api.md               AudioMuse API capability + throttling notes
-  PROJECT-SUMMARY-2026-07-18.md  done vs. to-do snapshot
-  SESSION-2026-08-09-lbbot-client-polish.md  lb-bot rounds 2-3: in-section tiles, quality, stuck fills (latest)
-  SESSION-2026-08-06-navic-saved-queues.md   Navic saved-queue parity with Feishin
-  SESSION-2026-08-01-feishin-queue-fixes.md  Feishin auto-advance + saved-queue fixes
-  SESSION-2026-07-26-audit-fixes.md  saved-queue/takeover/transfer audit fixes
-  CHANGES-2026-07-18-symfonium.md Symfonium-plan finishing pass (queue undo, history typing, QoL)
   TODO-PROMPTS.md                pickup-ready implementation prompts
   hub/                           Python relay hub + tools/
   navic/                         Navic fork (Kotlin Multiplatform / Compose)
