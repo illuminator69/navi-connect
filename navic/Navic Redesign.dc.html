@@ -1,0 +1,1162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<style>
+@font-face {
+  font-family: 'Google Sans';
+  src: url('fonts/google_sans.ttf') format('truetype');
+  font-weight: 100 900;
+  font-display: swap;
+}
+* { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+body { margin: 0; font-family: 'Google Sans', system-ui, sans-serif; background: #0c0b10; }
+a { color: inherit; text-decoration: none; }
+a:hover { color: inherit; }
+@keyframes eq { 0%,100% { transform: scaleY(.28); } 50% { transform: scaleY(1); } }
+@keyframes floaty { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+@keyframes navpop { 0% { transform: scale(.6); opacity: 0; } 60% { transform: scale(1.08); } 100% { transform: scale(1); opacity: 1; } }
+@keyframes shimmer { 0% { background-position: -240px 0; } 100% { background-position: 240px 0; } }
+</style>
+</helmet>
+
+<div style="display:flex;flex-direction:column;gap:0;padding:0;background:#0c0b10;color:#e8e4ef;font-family:'Google Sans',system-ui,sans-serif">
+
+  <div style="max-width:1100px;padding:64px 60px 8px">
+    <div style="font-size:12px;letter-spacing:.28em;text-transform:uppercase;color:#8a84a0;font-weight:600">Navic · design polish study</div>
+    <h1 style="font-size:40px;line-height:1.08;margin:14px 0 12px;font-weight:600;letter-spacing:-.02em">A more consistent, more expressive Navic</h1>
+    <p style="max-width:640px;font-size:15px;line-height:1.6;color:#a7a2b8;margin:0">Two polished directions on top, the current build at the bottom for reference. Focus screens: Library, Albums &amp; album detail, and Search. Everything below is the real Material 3 baseline, Google Sans, and Navic's own iconography — restructured for rhythm and consistency. Reference any frame by its badge (e.g. <a href="#1a" style="color:#c7b8ff">1a</a>) in chat.</p>
+  </div>
+
+  <!-- ============ 1a — EDITORIAL (recommended) ============ -->
+  <section id="1a" style="padding:44px 60px 8px">
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+      <span style="font-size:13px;font-weight:700;background:#2b2438;color:#c7b8ff;padding:4px 10px;border-radius:8px">1a</span>
+      <h2 style="font-size:24px;font-weight:600;margin:0;letter-spacing:-.01em">Direction A — “Editorial”</h2>
+      <span style="font-size:13px;color:#7f7a93;font-weight:600;letter-spacing:.02em">recommended</span>
+    </div>
+    <p style="max-width:720px;font-size:14px;line-height:1.6;color:#9c97ac;margin:12px 0 26px">A single, warm amber theme replaces the default purple. One consistent section pattern everywhere — an uppercase overline + count, a unified card, one cover-radius (12dp) across the whole app. Bigger display type sets hierarchy; the accent does the pointing. This is the fix for “does it feel consistent.”</p>
+
+    <div style="display:flex;flex-wrap:wrap;gap:36px;align-items:flex-start">
+
+      <!-- PHONE: 1a Library (dark) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Library — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#16130F;color:#EFE5DB;display:flex;flex-direction:column">
+
+            <!-- status bar -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#EFE5DB"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#EFE5DB"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#EFE5DB"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#EFE5DB"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#EFE5DB"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#EFE5DB" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#EFE5DB"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#EFE5DB"/></svg>
+              </div>
+            </div>
+
+            <!-- top bar -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px 6px;flex:none">
+              <div style="font-size:28px;font-weight:700;letter-spacing:-.01em">Library</div>
+              <div style="display:flex;gap:6px;align-items:center">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#FFB77C"><path d="M433-80q-27 0-46.5-18T363-142l-9-66q-13-5-24.5-12T307-235l-62 26q-25 11-50 2t-39-32l-47-82q-14-23-8-49t27-43l53-40q-1-7-1-13.5v-27q0-6.5 1-13.5l-53-40q-21-17-27-43t8-49l47-82q14-23 39-32t50 2l62 26q11-8 23-15t24-12l9-66q4-26 23.5-44t46.5-18h94q27 0 46.5 18t23.5 44l9 66q13 5 24.5 12t22.5 15l62-26q25-11 50-2t39 32l47 82q14 23 8 49t-27 43l-53 40q1 7 1 13.5v27q0 6.5-2 13.5l53 40q21 17 27 43t-8 49l-48 82q-14 23-39 32t-50-2l-60-26q-11 8-23 15t-24 12l-9 66q-4 26-23.5 44T527-80h-94Zm49-260q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Z"/></svg>
+                <svg width="24" height="24" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M234-276q51-39 114-61.5T480-360q69 0 132 22.5T726-276q35-41 54.5-93T800-480q0-133-93.5-226.5T480-800q-133 0-226.5 93.5T160-480q0 59 19.5 111t54.5 93Zm146.5-204.5Q340-521 340-580t40.5-99.5Q421-720 480-720t99.5 40.5Q620-639 620-580t-40.5 99.5Q539-440 480-440t-99.5-40.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg>
+              </div>
+            </div>
+
+            <!-- content -->
+            <div style="flex:1;overflow:hidden;padding-bottom:8px">
+
+              <!-- overview buttons -->
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:6px 16px 4px">
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#2C2620;color:#EFE5DB;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M588.5-411.5Q600-423 600-440v-80h80q17 0 28.5-11.5T720-560q0-17-11.5-28.5T680-600h-80v-80q0-17-11.5-28.5T560-720q-17 0-28.5 11.5T520-680v80h-80q-17 0-28.5 11.5T400-560q0 17 11.5 28.5T440-520h80v80q0 17 11.5 28.5T560-400q17 0 28.5-11.5ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320Zm0-80h480v-480H320v480ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                  Newest
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#2C2620;color:#EFE5DB;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                  Random
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#2C2620;color:#EFE5DB;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="m354-287 126-76 126 77-33-144 111-96-146-13-58-136-58 135-146 13 111 97-33 143Zm126 18L314-169q-11 7-23 6t-21-8q-9-7-14-17.5t-2-23.5l44-189-147-127q-10-9-12.5-20.5T140-571q4-11 12-18t22-9l194-17 75-178q5-12 15.5-18t21.5-6q11 0 21.5 6t15.5 18l75 178 194 17q14 2 22 9t12 18q4 11 1.5 22.5T809-528L662-401l44 189q3 13-2 23.5T690-171q-9 7-21 8t-23-6L480-269Zm0-201Z"/></svg>
+                  Starred
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#2C2620;color:#EFE5DB;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M480-120q-126 0-223-76.5T131-392q-4-15 6-27.5t27-14.5q16-2 29 6t18 24q24 90 99 147t170 57q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h70q17 0 28.5 11.5T360-600q0 17-11.5 28.5T320-560H160q-17 0-28.5-11.5T120-600v-160q0-17 11.5-28.5T160-800q17 0 28.5 11.5T200-760v54q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm40-376 100 100q11 11 11 28t-11 28q-11 11-28 11t-28-11L452-452q-6-6-9-13.5t-3-15.5v-159q0-17 11.5-28.5T480-680q17 0 28.5 11.5T520-640v144Z"/></svg>
+                  Frequent
+                </div>
+              </div>
+
+              <!-- Recent section -->
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:16px 16px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#C9BCAC">Recently added</div>
+                <div style="font-size:12px;font-weight:700;color:#FFB77C">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ recent }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:104px">
+                    <div style="width:104px;height:104px;border-radius:12px;background:{{ al.cover }}"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#C9BCAC;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <!-- Playlists section -->
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:18px 16px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#C9BCAC">Playlists</div>
+                <div style="font-size:12px;font-weight:700;color:#FFB77C">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ playlists }}" as="pl" hint-placeholder-count="3">
+                  <div style="flex:none;width:104px">
+                    <div style="width:104px;height:104px;border-radius:12px;background:{{ pl.cover }}"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pl.t }}</div>
+                    <div style="font-size:11px;color:#C9BCAC">{{ pl.n }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <!-- Artists section -->
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:18px 16px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#C9BCAC">Artists</div>
+                <div style="font-size:12px;font-weight:700;color:#FFB77C">See all</div>
+              </div>
+              <div style="display:flex;gap:14px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ artists }}" as="ar" hint-placeholder-count="4">
+                  <div style="flex:none;width:76px;text-align:center">
+                    <div style="width:76px;height:76px;border-radius:76px;background:{{ ar.cover }}"></div>
+                    <div style="font-size:11px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ ar.t }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <!-- mini player -->
+            <div style="flex:none;margin:0 10px 6px;padding:8px 10px;border-radius:18px;background:#2C2620;display:flex;align-items:center;gap:10px;box-shadow:0 6px 18px rgba(0,0,0,.35)">
+              <div style="width:38px;height:38px;border-radius:9px;background:{{ recent.1.cover }};flex:none"></div>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Nightgrove</div>
+                <div style="font-size:11px;color:#C9BCAC;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Cofield</div>
+              </div>
+              <div style="display:flex;gap:4px;align-items:flex-end;height:16px;margin-right:2px">
+                <div style="width:2.5px;height:100%;background:#FFB77C;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:0ms"></div>
+                <div style="width:2.5px;height:100%;background:#FFB77C;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:180ms"></div>
+                <div style="width:2.5px;height:100%;background:#FFB77C;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:360ms"></div>
+              </div>
+              <svg width="30" height="30" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M640-200q-33 0-56.5-23.5T560-280v-400q0-33 23.5-56.5T640-760q33 0 56.5 23.5T720-680v400q0 33-23.5 56.5T640-200Zm-320 0q-33 0-56.5-23.5T240-280v-400q0-33 23.5-56.5T320-760q33 0 56.5 23.5T400-680v400q0 33-23.5 56.5T320-200Z"/></svg>
+            </div>
+
+            <!-- bottom nav -->
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:6px 4px 10px;background:#16130F">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:6px 18px;border-radius:16px;background:#6B3F12"><svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#FFDCC2"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Z"/></svg></div>
+                <div style="font-size:10px;font-weight:700;color:#FFB77C">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Artists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Search</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1a Albums grid (dark) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Albums — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#16130F;color:#EFE5DB;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#EFE5DB"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#EFE5DB"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#EFE5DB"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#EFE5DB"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#EFE5DB"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#EFE5DB" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#EFE5DB"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#EFE5DB"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px 10px;flex:none">
+              <div style="font-size:28px;font-weight:700;letter-spacing:-.01em">Albums</div>
+              <div style="display:flex;align-items:center;gap:8px;height:32px;padding:0 12px;border-radius:10px;background:#2C2620;font-size:12px;font-weight:700">
+                <svg width="16" height="16" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M160-240q-17 0-28.5-11.5T120-280q0-17 11.5-28.5T160-320h160q17 0 28.5 11.5T360-280q0 17-11.5 28.5T320-240H160Zm0-200q-17 0-28.5-11.5T120-480q0-17 11.5-28.5T160-520h400q17 0 28.5 11.5T600-480q0 17-11.5 28.5T560-440H160Zm0-200q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h640q17 0 28.5 11.5T840-680q0 17-11.5 28.5T800-640H160Z"/></svg>
+                A–Z
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding:6px 13px 0">
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px 8px">
+                <sc-for list="{{ albums }}" as="al" hint-placeholder-count="9">
+                  <div>
+                    <div style="width:100%;aspect-ratio:1;border-radius:12px;background:{{ al.cover }}"></div>
+                    <div style="font-size:11.5px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:10.5px;color:#C9BCAC;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:8px 4px 10px;margin-top:6px;background:#16130F">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:6px 18px;border-radius:16px;background:#6B3F12"><svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#FFDCC2"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg></div>
+                <div style="font-size:10px;font-weight:700;color:#FFB77C">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Artists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Search</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1a Album Detail (dark) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Album detail — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:linear-gradient(180deg,#3c2a12 0%,#16130F 46%);color:#EFE5DB;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none;position:relative;z-index:2">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#EFE5DB"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#EFE5DB"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#EFE5DB"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#EFE5DB"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#EFE5DB"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#EFE5DB" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#EFE5DB"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#EFE5DB"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px 0;flex:none;position:relative;z-index:2">
+              <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+              <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M480-160q-33 0-56.5-23.5T400-240q0-33 23.5-56.5T480-320q33 0 56.5 23.5T560-240q0 33-23.5 56.5T480-160Zm0-240q-33 0-56.5-23.5T400-480q0-33 23.5-56.5T480-560q33 0 56.5 23.5T560-480q0 33-23.5 56.5T480-400Zm0-240q-33 0-56.5-23.5T400-720q0-33 23.5-56.5T480-800q33 0 56.5 23.5T560-720q0 33-23.5 56.5T480-640Z"/></svg>
+            </div>
+
+            <div style="flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column">
+              <div style="flex:none;padding:14px 44px 0;display:flex;justify-content:center">
+                <div style="width:190px;height:190px;border-radius:16px;background:{{ recent.0.cover }};box-shadow:0 18px 30px -12px rgba(0,0,0,.6)"></div>
+              </div>
+              <div style="flex:none;text-align:center;padding:14px 30px 0">
+                <div style="font-size:21px;font-weight:700;letter-spacing:-.01em">Solar Drift</div>
+                <div style="font-size:13.5px;font-weight:600;color:#FFB77C;margin-top:3px">Kiasmos</div>
+                <div style="font-size:12px;color:#C9BCAC;margin-top:2px">Ambient · 2024</div>
+              </div>
+
+              <div style="flex:none;display:flex;align-items:center;justify-content:center;gap:10px;padding:14px 24px 6px">
+                <div style="width:48px;height:48px;border-radius:24px;border:1.5px solid #6E6153;display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                </div>
+                <div style="flex:1;max-width:168px;height:48px;border-radius:24px;background:#FFB77C;display:flex;align-items:center;justify-content:center;gap:8px;color:#4A2800;font-weight:700;font-size:15px">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#4A2800"><path d="M320-273v-414q0-17 12-28.5t28-11.5q5 0 10.5 1.5T381-721l326 207q9 6 13.5 15t4.5 19q0 10-4.5 19T707-446L381-239q-5 3-10.5 4.5T360-233q-16 0-28-11.5T320-273Z"/></svg>
+                  Play
+                </div>
+                <div style="width:48px;height:48px;border-radius:24px;border:1.5px solid #6E6153;display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#EFE5DB"><path d="M465-339.5q-7-2.5-13-8.5L308-492q-12-12-11.5-28t11.5-28q12-12 28.5-12.5T365-549l75 75v-286q0-17 11.5-28.5T480-800q17 0 28.5 11.5T520-760v286l75-75q12-12 28.5-11.5T652-548q11 12 11.5 28T652-492L508-348q-6 6-13 8.5t-15 2.5q-8 0-15-2.5ZM240-160q-33 0-56.5-23.5T160-240v-80q0-17 11.5-28.5T200-360q17 0 28.5 11.5T240-320v80h480v-80q0-17 11.5-28.5T760-360q17 0 28.5 11.5T800-320v80q0 33-23.5 56.5T720-160H240Z"/></svg>
+                </div>
+              </div>
+
+              <div style="flex:1;overflow:hidden;padding:8px 14px 0">
+                <sc-for list="{{ detailSongs }}" as="s" hint-placeholder-count="7">
+                  <div style="display:flex;align-items:center;gap:12px;padding:10px 12px;margin-bottom:3px;border-radius:12px;background:rgba(255,255,255,{{ s.bg }})">
+                    <div style="width:20px;text-align:center;font-size:12.5px;color:#C9BCAC;flex:none">{{ s.n }}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ s.color }}">{{ s.t }}</div>
+                    </div>
+                    <div style="font-size:12px;color:#C9BCAC;flex:none">{{ s.d }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1a Search (dark) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Search — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#16130F;color:#EFE5DB;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#EFE5DB"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#EFE5DB"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#EFE5DB"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#EFE5DB"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#EFE5DB"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#EFE5DB" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#EFE5DB"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#EFE5DB"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:none;padding:12px 14px 8px;display:flex;align-items:center;gap:10px">
+              <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#EFE5DB;flex:none"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+              <div style="flex:1;height:44px;border-radius:22px;background:#2C2620;display:flex;align-items:center;padding:0 16px;gap:8px">
+                <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#C9BCAC;flex:none"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <span style="font-size:14px;font-weight:600">bonobo</span>
+              </div>
+            </div>
+
+            <div style="flex:none;display:flex;gap:8px;padding:0 14px 10px">
+              <div style="height:32px;padding:0 14px;border-radius:10px;background:#FFB77C;color:#4A2800;font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:6px">
+                <svg width="14" height="14" viewBox="0 -960 960 960" style="fill:#4A2800"><path d="m382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z"/></svg>
+                All
+              </div>
+              <div style="height:32px;padding:0 14px;border-radius:10px;background:#2C2620;color:#EFE5DB;font-size:12.5px;font-weight:700;display:flex;align-items:center">Songs</div>
+              <div style="height:32px;padding:0 14px;border-radius:10px;background:#2C2620;color:#EFE5DB;font-size:12.5px;font-weight:700;display:flex;align-items:center">Albums</div>
+              <div style="height:32px;padding:0 14px;border-radius:10px;background:#2C2620;color:#EFE5DB;font-size:12.5px;font-weight:700;display:flex;align-items:center">Artists</div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding:0 14px">
+              <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#C9BCAC;padding:6px 2px 8px">Songs</div>
+              <sc-for list="{{ searchSongs }}" as="s" hint-placeholder-count="3">
+                <div style="display:flex;align-items:center;gap:12px;padding:7px 4px">
+                  <div style="width:46px;height:46px;border-radius:10px;background:{{ s.cover }};flex:none"></div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.t }}</div>
+                    <div style="font-size:11.5px;color:#C9BCAC;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.a }} · {{ s.al }}</div>
+                  </div>
+                </div>
+              </sc-for>
+
+              <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#C9BCAC;padding:14px 2px 8px">Albums</div>
+              <div style="display:flex;gap:10px;overflow:hidden">
+                <sc-for list="{{ albums }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:96px">
+                    <div style="width:96px;height:96px;border-radius:12px;background:{{ al.cover }}"></div>
+                    <div style="font-size:11.5px;font-weight:700;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:8px 4px 10px;background:#16130F">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#9A9184"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#9A9184">Artists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:6px 18px;border-radius:16px;background:#6B3F12"><svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#FFDCC2"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg></div>
+                <div style="font-size:10px;font-weight:700;color:#FFB77C">Search</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1a Library (light) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Library — light</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#FFF8F3;color:#201B15;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#201B15"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#201B15"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#201B15"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#201B15"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#201B15"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#201B15" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#201B15"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#201B15"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px 6px;flex:none">
+              <div style="font-size:28px;font-weight:700;letter-spacing:-.01em">Library</div>
+              <div style="display:flex;gap:6px;align-items:center">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#8A5100"><path d="M433-80q-27 0-46.5-18T363-142l-9-66q-13-5-24.5-12T307-235l-62 26q-25 11-50 2t-39-32l-47-82q-14-23-8-49t27-43l53-40q-1-7-1-13.5v-27q0-6.5 1-13.5l-53-40q-21-17-27-43t8-49l47-82q14-23 39-32t50 2l62 26q11-8 23-15t24-12l9-66q4-26 23.5-44t46.5-18h94q27 0 46.5 18t23.5 44l9 66q13 5 24.5 12t22.5 15l62-26q25-11 50-2t39 32l47 82q14 23 8 49t-27 43l-53 40q1 7 1 13.5v27q0 6.5-2 13.5l53 40q21 17 27 43t-8 49l-48 82q-14 23-39 32t-50-2l-60-26q-11 8-23 15t-24 12l-9 66q-4 26-23.5 44T527-80h-94Zm49-260q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Z"/></svg>
+                <svg width="24" height="24" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M234-276q51-39 114-61.5T480-360q69 0 132 22.5T726-276q35-41 54.5-93T800-480q0-133-93.5-226.5T480-800q-133 0-226.5 93.5T160-480q0 59 19.5 111t54.5 93Zm146.5-204.5Q340-521 340-580t40.5-99.5Q421-720 480-720t99.5 40.5Q620-639 620-580t-40.5 99.5Q539-440 480-440t-99.5-40.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding-bottom:8px">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:6px 16px 4px">
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#F5EDE4;color:#201B15;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M588.5-411.5Q600-423 600-440v-80h80q17 0 28.5-11.5T720-560q0-17-11.5-28.5T680-600h-80v-80q0-17-11.5-28.5T560-720q-17 0-28.5 11.5T520-680v80h-80q-17 0-28.5 11.5T400-560q0 17 11.5 28.5T440-520h80v80q0 17 11.5 28.5T560-400q17 0 28.5-11.5ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320Zm0-80h480v-480H320v480ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                  Newest
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#F5EDE4;color:#201B15;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                  Random
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#F5EDE4;color:#201B15;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#201B15"><path d="m354-287 126-76 126 77-33-144 111-96-146-13-58-136-58 135-146 13 111 97-33 143Zm126 18L314-169q-11 7-23 6t-21-8q-9-7-14-17.5t-2-23.5l44-189-147-127q-10-9-12.5-20.5T140-571q4-11 12-18t22-9l194-17 75-178q5-12 15.5-18t21.5-6q11 0 21.5 6t15.5 18l75 178 194 17q14 2 22 9t12 18q4 11 1.5 22.5T809-528L662-401l44 189q3 13-2 23.5T690-171q-9 7-21 8t-23-6L480-269Zm0-201Z"/></svg>
+                  Starred
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:42px;padding:0 12px;border-radius:12px;background:#F5EDE4;color:#201B15;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M480-120q-126 0-223-76.5T131-392q-4-15 6-27.5t27-14.5q16-2 29 6t18 24q24 90 99 147t170 57q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h70q17 0 28.5 11.5T360-600q0 17-11.5 28.5T320-560H160q-17 0-28.5-11.5T120-600v-160q0-17 11.5-28.5T160-800q17 0 28.5 11.5T200-760v54q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm40-376 100 100q11 11 11 28t-11 28q-11 11-28 11t-28-11L452-452q-6-6-9-13.5t-3-15.5v-159q0-17 11.5-28.5T480-680q17 0 28.5 11.5T520-640v144Z"/></svg>
+                  Frequent
+                </div>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:16px 16px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#52463A">Recently added</div>
+                <div style="font-size:12px;font-weight:700;color:#8A5100">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ recent }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:104px">
+                    <div style="width:104px;height:104px;border-radius:12px;background:{{ al.cover }}"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#52463A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:18px 16px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#52463A">Playlists</div>
+                <div style="font-size:12px;font-weight:700;color:#8A5100">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ playlists }}" as="pl" hint-placeholder-count="3">
+                  <div style="flex:none;width:104px">
+                    <div style="width:104px;height:104px;border-radius:12px;background:{{ pl.cover }}"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pl.t }}</div>
+                    <div style="font-size:11px;color:#52463A">{{ pl.n }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="flex:none;margin:0 10px 6px;padding:8px 10px;border-radius:18px;background:#F5EDE4;display:flex;align-items:center;gap:10px;box-shadow:0 6px 18px rgba(0,0,0,.1)">
+              <div style="width:38px;height:38px;border-radius:9px;background:{{ recent.1.cover }};flex:none"></div>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Nightgrove</div>
+                <div style="font-size:11px;color:#52463A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Cofield</div>
+              </div>
+              <div style="display:flex;gap:4px;align-items:flex-end;height:16px;margin-right:2px">
+                <div style="width:2.5px;height:100%;background:#8A5100;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:0ms"></div>
+                <div style="width:2.5px;height:100%;background:#8A5100;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:180ms"></div>
+                <div style="width:2.5px;height:100%;background:#8A5100;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:360ms"></div>
+              </div>
+              <svg width="30" height="30" viewBox="0 -960 960 960" style="fill:#201B15"><path d="M640-200q-33 0-56.5-23.5T560-280v-400q0-33 23.5-56.5T640-760q33 0 56.5 23.5T720-680v400q0 33-23.5 56.5T640-200Zm-320 0q-33 0-56.5-23.5T240-280v-400q0-33 23.5-56.5T320-760q33 0 56.5 23.5T400-680v400q0 33-23.5 56.5T320-200Z"/></svg>
+            </div>
+
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:6px 4px 10px;background:#FFF8F3">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:6px 18px;border-radius:16px;background:#FFDCBE"><svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#2C1600"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Z"/></svg></div>
+                <div style="font-size:10px;font-weight:700;color:#8A5100">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#8C7C6C"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#8C7C6C">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#8C7C6C"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#8C7C6C">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#8C7C6C"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#8C7C6C">Artists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#8C7C6C"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <div style="font-size:10px;font-weight:600;color:#8C7C6C">Search</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ 1b — AMBIENT (alternate) ============ -->
+  <section id="1b" style="padding:36px 60px 8px">
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+      <span style="font-size:13px;font-weight:700;background:#232049;color:#b9c3ff;padding:4px 10px;border-radius:8px">1b</span>
+      <h2 style="font-size:24px;font-weight:600;margin:0;letter-spacing:-.01em">Direction B — “Ambient”</h2>
+      <span style="font-size:13px;color:#7f7a93;font-weight:600;letter-spacing:.02em">alternate, higher-motion</span>
+    </div>
+    <p style="max-width:720px;font-size:14px;line-height:1.6;color:#9c97ac;margin:12px 0 26px">Leans harder into the cover-colour ambient wash Navic already has on the album page — but makes it the whole app's identity, not just one screen. Chrome dematerialises into frosted floating pills; the cover art does the theming. More alive, more distinctive, a bigger engineering lift than 1a.</p>
+
+    <div style="max-width:720px;margin:0 0 20px;padding:16px 18px;border-radius:14px;background:#191730;border:1px solid #2c2954">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#8f8ac2;margin-bottom:6px">Rebuilt the wash — this was too close to the current build</div>
+      <div style="font-size:13.5px;line-height:1.6;color:#c8c4dc">A flat hue-locked gradient still read as "the same screen, recoloured." So the background is no longer a gradient swatch at all — it's <strong style="color:#ECE7FF">the cover art itself, blown up and heavily blurred</strong> behind a darkening scrim (the real Apple-Music/Spotify technique), so it carries the photo's actual colour <em>and</em> texture, not an approximation of its hue. The sharp cover then floats as a small card on top. That's a genuinely different composition from today's edge-to-edge photo + flat fade below it — not just a different palette.</div>
+    </div>
+
+    <div style="max-width:720px;margin:0 0 26px;padding:16px 18px;border-radius:14px;background:#191730;border:1px solid #2c2954">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#8f8ac2;margin-bottom:6px">Home / Library — keyed to the now-playing track, not the whole grid</div>
+      <div style="font-size:13.5px;line-height:1.6;color:#c8c4dc">Library shows a dozen different album covers on screen at once, so washing the <em>entire</em> page in one colour would fight with all of them. Instead: the glow comes from whatever's in the mini-player (the one thing that's actually "now"), sits only behind the greeting/header — like Spotify's home hero — and resolves to the neutral surface by the time you reach the grids, so every cover underneath still reads true. The floating mini-player itself keeps a persistent ring of that colour, so the identity carries even after the glow fades out. <strong style="color:#ECE7FF">Nothing playing → no glow</strong>, just the plain dark surface (below, in 1a's palette) — it never fakes a colour that isn't there.</div>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:36px;align-items:flex-start">
+
+      <!-- PHONE: 1b Library (ambient dark) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Library — wash keyed to now-playing track</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#15131b;color:#ECE7FF">
+            <div style="position:absolute;inset:-50px;top:-50px;height:420px;background:linear-gradient(150deg, hsl(262 60% 55%), hsl(304 55% 32%));filter:blur(50px) saturate(1.6) brightness(.6);transform:scale(1.2)"></div>
+            <div style="position:absolute;inset:0;background:linear-gradient(180deg, rgba(11,9,17,.05) 0%, rgba(13,11,19,.6) 38%, rgba(13,11,19,.97) 62%, #15131b 78%)"></div>
+            <div style="position:relative;z-index:1;height:100%;width:100%;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#ECE7FF"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#ECE7FF"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#ECE7FF"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#ECE7FF"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#ECE7FF"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#ECE7FF" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#ECE7FF"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#ECE7FF"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 22px 4px;flex:none">
+              <div>
+                <div style="font-size:12px;color:#B9B2CE;font-weight:600">Good evening</div>
+                <div style="font-size:26px;font-weight:700;letter-spacing:-.01em;margin-top:1px">Library</div>
+              </div>
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.14);display:flex;align-items:center;justify-content:center">
+                <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M234-276q51-39 114-61.5T480-360q69 0 132 22.5T726-276q35-41 54.5-93T800-480q0-133-93.5-226.5T480-800q-133 0-226.5 93.5T160-480q0 59 19.5 111t54.5 93Zm146.5-204.5Q340-521 340-580t40.5-99.5Q421-720 480-720t99.5 40.5Q620-639 620-580t-40.5 99.5Q539-440 480-440t-99.5-40.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding-bottom:8px">
+              <div style="display:flex;gap:8px;padding:14px 18px 6px;overflow:hidden">
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-radius:19px;background:rgba(255,255,255,.12);font-size:12.5px;font-weight:700">
+                  <svg width="15" height="15" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                  Shuffle all
+                </div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-radius:19px;background:rgba(255,255,255,.12);font-size:12.5px;font-weight:700">
+                  <svg width="15" height="15" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="m354-287 126-76 126 77-33-144 111-96-146-13-58-136-58 135-146 13 111 97-33 143Zm126 18L314-169q-11 7-23 6t-21-8q-9-7-14-17.5t-2-23.5l44-189-147-127q-10-9-12.5-20.5T140-571q4-11 12-18t22-9l194-17 75-178q5-12 15.5-18t21.5-6q11 0 21.5 6t15.5 18l75 178 194 17q14 2 22 9t12 18q4 11 1.5 22.5T809-528L662-401l44 189q3 13-2 23.5T690-171q-9 7-21 8t-23-6L480-269Zm0-201Z"/></svg>
+                  Starred
+                </div>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:14px 18px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#B9B2CE">Recently added</div>
+                <div style="font-size:12px;font-weight:700;color:#B9C3FF">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 18px;overflow:hidden">
+                <sc-for list="{{ recent }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:106px">
+                    <div style="width:106px;height:106px;border-radius:18px;background:{{ al.cover }};box-shadow:0 10px 20px -8px rgba(0,0,0,.5)"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#B9B2CE;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:18px 18px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#B9B2CE">Playlists</div>
+                <div style="font-size:12px;font-weight:700;color:#B9C3FF">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 18px;overflow:hidden">
+                <sc-for list="{{ playlists }}" as="pl" hint-placeholder-count="3">
+                  <div style="flex:none;width:106px">
+                    <div style="width:106px;height:106px;border-radius:18px;background:{{ pl.cover }};box-shadow:0 10px 20px -8px rgba(0,0,0,.5)"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pl.t }}</div>
+                    <div style="font-size:11px;color:#B9B2CE">{{ pl.n }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <!-- floating frosted mini-player — ring tinted from the now-playing cover's hue -->
+            <div style="flex:none;margin:0 16px 10px;padding:9px 11px;border-radius:22px;background:rgba(255,255,255,.14);backdrop-filter:blur(18px);display:flex;align-items:center;gap:10px;box-shadow:0 10px 24px rgba(0,0,0,.4), 0 0 0 1px rgba(185,195,255,.35), 0 0 20px -4px hsl(262 70% 60% / .55)">
+              <div style="width:36px;height:36px;border-radius:11px;background:{{ recent.1.cover }};flex:none"></div>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Nightgrove</div>
+              </div>
+              <div style="display:flex;gap:4px;align-items:flex-end;height:14px;margin-right:2px">
+                <div style="width:2.5px;height:100%;background:#B9C3FF;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:0ms"></div>
+                <div style="width:2.5px;height:100%;background:#B9C3FF;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:180ms"></div>
+                <div style="width:2.5px;height:100%;background:#B9C3FF;border-radius:2px;animation:eq 900ms ease-in-out infinite;animation-delay:360ms"></div>
+              </div>
+              <svg width="26" height="26" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M640-200q-33 0-56.5-23.5T560-280v-400q0-33 23.5-56.5T640-760q33 0 56.5 23.5T720-680v400q0 33-23.5 56.5T640-200Zm-320 0q-33 0-56.5-23.5T240-280v-400q0-33 23.5-56.5T320-760q33 0 56.5 23.5T400-680v400q0 33-23.5 56.5T320-200Z"/></svg>
+            </div>
+
+            <!-- floating capsule nav (not docked full-width) -->
+            <div style="flex:none;margin:0 auto 14px;padding:8px 10px;border-radius:26px;background:rgba(255,255,255,.14);backdrop-filter:blur(18px);display:flex;align-items:center;gap:4px;box-shadow:0 10px 24px rgba(0,0,0,.4)">
+              <div style="padding:8px 16px;border-radius:20px;background:rgba(185,195,255,.28);display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700">
+                <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Z"/></svg>
+                Library
+              </div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#B9B2CE"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg></div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#B9B2CE"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg></div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#B9B2CE"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg></div>
+            </div>
+
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1b Library (nothing playing — neutral fallback, no glow) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Library — nothing playing (fallback)</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#15131b;color:#ECE7FF;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#ECE7FF"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#ECE7FF"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#ECE7FF"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#ECE7FF"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#ECE7FF"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#ECE7FF" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#ECE7FF"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#ECE7FF"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 22px 4px;flex:none">
+              <div>
+                <div style="font-size:12px;color:#8f8a9e;font-weight:600">Good evening</div>
+                <div style="font-size:26px;font-weight:700;letter-spacing:-.01em;margin-top:1px">Library</div>
+              </div>
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center">
+                <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M234-276q51-39 114-61.5T480-360q69 0 132 22.5T726-276q35-41 54.5-93T800-480q0-133-93.5-226.5T480-800q-133 0-226.5 93.5T160-480q0 59 19.5 111t54.5 93Zm146.5-204.5Q340-521 340-580t40.5-99.5Q421-720 480-720t99.5 40.5Q620-639 620-580t-40.5 99.5Q539-440 480-440t-99.5-40.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding-bottom:8px">
+              <div style="display:flex;gap:8px;padding:14px 18px 6px;overflow:hidden">
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-radius:19px;background:rgba(255,255,255,.08);font-size:12.5px;font-weight:700">
+                  <svg width="15" height="15" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                  Shuffle all
+                </div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-radius:19px;background:rgba(255,255,255,.08);font-size:12.5px;font-weight:700">
+                  <svg width="15" height="15" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="m354-287 126-76 126 77-33-144 111-96-146-13-58-136-58 135-146 13 111 97-33 143Zm126 18L314-169q-11 7-23 6t-21-8q-9-7-14-17.5t-2-23.5l44-189-147-127q-10-9-12.5-20.5T140-571q4-11 12-18t22-9l194-17 75-178q5-12 15.5-18t21.5-6q11 0 21.5 6t15.5 18l75 178 194 17q14 2 22 9t12 18q4 11 1.5 22.5T809-528L662-401l44 189q3 13-2 23.5T690-171q-9 7-21 8t-23-6L480-269Zm0-201Z"/></svg>
+                  Starred
+                </div>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:14px 18px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#8f8a9e">Recently added</div>
+                <div style="font-size:12px;font-weight:700;color:#b9b4d6">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 18px;overflow:hidden">
+                <sc-for list="{{ recent }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:106px">
+                    <div style="width:106px;height:106px;border-radius:18px;background:{{ al.cover }};box-shadow:0 10px 20px -8px rgba(0,0,0,.5)"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#8f8a9e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:18px 18px 8px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#8f8a9e">Playlists</div>
+                <div style="font-size:12px;font-weight:700;color:#b9b4d6">See all</div>
+              </div>
+              <div style="display:flex;gap:10px;padding:0 18px;overflow:hidden">
+                <sc-for list="{{ playlists }}" as="pl" hint-placeholder-count="3">
+                  <div style="flex:none;width:106px">
+                    <div style="width:106px;height:106px;border-radius:18px;background:{{ pl.cover }};box-shadow:0 10px 20px -8px rgba(0,0,0,.5)"></div>
+                    <div style="font-size:12px;font-weight:700;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pl.t }}</div>
+                    <div style="font-size:11px;color:#8f8a9e">{{ pl.n }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <!-- no mini-player: nothing queued, so no card and no glow -->
+            <div style="flex:none;margin:0 auto 14px;padding:8px 10px;border-radius:26px;background:rgba(255,255,255,.08);display:flex;align-items:center;gap:4px">
+              <div style="padding:8px 16px;border-radius:20px;background:rgba(255,255,255,.10);display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700">
+                <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Z"/></svg>
+                Library
+              </div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#8f8a9e"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg></div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#8f8a9e"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg></div>
+              <div style="padding:8px;border-radius:20px"><svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#8f8a9e"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg></div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1b Album Detail (hue-locked ambient, cyan cover) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Album detail — dominant colour: cyan-teal</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#0d1f22;color:#ECE7FF">
+            <div style="position:absolute;inset:-50px;background:linear-gradient(150deg, hsl(188 62% 58%), hsl(230 56% 34%));filter:blur(46px) saturate(1.6) brightness(.6);transform:scale(1.2)"></div>
+            <div style="position:absolute;inset:0;background:linear-gradient(180deg, rgba(6,16,18,.05) 0%, rgba(6,16,18,.4) 55%, rgba(5,13,15,.88) 100%)"></div>
+            <div style="position:relative;z-index:1;height:100%;width:100%;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#ECE7FF"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#ECE7FF"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#ECE7FF"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#ECE7FF"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#ECE7FF"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#ECE7FF" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#ECE7FF"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#ECE7FF"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 0;flex:none">
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.16);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center">
+                <svg width="17" height="17" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+              </div>
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.16);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center">
+                <svg width="17" height="17" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M480-160q-33 0-56.5-23.5T400-240q0-33 23.5-56.5T480-320q33 0 56.5 23.5T560-240q0 33-23.5 56.5T480-160Zm0-240q-33 0-56.5-23.5T400-480q0-33 23.5-56.5T480-560q33 0 56.5 23.5T560-480q0 33-23.5 56.5T480-400Zm0-240q-33 0-56.5-23.5T400-720q0-33 23.5-56.5T480-800q33 0 56.5 23.5T560-720q0 33-23.5 56.5T480-640Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column">
+              <div style="flex:none;padding:26px 0 0;display:flex;justify-content:center">
+                <div style="width:172px;height:172px;border-radius:18px;background:linear-gradient(150deg, hsl(188 62% 58%), hsl(230 56% 34%));box-shadow:0 20px 44px -12px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.08)"></div>
+              </div>
+              <div style="flex:none;text-align:center;padding:10px 30px 0">
+                <div style="font-size:23px;font-weight:700;letter-spacing:-.01em">Paper Cities</div>
+                <div style="font-size:13.5px;font-weight:600;color:#AEE9F0;margin-top:3px">Tycho</div>
+              </div>
+
+              <div style="flex:none;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 24px 8px">
+                <div style="width:48px;height:48px;border-radius:24px;background:rgba(255,255,255,.14);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                </div>
+                <div style="flex:1;max-width:170px;height:48px;border-radius:24px;background:#ECE7FF;display:flex;align-items:center;justify-content:center;gap:8px;color:#0d2e33;font-weight:700;font-size:15px">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#0d2e33"><path d="M320-273v-414q0-17 12-28.5t28-11.5q5 0 10.5 1.5T381-721l326 207q9 6 13.5 15t4.5 19q0 10-4.5 19T707-446L381-239q-5 3-10.5 4.5T360-233q-16 0-28-11.5T320-273Z"/></svg>
+                  Play
+                </div>
+                <div style="width:48px;height:48px;border-radius:24px;background:rgba(255,255,255,.14);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#ECE7FF"><path d="M465-339.5q-7-2.5-13-8.5L308-492q-12-12-11.5-28t11.5-28q12-12 28.5-12.5T365-549l75 75v-286q0-17 11.5-28.5T480-800q17 0 28.5 11.5T520-760v286l75-75q12-12 28.5-11.5T652-548q11 12 11.5 28T652-492L508-348q-6 6-13 8.5t-15 2.5q-8 0-15-2.5ZM240-160q-33 0-56.5-23.5T160-240v-80q0-17 11.5-28.5T200-360q17 0 28.5 11.5T240-320v80h480v-80q0-17 11.5-28.5T760-360q17 0 28.5 11.5T800-320v80q0 33-23.5 56.5T720-160H240Z"/></svg>
+                </div>
+              </div>
+
+              <div style="flex:1;overflow:hidden;padding:10px 16px 0">
+                <sc-for list="{{ detailSongs }}" as="s" hint-placeholder-count="7">
+                  <div style="display:flex;align-items:center;gap:12px;padding:11px 14px;margin-bottom:6px;border-radius:16px;background:rgba(255,255,255,{{ s.bgb }});backdrop-filter:blur(10px)">
+                    <div style="width:20px;text-align:center;font-size:12.5px;color:#BEE3E7;flex:none">{{ s.n }}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ s.colorb }}">{{ s.t }}</div>
+                    </div>
+                    <div style="font-size:12px;color:#BEE3E7;flex:none">{{ s.d }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: 1b Album Detail (hue-locked ambient, warm gold cover — proves it adapts) -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Album detail — dominant colour: warm gold</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#221708;color:#FBF1E4">
+            <div style="position:absolute;inset:-50px;background:linear-gradient(150deg, hsl(44 62% 58%), hsl(86 56% 34%));filter:blur(46px) saturate(1.6) brightness(.6);transform:scale(1.2)"></div>
+            <div style="position:absolute;inset:0;background:linear-gradient(180deg, rgba(20,14,4,.05) 0%, rgba(20,14,4,.4) 55%, rgba(16,11,3,.88) 100%)"></div>
+            <div style="position:relative;z-index:1;height:100%;width:100%;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#FBF1E4"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#FBF1E4"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#FBF1E4"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#FBF1E4"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#FBF1E4"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#FBF1E4" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#FBF1E4"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#FBF1E4"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 0;flex:none">
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.16);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center">
+                <svg width="17" height="17" viewBox="0 -960 960 960" style="fill:#FBF1E4"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+              </div>
+              <div style="width:34px;height:34px;border-radius:17px;background:rgba(255,255,255,.16);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center">
+                <svg width="17" height="17" viewBox="0 -960 960 960" style="fill:#FBF1E4"><path d="M480-160q-33 0-56.5-23.5T400-240q0-33 23.5-56.5T480-320q33 0 56.5 23.5T560-240q0 33-23.5 56.5T480-160Zm0-240q-33 0-56.5-23.5T400-480q0-33 23.5-56.5T480-560q33 0 56.5 23.5T560-480q0 33-23.5 56.5T480-400Zm0-240q-33 0-56.5-23.5T400-720q0-33 23.5-56.5T480-800q33 0 56.5 23.5T560-720q0 33-23.5 56.5T480-640Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column">
+              <div style="flex:none;padding:26px 0 0;display:flex;justify-content:center">
+                <div style="width:172px;height:172px;border-radius:18px;background:linear-gradient(150deg, hsl(44 62% 58%), hsl(86 56% 34%));box-shadow:0 20px 44px -12px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.08)"></div>
+              </div>
+              <div style="flex:none;text-align:center;padding:10px 30px 0">
+                <div style="font-size:23px;font-weight:700;letter-spacing:-.01em">Dust &amp; Gold</div>
+                <div style="font-size:13.5px;font-weight:600;color:#F3D9A6;margin-top:3px">Khruangbin</div>
+              </div>
+
+              <div style="flex:none;display:flex;align-items:center;justify-content:center;gap:10px;padding:16px 24px 8px">
+                <div style="width:48px;height:48px;border-radius:24px;background:rgba(255,255,255,.14);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#FBF1E4"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                </div>
+                <div style="flex:1;max-width:170px;height:48px;border-radius:24px;background:#FBF1E4;display:flex;align-items:center;justify-content:center;gap:8px;color:#3a2405;font-weight:700;font-size:15px">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#3a2405"><path d="M320-273v-414q0-17 12-28.5t28-11.5q5 0 10.5 1.5T381-721l326 207q9 6 13.5 15t4.5 19q0 10-4.5 19T707-446L381-239q-5 3-10.5 4.5T360-233q-16 0-28-11.5T320-273Z"/></svg>
+                  Play
+                </div>
+                <div style="width:48px;height:48px;border-radius:24px;background:rgba(255,255,255,.14);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#FBF1E4"><path d="M465-339.5q-7-2.5-13-8.5L308-492q-12-12-11.5-28t11.5-28q12-12 28.5-12.5T365-549l75 75v-286q0-17 11.5-28.5T480-800q17 0 28.5 11.5T520-760v286l75-75q12-12 28.5-11.5T652-548q11 12 11.5 28T652-492L508-348q-6 6-13 8.5t-15 2.5q-8 0-15-2.5ZM240-160q-33 0-56.5-23.5T160-240v-80q0-17 11.5-28.5T200-360q17 0 28.5 11.5T240-320v80h480v-80q0-17 11.5-28.5T760-360q17 0 28.5 11.5T800-320v80q0 33-23.5 56.5T720-160H240Z"/></svg>
+                </div>
+              </div>
+
+              <div style="flex:1;overflow:hidden;padding:10px 16px 0">
+                <sc-for list="{{ detailSongs }}" as="s" hint-placeholder-count="7">
+                  <div style="display:flex;align-items:center;gap:12px;padding:11px 14px;margin-bottom:6px;border-radius:16px;background:rgba(255,255,255,{{ s.bgb }});backdrop-filter:blur(10px)">
+                    <div style="width:20px;text-align:center;font-size:12.5px;color:#E4C9A0;flex:none">{{ s.n }}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ s.colorGold }}">{{ s.t }}</div>
+                    </div>
+                    <div style="font-size:12px;color:#E4C9A0;flex:none">{{ s.d }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ 0 — CURRENT (faithful recreation, for reference) ============ -->
+  <section id="0" style="padding:44px 60px 80px;background:#0a0910">
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+      <span style="font-size:13px;font-weight:700;background:#2a2733;color:#c9c2d6;padding:4px 10px;border-radius:8px">0</span>
+      <h2 style="font-size:24px;font-weight:600;margin:0;letter-spacing:-.01em">Current build — faithful recreation</h2>
+    </div>
+    <p style="max-width:720px;font-size:14px;line-height:1.6;color:#9c97ac;margin:12px 0 26px">Pulled directly from the Navic source: Material 3 Expressive baseline (default dynamic scheme, unseeded), Google Sans, continuous-corner shapes. Shown for side-by-side comparison with 1a / 1b above.</p>
+
+    <div style="display:flex;flex-wrap:wrap;gap:36px;align-items:flex-start">
+
+      <!-- PHONE: current Library -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Library — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#141218;color:#E6E0E9;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#E6E0E9"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#E6E0E9"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#E6E0E9"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#E6E0E9"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#E6E0E9"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#E6E0E9" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#E6E0E9"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#E6E0E9"/></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px 6px;flex:none">
+              <div style="font-size:24px;font-weight:500;letter-spacing:0">Library</div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg>
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M433-80q-27 0-46.5-18T363-142l-9-66q-13-5-24.5-12T307-235l-62 26q-25 11-50 2t-39-32l-47-82q-14-23-8-49t27-43l53-40q-1-7-1-13.5v-27q0-6.5 1-13.5l-53-40q-21-17-27-43t8-49l47-82q14-23 39-32t50 2l62 26q11-8 23-15t24-12l9-66q4-26 23.5-44t46.5-18h94q27 0 46.5 18t23.5 44l9 66q13 5 24.5 12t22.5 15l62-26q25-11 50-2t39 32l47 82q14 23 8 49t-27 43l-53 40q1 7 1 13.5v27q0 6.5-2 13.5l53 40q21 17 27 43t-8 49l-48 82q-14 23-39 32t-50-2l-60-26q-11 8-23 15t-24 12l-9 66q-4 26-23.5 44T527-80h-94Zm49-260q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Z"/></svg>
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M234-276q51-39 114-61.5T480-360q69 0 132 22.5T726-276q35-41 54.5-93T800-480q0-133-93.5-226.5T480-800q-133 0-226.5 93.5T160-480q0 59 19.5 111t54.5 93Zm146.5-204.5Q340-521 340-580t40.5-99.5Q421-720 480-720t99.5 40.5Q620-639 620-580t-40.5 99.5Q539-440 480-440t-99.5-40.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Z"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;padding-bottom:8px">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:2px 16px 4px">
+                <div style="display:flex;align-items:center;gap:10px;height:42px;padding:0 12px;border-radius:12px;background:#211F26;color:#CAC4D0;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M588.5-411.5Q600-423 600-440v-80h80q17 0 28.5-11.5T720-560q0-17-11.5-28.5T680-600h-80v-80q0-17-11.5-28.5T560-720q-17 0-28.5 11.5T520-680v80h-80q-17 0-28.5 11.5T400-560q0 17 11.5 28.5T440-520h80v80q0 17 11.5 28.5T560-400q17 0 28.5-11.5ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320Zm0-80h480v-480H320v480ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                  Newest
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;height:42px;padding:0 12px;border-radius:12px;background:#211F26;color:#CAC4D0;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                  Random
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;height:42px;padding:0 12px;border-radius:12px;background:#211F26;color:#CAC4D0;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="m354-287 126-76 126 77-33-144 111-96-146-13-58-136-58 135-146 13 111 97-33 143Zm126 18L314-169q-11 7-23 6t-21-8q-9-7-14-17.5t-2-23.5l44-189-147-127q-10-9-12.5-20.5T140-571q4-11 12-18t22-9l194-17 75-178q5-12 15.5-18t21.5-6q11 0 21.5 6t15.5 18l75 178 194 17q14 2 22 9t12 18q4 11 1.5 22.5T809-528L662-401l44 189q3 13-2 23.5T690-171q-9 7-21 8t-23-6L480-269Zm0-201Z"/></svg>
+                  Starred
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;height:42px;padding:0 12px;border-radius:12px;background:#211F26;color:#CAC4D0;font-size:13px;font-weight:600">
+                  <svg width="18" height="18" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M480-120q-126 0-223-76.5T131-392q-4-15 6-27.5t27-14.5q16-2 29 6t18 24q24 90 99 147t170 57q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h70q17 0 28.5 11.5T360-600q0 17-11.5 28.5T320-560H160q-17 0-28.5-11.5T120-600v-160q0-17 11.5-28.5T160-800q17 0 28.5 11.5T200-760v54q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm40-376 100 100q11 11 11 28t-11 28q-11 11-28 11t-28-11L452-452q-6-6-9-13.5t-3-15.5v-159q0-17 11.5-28.5T480-680q17 0 28.5 11.5T520-640v144Z"/></svg>
+                  Frequent
+                </div>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:12px 16px 6px">
+                <div style="font-size:15px;font-weight:600">Recently added</div>
+                <div style="font-size:12px;color:#D0BCFF">See all</div>
+              </div>
+              <div style="display:flex;gap:12px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ recent }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:110px">
+                    <div style="width:110px;height:110px;border-radius:10px;background:{{ al.cover }}"></div>
+                    <div style="font-size:12.5px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#CAC4D0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:16px 16px 6px">
+                <div style="font-size:15px;font-weight:600">Frequently played</div>
+                <div style="font-size:12px;color:#D0BCFF">See all</div>
+              </div>
+              <div style="display:flex;gap:12px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ newest }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:110px">
+                    <div style="width:110px;height:110px;border-radius:10px;background:{{ al.cover }}"></div>
+                    <div style="font-size:12.5px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                    <div style="font-size:11px;color:#CAC4D0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.a }}</div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:16px 16px 6px">
+                <div style="font-size:15px;font-weight:600">Playlists</div>
+                <div style="font-size:12px;color:#D0BCFF">See all</div>
+              </div>
+              <div style="display:flex;gap:12px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ playlists }}" as="pl" hint-placeholder-count="3">
+                  <div style="flex:none;width:110px">
+                    <div style="width:110px;height:110px;border-radius:10px;background:{{ pl.cover }}"></div>
+                    <div style="font-size:12.5px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pl.t }}</div>
+                    <div style="font-size:11px;color:#CAC4D0">{{ pl.n }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:8px 4px 10px;background:#141218;border-top:1px solid #2B2930">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:5px 20px;border-radius:16px;background:#4F378B"><svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#EADDFF"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Z"/></svg></div>
+                <div style="font-size:11px;font-weight:600;color:#E6E0E9">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M629-189q-29-29-29-71t29-71q29-29 71-29 8 0 18 1.5t22 6.5v-168q0-17 11.5-28.5T780-560h60q17 0 28.5 11.5T880-520q0 17-11.5 28.5T840-480h-40v220q0 42-29 71t-71 29q-42 0-71-29ZM327-527q-47-47-47-113t47-113q47-47 113-47t113 47q47 47 47 113t-47 113q-47 47-113 47t-113-47ZM160-160q-17 0-28.5-11.5T120-200v-72q0-35 17.5-63t46.5-43q62-31 126-46.5T440-440q28 0 55.5 3t55.5 9q17 4 21.5 21t-9.5 31q-21 25-31.5 54.5T521-260q0 13 1.5 25.5T528-209q5 18-4.5 33.5T497-160H160Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Artists</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: current Album Detail -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Album detail — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:linear-gradient(180deg,#2c2438 0%,#141218 50%);color:#E6E0E9;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none;position:relative;z-index:2">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#E6E0E9"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#E6E0E9"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#E6E0E9"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#E6E0E9"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#E6E0E9"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#E6E0E9" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#E6E0E9"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#E6E0E9"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:1;overflow:hidden;position:relative;display:flex;flex-direction:column">
+              <div style="flex:none;width:100%;aspect-ratio:1;background:{{ recent.0.cover }};position:relative">
+                <div style="position:absolute;inset:0;top:8px;padding:10px 16px 0;display:flex;justify-content:space-between">
+                  <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+                  <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M480-160q-33 0-56.5-23.5T400-240q0-33 23.5-56.5T480-320q33 0 56.5 23.5T560-240q0 33-23.5 56.5T480-160Zm0-240q-33 0-56.5-23.5T400-480q0-33 23.5-56.5T480-560q33 0 56.5 23.5T560-480q0 33-23.5 56.5T480-400Zm0-240q-33 0-56.5-23.5T400-720q0-33 23.5-56.5T480-800q33 0 56.5 23.5T560-720q0 33-23.5 56.5T480-640Z"/></svg>
+                </div>
+              </div>
+              <div style="flex:none;text-align:center;padding:12px 30px 0">
+                <div style="font-size:22px;font-weight:500">Solar Drift</div>
+                <div style="font-size:14px;color:#D0BCFF;margin-top:2px">Kiasmos</div>
+                <div style="font-size:12px;color:#CAC4D0;margin-top:2px">Ambient · 2024</div>
+              </div>
+
+              <div style="flex:none;display:flex;align-items:center;justify-content:center;gap:10px;padding:12px 24px 6px">
+                <div style="width:52px;height:44px;border-radius:22px;border:1px solid #938F99;display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M600-160q-17 0-28.5-11.5T560-200q0-17 11.5-28.5T600-240h64l-99-99q-12-12-11.5-28.5T566-396q12-12 28.5-12t28.5 12l97 98v-62q0-17 11.5-28.5T760-400q17 0 28.5 11.5T800-360v160q0 17-11.5 28.5T760-160H600Zm-428-12q-11-11-11-28t11-28l492-492h-64q-17 0-28.5-11.5T560-760q0-17 11.5-28.5T600-800h160q17 0 28.5 11.5T800-760v160q0 17-11.5 28.5T760-560q-17 0-28.5-11.5T720-600v-64L228-172q-11 11-28 11t-28-11Zm-1-560q-11-11-11-28t11-28q11-11 27.5-11t28.5 11l168 167q11 11 11.5 27.5T395-565q-11 11-28 11t-28-11L171-732Z"/></svg>
+                </div>
+                <div style="flex:1;max-width:170px;height:44px;border-radius:22px;background:#D0BCFF;display:flex;align-items:center;justify-content:center;gap:8px;color:#381E72;font-weight:600;font-size:15px">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#381E72"><path d="M320-273v-414q0-17 12-28.5t28-11.5q5 0 10.5 1.5T381-721l326 207q9 6 13.5 15t4.5 19q0 10-4.5 19T707-446L381-239q-5 3-10.5 4.5T360-233q-16 0-28-11.5T320-273Z"/></svg>
+                  Play
+                </div>
+                <div style="width:52px;height:44px;border-radius:22px;border:1px solid #938F99;display:flex;align-items:center;justify-content:center;flex:none">
+                  <svg width="20" height="20" viewBox="0 -960 960 960" style="fill:#E6E0E9"><path d="M465-339.5q-7-2.5-13-8.5L308-492q-12-12-11.5-28t11.5-28q12-12 28.5-12.5T365-549l75 75v-286q0-17 11.5-28.5T480-800q17 0 28.5 11.5T520-760v286l75-75q12-12 28.5-11.5T652-548q11 12 11.5 28T652-492L508-348q-6 6-13 8.5t-15 2.5q-8 0-15-2.5ZM240-160q-33 0-56.5-23.5T160-240v-80q0-17 11.5-28.5T200-360q17 0 28.5 11.5T240-320v80h480v-80q0-17 11.5-28.5T760-360q17 0 28.5 11.5T800-320v80q0 33-23.5 56.5T720-160H240Z"/></svg>
+                </div>
+              </div>
+
+              <div style="flex:1;overflow:hidden;padding:6px 16px 0">
+                <sc-for list="{{ detailSongs }}" as="s" hint-placeholder-count="7">
+                  <div style="display:flex;align-items:center;gap:12px;padding:11px 14px;margin-bottom:1.5px;border-radius:4px;background:rgba(54,52,59,0.6)">
+                    <div style="width:20px;text-align:center;font-size:12.5px;color:#CAC4D0;flex:none">{{ s.n }}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:{{ s.color }}">{{ s.t }}</div>
+                      <div style="font-size:11.5px;color:#CAC4D0;margin-top:1px">Kiasmos</div>
+                    </div>
+                    <div style="font-size:12px;color:#CAC4D0;flex:none">{{ s.d }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PHONE: current Search -->
+      <div style="flex:none">
+        <div style="font-size:12px;font-weight:600;color:#8a84a0;margin-bottom:10px">Search — dark</div>
+        <div style="position:relative;width:340px;height:724px;border-radius:44px;background:#000;padding:9px;box-shadow:0 30px 60px -20px rgba(0,0,0,.55)">
+          <div style="position:relative;width:100%;height:100%;border-radius:36px;overflow:hidden;background:#141218;color:#E6E0E9;display:flex;flex-direction:column">
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 24px 2px;font-size:13px;font-weight:700;flex:none">
+              <span>9:41</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="0" y="7" width="3" height="5" rx="1" fill="#E6E0E9"/><rect x="4.5" y="5" width="3" height="7" rx="1" fill="#E6E0E9"/><rect x="9" y="2.5" width="3" height="9.5" rx="1" fill="#E6E0E9"/><rect x="13" y="0" width="3" height="12" rx="1" fill="#E6E0E9"/></svg>
+                <svg width="18" height="12" viewBox="0 0 18 12"><path d="M9 12L1 4.5C4 1.8 6.4 0.5 9 0.5s5 1.3 8 4L9 12z" fill="#E6E0E9"/></svg>
+                <svg width="24" height="12" viewBox="0 0 24 12"><rect x="0.5" y="0.5" width="20" height="11" rx="2.5" stroke="#E6E0E9" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1" fill="#E6E0E9"/><rect x="21" y="4" width="2" height="4" rx="1" fill="#E6E0E9"/></svg>
+              </div>
+            </div>
+
+            <div style="flex:none;padding:8px 8px 4px;display:flex;align-items:center;gap:2px">
+              <div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;flex:none">
+                <svg width="22" height="22" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="m313-440 196 196q12 12 11.5 28T508-188q-12 11-28 11.5T452-188L188-452q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l264-264q11-11 27.5-11t28.5 11q12 12 12 28.5T508-715L313-520h447q17 0 28.5 11.5T800-480q0 17-11.5 28.5T760-440H313Z"/></svg>
+              </div>
+              <span style="font-size:16px;color:#E6E0E9;font-weight:400">bonobo</span>
+            </div>
+
+            <div style="flex:none;display:flex;gap:8px;padding:4px 16px 10px">
+              <div style="height:32px;padding:0 12px 0 8px;border-radius:8px;background:#4F378B;color:#EADDFF;font-size:13px;font-weight:500;display:flex;align-items:center;gap:5px">
+                <svg width="16" height="16" viewBox="0 -960 960 960" style="fill:#EADDFF"><path d="m382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z"/></svg>
+                All
+              </div>
+              <div style="height:32px;padding:0 12px;border-radius:8px;border:1px solid #938F99;color:#E6E0E9;font-size:13px;font-weight:500;display:flex;align-items:center">Songs</div>
+              <div style="height:32px;padding:0 12px;border-radius:8px;border:1px solid #938F99;color:#E6E0E9;font-size:13px;font-weight:500;display:flex;align-items:center">Albums</div>
+              <div style="height:32px;padding:0 12px;border-radius:8px;border:1px solid #938F99;color:#E6E0E9;font-size:13px;font-weight:500;display:flex;align-items:center">Artists</div>
+            </div>
+
+            <div style="flex:1;overflow:hidden">
+              <div style="font-size:20px;font-weight:500;padding:8px 16px">Songs</div>
+              <sc-for list="{{ searchSongs }}" as="s" hint-placeholder-count="3">
+                <div style="display:flex;align-items:center;gap:14px;padding:8px 16px">
+                  <div style="width:50px;height:50px;border-radius:4px;background:{{ s.cover }};flex:none"></div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-size:15px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.t }}</div>
+                    <div style="font-size:12.5px;color:#CAC4D0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.al }} • {{ s.a }}</div>
+                  </div>
+                </div>
+              </sc-for>
+
+              <div style="display:flex;align-items:baseline;justify-content:space-between;padding:14px 16px 4px">
+                <div style="font-size:15px;font-weight:600">Albums</div>
+              </div>
+              <div style="display:flex;gap:12px;padding:0 16px;overflow:hidden">
+                <sc-for list="{{ albums }}" as="al" hint-placeholder-count="3">
+                  <div style="flex:none;width:100px">
+                    <div style="width:100px;height:100px;border-radius:10px;background:{{ al.cover }}"></div>
+                    <div style="font-size:12px;font-weight:600;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ al.t }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="flex:none;display:flex;align-items:center;justify-content:space-around;padding:8px 4px 10px;background:#141218;border-top:1px solid #2B2930">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M500-360q42 0 71-29t29-71v-220h80q17 0 28.5-11.5T720-720q0-17-11.5-28.5T680-760h-80q-17 0-28.5 11.5T560-720v180q-13-10-28-15t-32-5q-42 0-71 29t-29 71q0 42 29 71t71 29ZM320-240q-33 0-56.5-23.5T240-320v-480q0-33 23.5-56.5T320-880h480q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H320ZM160-80q-33 0-56.5-23.5T80-160v-520q0-17 11.5-28.5T120-720q17 0 28.5 11.5T160-680v520h520q17 0 28.5 11.5T720-120q0 17-11.5 28.5T680-80H160Zm160-720v480-480Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Library</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm-28.5-151.5Q440-463 440-480t11.5-28.5Q463-520 480-520t28.5 11.5Q520-497 520-480t-11.5 28.5Q497-440 480-440t-28.5-11.5ZM480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Albums</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#CAC4D0"><path d="M160-320q-17 0-28.5-11.5T120-360q0-17 11.5-28.5T160-400h240q17 0 28.5 11.5T440-360q0 17-11.5 28.5T400-320H160Zm0-160q-17 0-28.5-11.5T120-520q0-17 11.5-28.5T160-560h400q17 0 28.5 11.5T600-520q0 17-11.5 28.5T560-480H160Zm0-160q-17 0-28.5-11.5T120-680q0-17 11.5-28.5T160-720h400q17 0 28.5 11.5T600-680q0 17-11.5 28.5T560-640H160Zm511 499q-5 3-10 3t-10-2q-5-2-8-6.5t-3-10.5v-246q0-6 3-10.5t8-6.5q5-2 10-2t10 3l184 122q5 3 7 7.5t2 9.5q0 5-2 9.5t-7 7.5L671-141Z"/></svg>
+                <div style="font-size:11px;font-weight:500;color:#CAC4D0">Playlists</div>
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+                <div style="padding:5px 20px;border-radius:16px;background:#4F378B"><svg width="21" height="21" viewBox="0 -960 960 960" style="fill:#EADDFF"><path d="M380-320q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l224 224q11 11 11 28t-11 28q-11 11-28 11t-28-11L532-372q-30 24-69 38t-83 14Zm0-80q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/></svg></div>
+                <div style="font-size:11px;font-weight:600;color:#E6E0E9">Search</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  cover(h, s2 = 34) {
+    return `linear-gradient(150deg, hsl(${h} 62% 58%), hsl(${(h+42)%360} 56% ${s2}%))`;
+  }
+  renderVals() {
+    const mk = (t, a, h) => ({ t, a, h, cover: this.cover(h) });
+    const albums = [
+      mk('Solar Drift','Kiasmos',205), mk('Nightgrove','Cofield',262),
+      mk('Amber Hours','June Marieezy',32), mk('Paper Cities','Tycho',188),
+      mk('Low Tide','Bonobo',152), mk('Velvet Static','Men I Trust',322),
+      mk('Meridian','Emancipator',96), mk('Ghostlight','ODESZA',234),
+      mk('Coral Ways','STRFKR',344), mk('Ferrous','Nils Frahm',18),
+      mk('Halcyon','Jon Hopkins',196), mk('Dust & Gold','Khruangbin',44),
+    ];
+    const playlists = [
+      { t:'Late Night Drive', n:'42 songs', h:250 },
+      { t:'Focus Deep', n:'88 songs', h:180 },
+      { t:'Sunday Coffee', n:'31 songs', h:36 },
+      { t:'Rediscover 2015', n:'50 songs', h:320 },
+    ].map(p => ({ ...p, cover: this.cover(p.h) }));
+    const artists = [
+      { t:'Bonobo', h:152 }, { t:'Tycho', h:188 }, { t:'ODESZA', h:234 }, { t:'Nils Frahm', h:18 },
+    ].map(p => ({ ...p, cover: this.cover(p.h, 40) }));
+    const genres = [
+      { t:'Ambient', h:196 }, { t:'Electronic', h:262 }, { t:'Jazz', h:32 }, { t:'Downtempo', h:152 },
+    ].map(p => ({ ...p, cover: this.cover(p.h) }));
+    const detailSongs = [
+      { n:1, t:'First Light', d:'3:58', playing:false },
+      { n:2, t:'Solar Drift', d:'5:12', playing:true },
+      { n:3, t:'Meridian Haze', d:'4:27', playing:false },
+      { n:4, t:'Undertow', d:'6:03', playing:false },
+      { n:5, t:'Amber Hours', d:'4:41', playing:false },
+      { n:6, t:'Slow Return', d:'5:35', playing:false },
+      { n:7, t:'Nightfall', d:'7:18', playing:false },
+    ].map(s => ({
+      ...s,
+      bg: s.playing ? 0.08 : 0, color: s.playing ? '#FFB77C' : '#EFE5DB',
+      bgb: s.playing ? 0.16 : 0.06, colorb: s.playing ? '#AEE9F0' : '#ECE7FF',
+      colorGold: s.playing ? '#F3D9A6' : '#FBF1E4'
+    }));
+    const searchSongs = [
+      { t:'Solar Drift', a:'Kiasmos', al:'Solar Drift', h:205 },
+      { t:'Kiara', a:'Bonobo', al:'Migration', h:152 },
+      { t:'Cirrus', a:'Bonobo', al:'The North Borders', h:172 },
+    ].map(p => ({ ...p, cover: this.cover(p.h) }));
+    return {
+      albums, recent: albums.slice(0,6), newest: albums.slice(6,12),
+      playlists, artists, genres, detailSongs, searchSongs,
+      history: ['bonobo','ambient mix','tycho','late night'],
+    };
+  }
+}
+</script>
+</body>
+</html>

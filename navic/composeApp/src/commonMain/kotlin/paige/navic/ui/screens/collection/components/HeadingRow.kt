@@ -1,0 +1,130 @@
+package paige.navic.ui.screens.collection.components
+
+import androidx.compose.animation.BoundsTransform
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.dropShadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.shadow.Shadow
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.kyant.capsule.ContinuousRoundedRectangle
+import androidx.lifecycle.compose.dropUnlessResumed
+import androidx.navigation3.ui.LocalNavAnimatedContentScope
+import navic.composeapp.generated.resources.Res
+import navic.composeapp.generated.resources.info_unknown_genre
+import navic.composeapp.generated.resources.info_unknown_year
+import navic.composeapp.generated.resources.subtitle_playlist
+import org.jetbrains.compose.resources.stringResource
+import paige.navic.LocalPlatformContext
+import paige.navic.LocalNavStack
+import paige.navic.LocalSharedTransitionScope
+import paige.navic.ui.navigation.Screen
+import paige.navic.domain.models.DomainAlbum
+import paige.navic.domain.models.DomainPlaylist
+import paige.navic.domain.models.DomainSongCollection
+import paige.navic.ui.components.common.CoverArt
+import paige.navic.ui.theme.defaultFont
+import paige.navic.util.ui.EmphasizedDecelerateEasing
+
+@Composable
+fun CollectionDetailScreenHeadingRow(
+	collection: DomainSongCollection,
+	tab: String,
+	titleAlpha: Float
+) {
+	val platformContext = LocalPlatformContext.current
+	val backStack = LocalNavStack.current
+	val coverCardShape = ContinuousRoundedRectangle(18.dp)
+	with(LocalSharedTransitionScope.current) {
+		// A small cover CARD floating over the blurred ambient wash (Apple-Music/Spotify
+		// style), replacing the old full-bleed cover that alpha-faded into the gradient.
+		Box(
+			modifier = Modifier
+				.fillMaxWidth()
+				.padding(top = 24.dp, bottom = 6.dp),
+			contentAlignment = Alignment.Center
+		) {
+			CoverArt(
+				coverArtId = collection.coverArtId,
+				contentDescription = collection.name,
+				shape = coverCardShape,
+				modifier = Modifier
+					.size(212.dp)
+					.sharedElement(
+						sharedContentState = this@with.rememberSharedContentState("${tab}-${collection.id}-cover"),
+						boundsTransform = BoundsTransform { _, _ ->
+							tween(
+								durationMillis = 500,
+								easing = EmphasizedDecelerateEasing
+							)
+						},
+						animatedVisibilityScope = LocalNavAnimatedContentScope.current
+					)
+					.alpha(titleAlpha)
+					// Soft drop shadow so the card reads as floating above the wash.
+					.dropShadow(
+						coverCardShape,
+						Shadow(radius = 30.dp, color = Color.Black, alpha = 0.5f)
+					),
+				crossfadeMs = 0
+			)
+		}
+		Column(
+			modifier = Modifier
+				.padding(horizontal = 31.dp)
+				.padding(top = 10.dp, bottom = 8.dp)
+				.alpha(titleAlpha),
+			horizontalAlignment = Alignment.CenterHorizontally
+		) {
+			Text(
+				collection.name,
+				style = MaterialTheme.typography.headlineSmall,
+				textAlign = TextAlign.Center,
+				modifier = Modifier
+			)
+			val subtitle = when (collection) {
+				is DomainAlbum -> collection.artistName
+				is DomainPlaylist -> collection.comment
+			}
+			subtitle?.let { subtitle ->
+				Text(
+					subtitle,
+					color = MaterialTheme.colorScheme.primary,
+					modifier = Modifier.clickable(collection is DomainAlbum, onClick = dropUnlessResumed {
+						platformContext.clickSound()
+						(collection as? DomainAlbum)?.artistId?.let { id ->
+							backStack.add(Screen.ArtistDetail(id))
+						}
+					}),
+					style = MaterialTheme.typography.bodyMedium,
+					fontFamily = defaultFont(grade = 100, round = 100f)
+				)
+			}
+			Text(
+				if (collection is DomainAlbum)
+					"${collection.genre ?: stringResource(Res.string.info_unknown_genre)} • ${
+						collection.year ?: stringResource(
+							Res.string.info_unknown_year
+						)
+					}"
+				else stringResource(Res.string.subtitle_playlist),
+				color = LocalContentColor.current.copy(alpha = 0.7f),
+				style = MaterialTheme.typography.bodySmall,
+				fontFamily = defaultFont(grade = 100, round = 100f)
+			)
+		}
+	}
+}
