@@ -215,7 +215,15 @@ LBBOT_URL=http://lb-bot:8899
 Unset = the entire discography/missing-album surface disappears from both clients. That is the
 intended "off" state and the artist pages should look untouched.
 
-On lb-bot (its own env — see its `README.md` §Configuration for the full list):
+On lb-bot, copy its **`.env.example`** to `.env` beside `docker-compose.yml` and fill it in —
+Compose reads it automatically:
+
+```bash
+cp .env.example .env    # then edit
+docker compose up -d
+```
+
+The variables that matter:
 
 | Variable | Notes |
 |---|---|
@@ -224,7 +232,7 @@ On lb-bot (its own env — see its `README.md` §Configuration for the full list
 | `MBZ_CONTACT` | **Required by the MusicBrainz ToS.** A contact email. |
 | `LISTENBRAINZ_USER` | Playlist/fresh-release sources |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Its Telegram control surface |
-| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` | **Set these.** Same token as `HUB_TOKEN`. Without them a finished download won't push a refresh to open client pages — you'll see it on the next manual read instead. |
+| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` | **Set these.** The hub's **http://** address (not the `ws://` one clients use) and the same token as `HUB_TOKEN`. Without them a finished download won't push a refresh to open client pages — you'll see it on the next manual read instead. |
 | `LASTFM_API_KEY`, `SPOTIFY_CLIENT_ID/SECRET` | Optional enrichment |
 
 **Deployment gotchas that will bite you** (all from lb-bot's own docs):
