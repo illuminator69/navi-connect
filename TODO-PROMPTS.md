@@ -17,8 +17,8 @@ General ground rules (both tasks):
 
 ## PROMPT 1 — Finish the Symfonium-style plan (Navic)
 
-You are continuing the navi-connect project (see `HANDOFF.md`, `NAVIC-SYMFONIUM-PLAN.md`,
-`PROJECT-SUMMARY-2026-07-18.md`). The Symfonium-style reliability/queue/offline/polish plan is
+You are continuing the navi-connect project (see `README.md`, `NAVIC-SYMFONIUM-PLAN.md`,
+`TESTING-SETUP.md`). The Symfonium-style reliability/queue/offline/polish plan is
 **largely implemented already** — your job is to finish the genuinely-remaining pieces without
 duplicating what exists.
 
@@ -102,7 +102,7 @@ already present in the tree (do NOT rebuild — only extend if the audit shows a
 You are continuing navi-connect. **The native-Cast crash is already fixed** (`SafeMediaItemConverter`
 in `androidMain/.../shared/MediaPlayer.android.kt` — a converter returning a placeholder `MediaItem`
 when `MediaQueueItem.getMedia()` is momentarily null). What remains is the **cast session lifecycle
-after a process restart**, flagged "⏳ STILL OPEN" in `HANDOFF.md`.
+after a process restart**, still open — see `TESTING-SETUP.md` §8.
 
 This is **Navic's own MediaRouter/media3 Cast path** (`AndroidCastManager` + `PlaybackService`'s
 `CastPlayer` swap) — *not* the Feishin hub cast bridge. Use Feishin's hardened bridge
