@@ -7,7 +7,7 @@ metadata:
   originSessionId: 213138fd-e09b-449a-b005-2fcfaf1aa233
 ---
 
-AudioMuse-AI integration surface for [[navi-connect-project]]. Source zips were at
+AudioMuse-AI integration surface for navi-connect. Source zips were at
 `~\Downloads\AudioMuse-AI-main.zip` (core) + `AudioMuse-AI-NV-plugin-main.zip`
 (Navidrome plugin), extracted to `Downloads\_am_src\`.
 
