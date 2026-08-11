@@ -1,0 +1,1 @@
+check the markdown files (not only the uploaded ones but the new ones in the folder as well) sorting by last modified. update the readme only if there are architectural changes, keep the file as succint as possible.

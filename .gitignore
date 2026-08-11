@@ -1,0 +1,38 @@
+# navi-connect umbrella repo
+#
+# The Feishin fork is NOT vendored here — it keeps its own repository so that
+# upstream releases can still be merged with `git merge upstream/<tag>`, and so
+# its GPL-3.0 source stays independently available. See README.md.
+feishin/
+
+# Local agent / editor tooling
+.claude/
+.codex/
+.codex-*/
+.vscode/
+.idea/
+*.iml
+
+# Build output
+node_modules/
+dist/
+out/
+release/
+**/build/
+!src/**/build/
+.gradle/
+.gradle-dist/
+.gradle-user/
+.kotlin/
+__pycache__/
+*.pyc
+
+# Local machine config / secrets
+local.properties
+.env
+hub/data/
+
+# Runtime state
+*.log
+.DS_Store
+Thumbs.db
