@@ -13,13 +13,45 @@ smoke test that isolates failures, and every known bug and caveat. Prebuilt clie
 
 This file explains *what the project is and how it fits together*. `PROTOCOL.md` has the wire spec.
 
+### Repositories
+
+| Repo | What's in it |
+|---|---|
+| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the **Navic** Android client, the docs, and the [prebuilt releases](../../releases). |
+| **[feishin](https://github.com/illuminator69/feishin)** | The desktop client. Kept separate so upstream Feishin releases can still be merged with `git merge upstream/<tag>` — flattening ~4,700 commits of upstream history into this tree would destroy that. GPL-3.0; this is also where the binaries' source lives. |
+| **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
+
 ---
 
 ## What you get
 
-- **The missing half of your library, visible.** Open an artist and the albums you *don't* have sit
-  right there among the ones you do — faded and dashed, a partly-owned album carrying its `9/12`.
-  One tap reviews real Soulseek sources against the canonical tracklist and fetches the right one.
+### The missing half of your library, visible
+
+Open an artist and the albums you *don't* have sit right there among the ones you do — greyed out and
+marked, a partly-owned album carrying its missing count. Nothing is a separate "wanted" list; the gaps
+live where you'd notice them.
+
+![Feishin artist page showing owned albums alongside greyed-out ones marked NOT IN LIBRARY, with a +38 MISSING badge](docs/screenshots/feishin-artist-missing-albums.png)
+
+**A download is reviewed, not fired blind.** Pick the edition, check it against the canonical
+MusicBrainz tracklist, choose a quality, and only then go looking for sources.
+
+![Missing-album dialog in Feishin showing edition tabs, media-format tabs, the full tracklist, a quality selector and a Find sources button](docs/screenshots/feishin-missing-album-review.png)
+
+The same surface on Android — note the mini-player reading **Playing on Feishin**: the phone is
+controlling a session running on the desktop.
+
+| Artist page | Album review |
+|---|---|
+| ![Navic artist page with albums marked 7 missing, 3 missing and Not in your library](docs/screenshots/navic-artist-missing-albums.png) | ![Navic bottom sheet showing edition options, tracklist, quality preference and Find sources](docs/screenshots/navic-missing-album-review.png) |
+
+Behind it, lb-bot's own workspace handles the per-track gap filling — which tracks are absent, which
+sources are ready, and what it's working on.
+
+![lb-bot Fill gaps workspace showing an album with 14 of 16 present, 2 tracks missing, and the missing track list](docs/screenshots/lb-bot-fill-gaps.png)
+
+### Everything else
+
 - **One playback session, every device.** Control what's playing on one device from another; move
   playback mid-song to your desktop, your phone, or a Chromecast, and it resumes on the same beat.
 - **Recommendations that follow you.** AudioMuse-AI similar-songs radio, artist radio, Song Journey,
@@ -35,7 +67,10 @@ no AudioMuse means those features grey out. The core remote-control layer needs 
 
 ## Contents
 
+  - [Repositories](#repositories)
 - [What you get](#what-you-get)
+  - [The missing half of your library, visible](#the-missing-half-of-your-library-visible)
+  - [Everything else](#everything-else)
 - [1. What it is / the problem it solves](#1-what-it-is--the-problem-it-solves)
 - [2. Components](#2-components)
 - [3. Architecture](#3-architecture)
@@ -63,7 +98,6 @@ no AudioMuse means those features grey out. The core remote-control layer needs 
   - [Navic (Android / KMP)](#navic-android--kmp)
 - [9. Conventions & gotchas](#9-conventions--gotchas)
 - [10. Directory map](#10-directory-map)
-  - [Sibling repositories](#sibling-repositories)
 
 ---
 
@@ -448,18 +482,12 @@ navi-connect/
   README.md                      ← this file (start here)
   TESTING-SETUP.md               prerequisites, step-by-step setup, smoke test, known bugs/caveats
   PROTOCOL.md                    wire protocol spec
+  CLAUDE.md                      working notes for coding agents
+  docs/screenshots/              images used by this file
   hub/                           Python relay hub + tools/
   navic/                         Navic fork (Kotlin Multiplatform / Compose)
 ```
+The Feishin fork and lb-bot live in their own repositories — see
+[Repositories](#repositories) at the top.
 
-### Sibling repositories
 
-Two components live in their own repositories rather than here:
-
-| Component | Why it's separate |
-|---|---|
-| **[Feishin fork](https://github.com/illuminator69/feishin)** | Carries ~4,700 commits of upstream history so that new upstream releases can still be merged with `git merge upstream/<tag>` — flattening it into this tree would destroy that. It is GPL-3.0, and keeping it public is also what makes the distributed binaries' source available. |
-| **[lb-bot](https://github.com/illuminator69/lb-bot)** | An independent service with its own release cycle, useful on its own, and entirely optional here. |
-
-Prebuilt Feishin and Navic binaries are attached to this repository's **Releases** —
-see `TESTING-SETUP.md` §6 if you'd rather not build them yourself.
