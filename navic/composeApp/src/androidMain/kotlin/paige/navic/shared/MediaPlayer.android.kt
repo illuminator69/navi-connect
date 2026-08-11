@@ -20,12 +20,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.Tracks
-import androidx.media3.cast.CastPlayer
-import androidx.media3.cast.DefaultMediaItemConverter
-import androidx.media3.cast.MediaItemConverter
-import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.common.util.UnstableApi
-import com.google.android.gms.cast.MediaQueueItem
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -36,7 +31,6 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionToken
-import com.google.android.gms.cast.framework.CastContext
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
@@ -83,35 +77,10 @@ import java.io.File
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
-/**
- * Wraps [DefaultMediaItemConverter] but tolerates a Cast queue item whose
- * `MediaInfo` is momentarily null — the receiver can report an item by id before
- * its media is populated (mid-load / queue transition). The default converter
- * dereferences `getMedia()` inside `CastTimelineTracker.getCastTimeline`, which
- * crashed the app with an NPE while casting. Returning a placeholder lets the
- * timeline build; the next RemoteMediaClient status update fills in the real item.
- */
 @OptIn(UnstableApi::class)
-private class SafeMediaItemConverter : MediaItemConverter {
-	private val delegate = DefaultMediaItemConverter()
-
-	override fun toMediaItem(mediaQueueItem: MediaQueueItem): MediaItem {
-		if (mediaQueueItem.media == null) {
-			return MediaItem.Builder()
-				.setMediaId("cast-pending-${mediaQueueItem.itemId}")
-				.build()
-		}
-		return delegate.toMediaItem(mediaQueueItem)
-	}
-
-	override fun toMediaQueueItem(mediaItem: MediaItem): MediaQueueItem =
-		delegate.toMediaQueueItem(mediaItem)
-}
-
 class PlaybackService : MediaSessionService(), KoinComponent {
 	private var mediaSession: MediaSession? = null
 	private var exoPlayer: ExoPlayer? = null
-	private var castPlayer: CastPlayer? = null
 	private var remotePlayer: RemoteSessionPlayer? = null
 	private val serviceScope = MainScope()
 	private var scrobbleManager: AndroidScrobbleManager? = null
@@ -208,41 +177,6 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 			.build()
 		exoPlayer = player
 
-		// navi-connect Chromecast bridge: when a Cast session starts (route
-		// selected in the device picker), swap the session's player to the
-		// CastPlayer and carry the queue/position over; swap back when it
-		// ends. MediaController consumers (the whole app, incl. hub reports)
-		// are unaffected by the swap. Best-effort — devices without Play
-		// Services simply never get a Cast session.
-		castPlayer = try {
-			// Custom converter (vs the default) so a Cast queue item with a
-			// momentarily-null MediaInfo doesn't NPE the timeline build — that
-			// crashed the app while casting (CastTimelineTracker.getCastTimeline →
-			// DefaultMediaItemConverter.toMediaItem → MediaQueueItem.getMedia()).
-			CastPlayer(CastContext.getSharedInstance(this), SafeMediaItemConverter()).apply {
-				setSessionAvailabilityListener(object : SessionAvailabilityListener {
-					override fun onCastSessionAvailable() {
-						castPlayer?.let { switchSessionPlayer(it) }
-					}
-
-					override fun onCastSessionUnavailable() {
-						exoPlayer?.let { switchSessionPlayer(it) }
-					}
-				})
-			}
-		} catch (e: Exception) {
-			Logger.e("PlaybackService", "Cast unavailable", e)
-			null
-		}
-
-		// A cast session already live when the process starts never fires the
-		// availability listener (it only reports TRANSITIONS), so adopt it explicitly
-		// here — otherwise a relaunch during casting silently reverts playback to the
-		// phone. (Known open item.)
-		castPlayer?.let { cp ->
-			if (cp.isCastSessionAvailable) switchSessionPlayer(cp)
-		}
-
 		// navi-connect: while another device is the active receiver, swap the
 		// session's player to a facade that mirrors AND drives the REMOTE session,
 		// so the Android system controls (notification / lock screen / Bluetooth)
@@ -271,59 +205,6 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 		}
 	}
 
-	// Items as last known WITH their stream URIs — CastPlayer's timeline can
-	// return MediaItems stripped of localConfiguration (especially while the
-	// session is ending), and feeding those to ExoPlayer.setMediaItems throws.
-	private var lastLocalItems: List<MediaItem> = emptyList()
-
-	private fun switchSessionPlayer(newPlayer: Player) {
-		try {
-			val session = mediaSession ?: return
-			val oldPlayer = session.player
-			if (oldPlayer === newPlayer) return
-
-			val rawItems = (0 until oldPlayer.mediaItemCount).map { oldPlayer.getMediaItemAt(it) }
-			val index = oldPlayer.currentMediaItemIndex
-			val position = oldPlayer.currentPosition
-			val playWhenReady = oldPlayer.playWhenReady
-			// The URI-less filter below can DROP items, so the old index no longer maps
-			// 1:1 into the filtered list — remember the current track's id and relocate it.
-			val currentMediaId = rawItems.getOrNull(index)?.mediaId
-
-			val items = if (newPlayer === exoPlayer) {
-				// Restore playable URIs by mediaId from the pre-cast snapshot;
-				// drop anything that still has no URI rather than crash.
-				val byId = lastLocalItems.associateBy { it.mediaId }
-				rawItems.mapNotNull { item ->
-					if (item.localConfiguration?.uri != null) item
-					else byId[item.mediaId]
-				}
-			} else {
-				// Heading to the CastPlayer: snapshot the URI-bearing items.
-				lastLocalItems = rawItems.filter { it.localConfiguration?.uri != null }
-				rawItems
-			}
-
-			session.player = newPlayer
-			if (items.isNotEmpty()) {
-				newPlayer.setMediaItems(
-					items,
-					currentMediaId?.let { id -> items.indexOfFirst { it.mediaId == id } }
-						?.takeIf { it >= 0 }
-						?: index.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
-					position.coerceAtLeast(0)
-				)
-				newPlayer.playWhenReady = playWhenReady
-				newPlayer.prepare()
-			}
-			oldPlayer.stop()
-			oldPlayer.clearMediaItems()
-		} catch (e: Exception) {
-			// Never let a cast handoff crash the playback service.
-			Logger.e("PlaybackService", "player switch failed", e)
-		}
-	}
-
 	override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
 		return mediaSession
 	}
@@ -336,18 +217,15 @@ class PlaybackService : MediaSessionService(), KoinComponent {
 		scrobbleManager?.release()
 		serviceScope.cancel()
 		stopForeground(STOP_FOREGROUND_REMOVE)
-		castPlayer?.setSessionAvailabilityListener(null)
 		mediaSession?.run {
 			player.stop()
 			release()
 		}
 		exoPlayer?.release()
-		castPlayer?.release()
 		remotePlayer?.release()
 		super.onDestroy()
 		mediaSession = null
 		exoPlayer = null
-		castPlayer = null
 		remotePlayer = null
 		stopSelf()
 	}
@@ -503,6 +381,19 @@ class AndroidMediaPlayerViewModel(
 					override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
 						updatePlaybackState()
 
+						// A track ending and the next one starting does not change
+						// isPlaying, so without this the mini-player and turntable
+						// widgets kept rendering the previous song's title, artist and
+						// art until playback was next paused or resumed. Resolve the
+						// song from the item that just became current rather than
+						// trusting _uiState — updatePlaybackState above has just set
+						// it, but a broadcast that silently lags one track is exactly
+						// the bug being fixed, so don't make it depend on ordering.
+						broadcastNowPlaying(
+							controller?.isPlaying == true,
+							songForMediaItem(mediaItem)
+						)
+
 						// The track we protected from a mid-song uri swap isn't playing any more,
 						// so apply the deferred quality/source change now — this is where a
 						// network handover actually lands.
@@ -527,26 +418,17 @@ class AndroidMediaPlayerViewModel(
 					override fun onIsPlayingChanged(isPlaying: Boolean) {
 						_uiState.update { it.copy(isPaused = !isPlaying) }
 						if (isPlaying) startProgressLoop()
-						val intent =
-							Intent("${application.packageName}.NOW_PLAYING_UPDATED").apply {
-								setPackage(application.packageName)
-								putExtra("isPlaying", isPlaying)
-								putExtra(
-									"title",
-									_uiState.value.currentSong?.title ?: "Unknown song"
-								)
-								putExtra(
-									"artist",
-									_uiState.value.currentSong?.artistName ?: "Unknown artist"
-								)
-								putExtra(
-									"artUrl",
-									_uiState.value.currentSong?.coverArtId?.let {
-										sessionManager.getCoverArtUrl(it)
-									})
-							}
+						broadcastNowPlaying(isPlaying, _uiState.value.currentSong)
+					}
 
-						application.sendBroadcast(intent)
+					// Metadata can change without the item doing so (a live stream, or
+					// a re-resolved item). The widgets key off metadata, so they need
+					// this too.
+					override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
+						broadcastNowPlaying(
+							controller?.isPlaying == true,
+							_uiState.value.currentSong
+						)
 					}
 
 					override fun onPlaybackStateChanged(playbackState: Int) {
@@ -646,6 +528,30 @@ class AndroidMediaPlayerViewModel(
 				loadingCollectionId = null
 			}
 		}
+	}
+
+	/** The queued song a MediaItem stands for, or the current one if it isn't queued. */
+	private fun songForMediaItem(mediaItem: MediaItem?): DomainSong? {
+		val id = mediaItem?.mediaId ?: return _uiState.value.currentSong
+		return _uiState.value.queue.firstOrNull { it.id == id } ?: _uiState.value.currentSong
+	}
+
+	/**
+	 * Tell the home-screen widgets what is playing.
+	 *
+	 * MiniPlayer/TurnTable/QuickPicks receivers listen for this and have no other
+	 * source of truth, so every place the track or the play state changes has to
+	 * send it — see the call sites in the controller listener.
+	 */
+	private fun broadcastNowPlaying(isPlaying: Boolean, song: DomainSong?) {
+		val intent = Intent("${application.packageName}.NOW_PLAYING_UPDATED").apply {
+			setPackage(application.packageName)
+			putExtra("isPlaying", isPlaying)
+			putExtra("title", song?.title ?: "Unknown song")
+			putExtra("artist", song?.artistName ?: "Unknown artist")
+			putExtra("artUrl", song?.coverArtId?.let { sessionManager.getCoverArtUrl(it) })
+		}
+		application.sendBroadcast(intent)
 	}
 
 	private fun updatePlaybackState() {

@@ -13,10 +13,10 @@ import paige.navic.data.database.MIGRATION_CACHE_16_17
 import paige.navic.data.database.MIGRATION_CACHE_17_18
 import paige.navic.data.database.MIGRATION_CACHE_18_19
 import paige.navic.data.database.MIGRATION_DOWNLOAD_3_4
-import paige.navic.domain.manager.CastManager
+import paige.navic.domain.manager.CastBridgeStatus
 import paige.navic.domain.manager.ConnectivityManager
 import paige.navic.domain.manager.LogManager
-import paige.navic.domain.manager.NoopCastManager
+import paige.navic.domain.manager.NoopCastBridgeStatus
 import paige.navic.domain.manager.ShareManager
 import paige.navic.domain.manager.StorageManager
 import paige.navic.domain.repositories.PlayerStateRepository
@@ -88,7 +88,7 @@ actual val platformModule = module {
 	singleOf(::StorageManager)
 	singleOf(::ConnectivityManager)
 	singleOf(::LogManager)
-	single<CastManager> { NoopCastManager() }
+	single<CastBridgeStatus> { NoopCastBridgeStatus() }
 }
 
 @OptIn(ExperimentalForeignApi::class)

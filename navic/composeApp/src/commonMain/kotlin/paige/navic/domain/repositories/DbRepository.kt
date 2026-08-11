@@ -84,10 +84,11 @@ class DbRepository(
 	suspend fun syncEverything(
 		onProgress: (Float, StringResource) -> Unit = { _, _ -> }
 	): Result<Unit> = runDbOp {
-		val progressCallback = { progress: Float, message: StringResource ->
-			Logger.i("DbRepository", "$progress $message")
-			onProgress(progress, message)
-		}
+		// Deliberately not logged. This fires once per album, tens of times a second on a full
+		// pull, and each line was a bare float plus a StringResource's toString — no diagnostic
+		// value, and enough volume to bury every other tag in logcat. The per-section
+		// "- X Synced" lines below carry the actual progress information.
+		val progressCallback = onProgress
 
 		progressCallback(0.0f, Res.string.info_syncing)
 

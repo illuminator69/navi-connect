@@ -3,8 +3,10 @@ package paige.navic.di
 import org.koin.core.module.dsl.singleOf
 import org.koin.dsl.module
 import paige.navic.domain.manager.AudioMuseManager
+import paige.navic.domain.manager.CastScrobbler
 import paige.navic.domain.manager.DownloadManager
 import paige.navic.domain.manager.HubManager
+import paige.navic.domain.manager.LbBotManager
 import paige.navic.domain.manager.NativeApiManager
 import paige.navic.domain.manager.PlaylistDownloadManager
 import paige.navic.domain.manager.PreferenceManager
@@ -18,7 +20,7 @@ val managerModule = module {
 	singleOf(::AmbientColorHolder)
 	singleOf(::SleepTimerManager)
 	single(createdAtStart = true) {
-		SyncManager(get(), get(), get(), get(), get(), get()).apply {
+		SyncManager(get(), get(), get(), get(), get(), get(), get()).apply {
 			startPeriodicSync()
 		}
 	}
@@ -26,8 +28,18 @@ val managerModule = module {
 	singleOf(::SessionManager)
 	singleOf(::PreferenceManager)
 	singleOf(::AudioMuseManager)
+	// createdAtStart so a fill that outlived the process is picked back up without
+	// waiting for the user to open the artist page it was started from.
 	single(createdAtStart = true) {
-		HubManager(get(), get(), get(), get(), get()).apply { start() }
+		LbBotManager(get()).apply { resumeWatches() }
+	}
+	single(createdAtStart = true) {
+		HubManager(get(), get(), get(), get(), get(), get()).apply { start() }
+	}
+	// createdAtStart, and never lazily: a cast session is precisely the case where no screen is
+	// open and no local player is running, so nothing else would ever construct this.
+	single(createdAtStart = true) {
+		CastScrobbler(get(), get(), get(), get(), get(), get()).apply { start() }
 	}
 	// createdAtStart so the autoplay observer is running before the first radio use.
 	single(createdAtStart = true) { RadioManager(get(), get(), get(), get(), get(), get()) }

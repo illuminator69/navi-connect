@@ -101,7 +101,8 @@ class HubManager(
 	private val sessionManager: SessionManager,
 	private val songDao: SongDao,
 	private val mediaPlayer: MediaPlayerViewModel,
-	private val savedQueueRepository: SavedQueueRepository
+	private val savedQueueRepository: SavedQueueRepository,
+	private val lbBotManager: LbBotManager
 ) : RemotePlaybackRouter {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 	private val client = HttpClient {
@@ -921,6 +922,13 @@ class HubManager(
 			}
 
 			"do" -> handleDo(msg)
+
+			// lb-bot placed an album somewhere in the library — possibly at another
+			// client's request. The frame carries no authority: it only says "re-read
+			// data you can already read", so it needs no validation beyond the socket's,
+			// and missing one costs nothing, because the index flip upstream is durable
+			// and the next read is right regardless.
+			"library" -> lbBotManager.onLibraryChanged()
 
 			"error" -> {
 				val code = msg["code"]?.jsonPrimitive?.content

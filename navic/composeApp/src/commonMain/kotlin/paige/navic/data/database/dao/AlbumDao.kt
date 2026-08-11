@@ -26,6 +26,11 @@ interface AlbumDao {
 	@Query("SELECT * FROM AlbumEntity ORDER BY name ASC")
 	suspend fun getAllAlbumsList(): List<AlbumWithSongs>
 
+	// @Transaction is mandatory, not tidiness: AlbumWithSongs makes Room walk the cursor twice —
+	// once to collect albumIds, then again to attach the songs it fetched for them. Without a
+	// transaction a concurrent sync can insert an album between the passes, and the second pass
+	// hits a row the first never saw ("Key <albumId> is missing in the map").
+	@Transaction
 	@RawQuery
 	suspend fun getAlbumsByQuery(query: RoomRawQuery): List<AlbumWithSongs>
 

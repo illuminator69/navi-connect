@@ -148,7 +148,7 @@ class PreferenceManager(
 
 	// navi-connect hub (Spotify-Connect-style remote control)
 	var hubEnabled by preference(false)
-	var hubUrl by preference("ws://192.168.1.10:4790")
+	var hubUrl by preference("")
 	var hubToken by preference("")
 	var hubDeviceName by preference("Navic")
 	var hubDeviceId by preference("")
@@ -159,6 +159,19 @@ class PreferenceManager(
 	// row went from Room, then the next reconnect adopted the hub's list — which still had it.
 	// Mirrors hub.py's `deleted_saved_queues`. See SavedQueueRepository.
 	var deletedSavedQueueIds by preference("")
+
+	// navi-connect lb-bot (library-gap intelligence, hub-proxied only).
+	//
+	// Which copy of an album to prefer when several are on offer — one of lb-bot's
+	// QUALITY_PREFERENCES, or "" for "whatever lb-bot's own Source preference says".
+	// Sticky across albums and restarts: a user who wants CD-quality FLAC wants it
+	// every time, and re-picking it per album is the kind of chore nobody does twice.
+	var lbBotQuality by preference("")
+
+	// In-flight fills, as a JSON object keyed by rgid (album downloads) or review
+	// group id (gap fills). Persisted rather than held in memory because a fill takes
+	// minutes and the app is routinely killed inside that window — see LbBotManager.
+	var lbBotWatches by preference("{}")
 
 	fun customHeadersMap(): Map<String, String> = buildMap {
 		for (line in customHeaders.lines()) {

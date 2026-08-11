@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.glance.GlanceModifier
@@ -47,21 +48,43 @@ class MiniPlayerWidget : NowPlayingWidget() {
 		isPlaying: Boolean,
 		title: String,
 		artist: String,
-		bitmap: Bitmap?
+		bitmap: Bitmap?,
+		ambientWash: Bitmap?
 	) {
+		// White reads on the wash (a 40%-scrimmed cover) whatever the album is; the themed
+		// colours only make sense on the flat background used when nothing is playing.
+		val onWash = ambientWash != null
+		val contentColor =
+			if (onWash) ColorProvider(Color.White) else GlanceTheme.colors.onPrimaryContainer
+
+		// `appWidgetBackground()` stamps `android.R.id.background` on the view, and a RemoteViews
+		// tree may only carry that id once — putting it on both the wash and the row is what made
+		// the launcher give up with "can't show content". It belongs on the outer box alone.
 		Box(
-			modifier = GlanceModifier.fillMaxSize(),
+			modifier = GlanceModifier
+				.fillMaxSize()
+				.height(88.dp)
+				.background(GlanceTheme.colors.widgetBackground)
+				.clickable(actionStartActivity(launchIntent(context)))
+				.appWidgetInnerCornerRadius(0.dp)
+				.appWidgetBackground(),
 			contentAlignment = Alignment.Center
 		) {
+			ambientWash?.let {
+				Image(
+					provider = ImageProvider(it),
+					contentDescription = null,
+					contentScale = ContentScale.Crop,
+					modifier = GlanceModifier
+						.fillMaxSize()
+						.appWidgetInnerCornerRadius(0.dp)
+				)
+			}
+
 			Row(
 				modifier = GlanceModifier
-					.background(GlanceTheme.colors.widgetBackground)
 					.fillMaxSize()
-					.height(88.dp)
-					.padding(12.dp)
-					.clickable(actionStartActivity(launchIntent(context)))
-					.appWidgetInnerCornerRadius(0.dp)
-					.appWidgetBackground(),
+					.padding(12.dp),
 				verticalAlignment = Alignment.CenterVertically
 			) {
 				Image(
@@ -78,17 +101,15 @@ class MiniPlayerWidget : NowPlayingWidget() {
 				Column(modifier = GlanceModifier.defaultWeight().padding(horizontal = 12.dp)) {
 					Text(
 						text = title,
-						style = TextStyle(
-							color = GlanceTheme.colors.onPrimaryContainer,
-							fontSize = 16.sp
-						),
+						style = TextStyle(color = contentColor, fontSize = 16.sp),
 						maxLines = 1
 					)
 					Text(
 						text = artist,
 						style = TextStyle(
 							color = ColorProvider(
-								GlanceTheme.colors.onPrimaryContainer.getColor(context)
+								(if (onWash) Color.White
+								else GlanceTheme.colors.onPrimaryContainer.getColor(context))
 									.copy(alpha = .8f)
 							),
 							fontSize = 14.sp
@@ -100,7 +121,7 @@ class MiniPlayerWidget : NowPlayingWidget() {
 				CircleIconButton(
 					imageProvider = ImageProvider(R.drawable.ic_previous),
 					contentDescription = "Previous",
-					contentColor = GlanceTheme.colors.onPrimaryContainer,
+					contentColor = contentColor,
 					onClick = actionSendBroadcast(
 						createMediaIntent(
 							context,
@@ -112,7 +133,7 @@ class MiniPlayerWidget : NowPlayingWidget() {
 				CircleIconButton(
 					imageProvider = ImageProvider(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play),
 					contentDescription = if (isPlaying) "Pause" else "Play",
-					contentColor = GlanceTheme.colors.onPrimaryContainer,
+					contentColor = contentColor,
 					onClick = actionSendBroadcast(
 						createMediaIntent(
 							context,
@@ -124,7 +145,7 @@ class MiniPlayerWidget : NowPlayingWidget() {
 				CircleIconButton(
 					imageProvider = ImageProvider(R.drawable.ic_next),
 					contentDescription = "Next",
-					contentColor = GlanceTheme.colors.onPrimaryContainer,
+					contentColor = contentColor,
 					onClick = actionSendBroadcast(
 						createMediaIntent(
 							context,

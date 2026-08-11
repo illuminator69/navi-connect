@@ -39,7 +39,9 @@ class TurnTableWidget : NowPlayingWidget() {
 		isPlaying: Boolean,
 		title: String,
 		artist: String,
-		bitmap: Bitmap?
+		bitmap: Bitmap?,
+		// Unused: the circular cover fills the whole widget, so there is no background to wash.
+		ambientWash: Bitmap?
 	) {
 		val size = LocalSize.current
 		Box(

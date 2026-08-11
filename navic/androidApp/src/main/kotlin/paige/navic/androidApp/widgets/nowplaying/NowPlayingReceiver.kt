@@ -23,6 +23,12 @@ open class NowPlayingReceiver(
 	override fun onReceive(context: Context, intent: Intent) {
 		super.onReceive(context, intent)
 
+		// Only OUR broadcast carries now-playing extras. Every other intent that reaches a widget
+		// receiver — APPWIDGET_UPDATE above all, which the system and Glance both send — has
+		// none, and writing their absent extras blanked the state: the widget went back to
+		// "Not Playing"/"No Artist" mid-song, whenever something merely asked it to redraw.
+		if (intent.action != "${context.packageName}.NOW_PLAYING_UPDATED") return
+
 		val isPlaying = intent.getBooleanExtra("isPlaying", false)
 		val title = intent.getStringExtra("title") ?: ""
 		val artist = intent.getStringExtra("artist") ?: ""

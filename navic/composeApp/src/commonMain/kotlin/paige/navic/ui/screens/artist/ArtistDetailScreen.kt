@@ -59,6 +59,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.dropUnlessResumed
+import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toImmutableList
 import kotlinx.collections.immutable.toPersistentList
 import kotlinx.coroutines.launch
@@ -98,6 +99,9 @@ import paige.navic.util.ui.coverAmbientGradient
 import paige.navic.util.ui.onAmbientColor
 import paige.navic.util.ui.rememberCoverColorScheme
 import paige.navic.ui.components.sheets.CollectionSheet
+import paige.navic.ui.components.sheets.GapFillSheet
+import paige.navic.ui.components.sheets.MissingAlbumSheet
+import paige.navic.ui.screens.artist.components.DiscographyShelf
 import paige.navic.ui.core.UiState
 import paige.navic.ui.navigation.Screen
 import paige.navic.ui.screens.artist.components.ArtistActionButtons
@@ -139,6 +143,9 @@ fun ArtistDetailScreen(
 	val starred by viewModel.starred.collectAsState()
 	val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
 	val allDownloads by viewModel.allDownloads.collectAsStateWithLifecycle()
+	val discography by viewModel.discography.collectAsStateWithLifecycle()
+	val selectedRelease by viewModel.selectedRelease.collectAsStateWithLifecycle()
+	val selectedGap by viewModel.selectedGap.collectAsStateWithLifecycle()
 	val downloadStatus by viewModel.collectionDownloadStatus()
 		.collectAsState(DownloadStatus.NOT_DOWNLOADED)
 
@@ -413,9 +420,16 @@ fun ArtistDetailScreen(
 								}
 							}
 							}
+							// The legacy play-count carousel, shown only when the
+							// discography shelf below is NOT rendering. Two album rows
+							// on one page is just confusing, and the discography is the
+							// better of the two — but without lb-bot the page has to
+							// look exactly as it always has.
+							val hasDiscography = discography.available && discography.indexed
 							ArtCarousel(
 								stringResource(Res.string.title_albums),
-								state.albums.sortedByDescending { album -> album.playCount }
+								if (hasDiscography) persistentListOf()
+								else state.albums.sortedByDescending { album -> album.playCount }
 									.toImmutableList()
 							) { album ->
 								val albumDownloadStatus by downloadManager
@@ -430,37 +444,33 @@ fun ArtistDetailScreen(
 										backStack.add(Screen.CollectionDetail(album.id, "artist"))
 									}
 								)
-								if (selectedAlbum == album) {
-									CollectionSheet(
-										onDismissRequest = { viewModel.clearAlbumSelection() },
-										collection = album,
-										starred = selectedAlbumIsStarred,
-										onShare = { shareId = album.id },
-										onPlayNext = { player.playNext(album) },
-										onAddToQueue = { player.addToQueue(album) },
-										onSetStarred = { viewModel.starAlbum(!selectedAlbumIsStarred) },
-										onAddAllToPlaylist = { playlistDialogShown = true },
-										downloadStatus = albumDownloadStatus,
-										onDownloadAll = { 
-											scope.launch {
-												downloadManager.downloadCollection(album)
-											}
-										},
-										onCancelDownloadAll = {
-											scope.launch {
-												album.songs.forEach { downloadManager.cancelDownload(it.id) }
-											}
-										},
-										onDeleteDownloadAll = {
-											scope.launch {
-												downloadManager.deleteDownloadedCollection(album)
-											}
-										},
-										rating = selectedAlbumRating,
-										onSetRating = { viewModel.rateSelectedAlbum(it) }
-									)
-								}
 							}
+							// NOTE: this must stay above the similar-artists guard below,
+							// which is an early `return@Column` — anything after it is
+							// skipped entirely for an artist with no similar artists.
+							DiscographyShelf(
+								ui = discography,
+								canIndex = !state.artist.musicBrainzId.isNullOrBlank(),
+								onIndex = { viewModel.indexArtist() },
+								onOpenEntry = { entry ->
+									when {
+										// Tapping an album you own opens it — including
+										// a partly-owned one. Filling its gaps is the
+										// exception, and lives in the long-press sheet
+										// below; making it the tap action put a chore in
+										// front of the thing the user actually wanted.
+										entry.album != null -> backStack.add(
+											Screen.CollectionDetail(entry.album.id, "artist")
+										)
+										// Nothing to open: only a release to fetch.
+										entry.release != null && !entry.pendingSync ->
+											viewModel.selectRelease(entry.release)
+									}
+								},
+								onSelectEntry = { entry ->
+									entry.album?.let { viewModel.selectAlbum(it) }
+								}
+							)
 							if (state.similarArtists.isEmpty()) return@Column
 							ArtCarousel(
 								stringResource(Res.string.title_similar_artists),
@@ -497,6 +507,66 @@ fun ArtistDetailScreen(
 		expiry = shareExpiry,
 		onExpiryChange = { shareExpiry = it }
 	)
+
+	// Hoisted out of the album carousel: long-press now comes from two places (the
+	// legacy carousel and the discography shelf), and only one of them renders at a
+	// time. Keeping the sheet inside either would tie it to whichever row happened
+	// to be showing.
+	selectedAlbum?.let { album ->
+		val albumDownloadStatus by downloadManager
+			.getCollectionDownloadStatus(album.songs.map { it.id })
+			.collectAsState(initial = DownloadStatus.NOT_DOWNLOADED)
+		// Filling gaps is offered only when lb-bot actually has a group for this
+		// album — the sheet hides the row when these are null, like every other
+		// optional action it takes.
+		val gapEntry = discography.sections
+			.asSequence()
+			.flatMap { it.entries }
+			.firstOrNull { it.album?.id == album.id && it.gapGroupId != null }
+		CollectionSheet(
+			onDismissRequest = { viewModel.clearAlbumSelection() },
+			collection = album,
+			starred = selectedAlbumIsStarred,
+			onShare = { shareId = album.id },
+			onPlayNext = { player.playNext(album) },
+			onAddToQueue = { player.addToQueue(album) },
+			onSetStarred = { viewModel.starAlbum(!selectedAlbumIsStarred) },
+			onAddAllToPlaylist = { playlistDialogShown = true },
+			downloadStatus = albumDownloadStatus,
+			onDownloadAll = { scope.launch { downloadManager.downloadCollection(album) } },
+			onCancelDownloadAll = {
+				scope.launch {
+					album.songs.forEach { downloadManager.cancelDownload(it.id) }
+				}
+			},
+			onDeleteDownloadAll = {
+				scope.launch { downloadManager.deleteDownloadedCollection(album) }
+			},
+			rating = selectedAlbumRating,
+			onSetRating = { viewModel.rateSelectedAlbum(it) },
+			missingTrackCount = gapEntry?.missingTracks,
+			onFillGaps = gapEntry?.let { entry -> { viewModel.selectGap(entry) } }
+		)
+	}
+
+	selectedRelease?.let { release ->
+		MissingAlbumSheet(
+			release = release,
+			onDismissRequest = { viewModel.selectRelease(null) }
+		)
+	}
+
+	selectedGap?.let { entry ->
+		val groupId = entry.gapGroupId
+		if (groupId != null) {
+			GapFillSheet(
+				groupId = groupId,
+				albumTitle = entry.title,
+				coverArtId = entry.album?.coverArtId,
+				onDismissRequest = { viewModel.selectGap(null) }
+			)
+		}
+	}
 
 	if (playlistDialogShown) {
 		PlaylistUpdateDialog(

@@ -25,6 +25,7 @@ import paige.navic.util.core.Logger
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 data class SyncState(
@@ -45,7 +46,8 @@ class SyncManager(
 	private val albumDao: AlbumDao,
 	private val connectivityManager: ConnectivityManager,
 	private val sessionManager: SessionManager,
-	private val preferenceManager: PreferenceManager
+	private val preferenceManager: PreferenceManager,
+	private val lbBotManager: LbBotManager
 ) {
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 	private var syncJob: Job? = null
@@ -53,10 +55,64 @@ class SyncManager(
 
 	private val fullSyncThreshold = 1.hours
 
+	private companion object {
+		/** How long after the last completed fill to wait before pulling. */
+		val LB_BOT_SYNC_DEBOUNCE = 90.seconds
+
+		/** Hard floor between lb-bot-triggered pulls, whatever the debounce says. */
+		val LB_BOT_SYNC_MIN_INTERVAL = 5.minutes.inWholeMilliseconds
+	}
+
 	private val _syncState = MutableStateFlow(SyncState())
 	val syncState = _syncState.asStateFlow()
 
+	/**
+	 * Pull the library in after lb-bot places an album, without doing it five times
+	 * for five albums.
+	 *
+	 * A completed fill leaves Navidrome holding files that Room knows nothing about,
+	 * so the album isn't playable until a sync — and the only sync Navic has is the
+	 * full one. Syncing per fill would be brutal on battery for anyone filling a
+	 * handful of albums in a sitting, so each signal *restarts* the timer instead of
+	 * starting a sync: a burst collapses into one pull at the end of it.
+	 *
+	 * The delay does double duty. Navidrome has to finish its own scan before a pull
+	 * could see the new files at all, so syncing the instant lb-bot says "placed"
+	 * would mostly fetch the library as it was a moment ago.
+	 */
+	private var lbBotSyncJob: Job? = null
+	private var lastLbBotSyncMs = 0L
+
+	private fun observeLbBotFills() {
+		scope.launch {
+			lbBotManager.libraryRevision.collect { revision ->
+				if (revision == 0L) return@collect
+				lbBotSyncJob?.cancel()
+				lbBotSyncJob = scope.launch {
+					delay(LB_BOT_SYNC_DEBOUNCE)
+					val now = Clock.System.now().toEpochMilliseconds()
+					// A floor as well as a debounce: back-to-back fills that each land
+					// just outside the debounce window must still not each buy a full
+					// library pull.
+					if (now - lastLbBotSyncMs < LB_BOT_SYNC_MIN_INTERVAL) {
+						Logger.i("SyncManager", "lb-bot sync skipped: one ran recently")
+						return@launch
+					}
+					if (_syncState.value.isSyncing || syncMutex.isLocked) {
+						Logger.i("SyncManager", "lb-bot sync skipped: already syncing")
+						return@launch
+					}
+					lastLbBotSyncMs = now
+					Logger.i("SyncManager", "Syncing after lb-bot placed an album")
+					preferenceManager.lastFullSyncTime = 0
+					runSyncCycle()
+				}
+			}
+		}
+	}
+
 	init {
+		observeLbBotFills()
 		scope.launch {
 			connectivityManager.isOnline.collect { isOnline ->
 				if (!syncMutex.isLocked && isOnline) {

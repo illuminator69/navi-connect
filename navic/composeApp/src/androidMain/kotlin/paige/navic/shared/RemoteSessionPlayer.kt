@@ -4,6 +4,7 @@ import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.C
+import androidx.media3.common.DeviceInfo
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -49,9 +50,30 @@ class RemoteSessionPlayer(
 			Player.COMMAND_SEEK_TO_MEDIA_ITEM,
 			Player.COMMAND_GET_CURRENT_MEDIA_ITEM,
 			Player.COMMAND_GET_TIMELINE,
-			Player.COMMAND_GET_METADATA
+			Player.COMMAND_GET_METADATA,
+			// Volume keys. Declaring these plus a PLAYBACK_TYPE_REMOTE DeviceInfo is
+			// what makes Android route the hardware rocker to the session instead of
+			// the phone's own music stream — which, while another device is playing,
+			// changes nothing anyone can hear. No VolumeProviderCompat is involved:
+			// SimpleBasePlayer's device-volume handlers are the modern equivalent.
+			Player.COMMAND_GET_DEVICE_VOLUME,
+			Player.COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS,
+			Player.COMMAND_ADJUST_DEVICE_VOLUME_WITH_FLAGS
 		)
 		.build()
+
+	// The hub's scale is 0..100, so it is used unchanged rather than mapped onto a
+	// coarser one: a step of 1 is what the picker's slider already sends.
+	private val deviceInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
+		.setMinVolume(0)
+		.setMaxVolume(100)
+		.build()
+
+	/** The active receiver's volume, or a middling default until the hub says. */
+	private fun remoteVolume(): Int {
+		val activeId = hubManager.activeDeviceId.value
+		return hubManager.devices.value.firstOrNull { it.id == activeId }?.volume ?: 50
+	}
 
 	// Ignore transport commands briefly after this facade is swapped into the
 	// session. media3 / the system controller re-syncs state on swap-in and can
@@ -70,6 +92,12 @@ class RemoteSessionPlayer(
 		// tick once a second while playing so the scrubber/elapsed time advances.
 		scope.launch {
 			hubManager.remoteSession.collect { invalidateState() }
+		}
+		// The device list is where the receiver's volume lives, and it changes
+		// independently of the session — including when another client moves the
+		// slider. Without this the system volume UI would show a stale level.
+		scope.launch {
+			hubManager.devices.collect { invalidateState() }
 		}
 		scope.launch {
 			while (isActive) {
@@ -111,6 +139,8 @@ class RemoteSessionPlayer(
 
 		return State.Builder()
 			.setAvailableCommands(availableCommands)
+			.setDeviceInfo(deviceInfo)
+			.setDeviceVolume(remoteVolume())
 			.setPlaybackState(if (tracks.isEmpty()) Player.STATE_IDLE else Player.STATE_READY)
 			.setPlayWhenReady(
 				session.isPlaying,
@@ -159,5 +189,28 @@ class RemoteSessionPlayer(
 		return Futures.immediateVoidFuture()
 	}
 
+	override fun handleSetDeviceVolume(deviceVolume: Int, flags: Int): ListenableFuture<*> {
+		// No grace guard here, unlike the transport handlers: a volume re-sync on
+		// swap-in sends the value we just reported, so echoing it back is harmless,
+		// and swallowing a real key press in the first 1.5s would be worse.
+		hubManager.actSetVolume(deviceVolume.coerceIn(0, 100))
+		return Futures.immediateVoidFuture()
+	}
+
+	override fun handleIncreaseDeviceVolume(flags: Int): ListenableFuture<*> {
+		hubManager.actSetVolume((remoteVolume() + VOLUME_STEP).coerceIn(0, 100))
+		return Futures.immediateVoidFuture()
+	}
+
+	override fun handleDecreaseDeviceVolume(flags: Int): ListenableFuture<*> {
+		hubManager.actSetVolume((remoteVolume() - VOLUME_STEP).coerceIn(0, 100))
+		return Futures.immediateVoidFuture()
+	}
+
 	override fun handleRelease(): ListenableFuture<*> = Futures.immediateVoidFuture()
+
+	private companion object {
+		/** One rocker press. 1-in-100 would need a hundred presses to cross the range. */
+		const val VOLUME_STEP = 5
+	}
 }

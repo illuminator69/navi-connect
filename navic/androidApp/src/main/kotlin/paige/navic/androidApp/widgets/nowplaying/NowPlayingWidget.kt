@@ -37,8 +37,15 @@ abstract class NowPlayingWidget : GlanceAppWidget() {
 			val artist = prefs[NowPlayingKeys.artistKey]?.takeIf { it.isNotBlank() } ?: "No Artist"
 			val artUrl = prefs[NowPlayingKeys.artUrlKey]
 
-			val bitmap by produceState<Bitmap?>(initialValue = null, artUrl) {
+			// Cover and wash come from ONE coroutine, seeded from the process cache: a widget
+			// update is a fresh composition, so anything derived in a second step lagged a
+			// track behind, and anything not already in hand flashed the placeholder first.
+			val coverKey = CoverArtCache.keyFor(artUrl)
+			val cover by produceState(initialValue = CoverArtCache.get(coverKey), coverKey) {
+				if (value != null) return@produceState
 				value = fetchBitmap(context, artUrl)
+					?.let { CoverArt(bitmap = it, wash = AmbientWash.of(it)) }
+					?.also { CoverArtCache.put(coverKey, it) }
 			}
 
 			GlanceTheme {
@@ -47,19 +54,26 @@ abstract class NowPlayingWidget : GlanceAppWidget() {
 					isPlaying = isPlaying,
 					title = title,
 					artist = artist,
-					bitmap = bitmap
+					bitmap = cover?.bitmap,
+					ambientWash = cover?.wash
 				)
 			}
 		}
 	}
 
+	/**
+	 * @param bitmap the now-playing cover, or null when there is nothing to show.
+	 * @param ambientWash [bitmap] blurred, saturated and scrimmed for use as a background. Always
+	 *   in step with [bitmap] — a widget that draws it can rely on the two matching.
+	 */
 	@Composable
 	abstract fun Content(
 		context: Context,
 		isPlaying: Boolean,
 		title: String,
 		artist: String,
-		bitmap: Bitmap?
+		bitmap: Bitmap?,
+		ambientWash: Bitmap?
 	)
 
 	/**

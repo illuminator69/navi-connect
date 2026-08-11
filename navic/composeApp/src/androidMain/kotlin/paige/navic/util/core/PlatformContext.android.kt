@@ -43,7 +43,8 @@ actual fun rememberPlatformContext(): PlatformContext {
 			ThemeMode.Light -> false
 		}
 	}
-	val sizeClass = calculateWindowSizeClass(LocalActivity.current!!)
+	val activity = LocalActivity.current!!
+	val sizeClass = calculateWindowSizeClass(activity)
 	SideEffect {
 		(view.context as? Activity)?.window?.let { window ->
 			WindowCompat.getInsetsController(window, view)
@@ -58,15 +59,21 @@ actual fun rememberPlatformContext(): PlatformContext {
 			}
 
 			override fun checkLocalNetworkPermission() {
-				if (Build.VERSION.SDK_INT >= 37) {
-					val hasPermission = context.checkSelfPermission(
-						Manifest.permission.ACCESS_LOCAL_NETWORK
-					) == PackageManager.PERMISSION_GRANTED
+				if (Build.VERSION.SDK_INT < 37) return
 
-					if (!hasPermission) {
-						requestPermissions((view.context as? Activity?)!!, arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), 500)
-					}
-				}
+				val hasPermission = context.checkSelfPermission(
+					Manifest.permission.ACCESS_LOCAL_NETWORK
+				) == PackageManager.PERMISSION_GRANTED
+				if (hasPermission) return
+
+				// The hosting Activity, not `view.context`: in Compose that context is usually a
+				// ContextThemeWrapper, and casting it blind used to risk an NPE — now that this
+				// runs on every launch rather than only on a login tap, that would be a crash.
+				requestPermissions(
+					activity,
+					arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK),
+					500
+				)
 			}
 
 			override val platformType = PlatformType.Android

@@ -29,6 +29,7 @@ import androidx.compose.material3.adaptive.navigation3.rememberListDetailSceneSt
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -67,6 +68,7 @@ import paige.navic.ui.components.dialogs.SideloadingDialog
 import paige.navic.ui.components.sheets.ChangelogSheet
 import paige.navic.ui.navigation.BottomSheetSceneStrategy
 import paige.navic.ui.navigation.NowPlayingSceneStrategy
+import paige.navic.ui.navigation.AppDeepLink
 import paige.navic.ui.navigation.Screen
 import paige.navic.ui.screens.album.AlbumListScreen
 import paige.navic.ui.screens.artist.ArtistDetailScreen
@@ -175,6 +177,23 @@ fun App() {
 	// the source, and the (per-screen) bottom bar reads it via LocalExpressiveBlur
 	// to frost over it. Gated by the Appearance "Expressive blur" toggle.
 	val expressiveBlur = rememberExpressiveBlur(preferenceManager.expressiveBlur)
+
+	// Ask for local-network access here, not only on the login screen. Anyone who signed in
+	// before the app started making direct LAN connections never gets asked otherwise, and the
+	// platform then falls back to prompting per connection — a "choose a device to connect"
+	// chooser on every launch, which grants nothing. No-op once granted.
+	LaunchedEffect(Unit) { platformContext.checkLocalNetworkPermission() }
+
+	// A screen requested from outside the composition (a Quick Picks widget tile). Held until
+	// there is a signed-in session to show it in — a cold start from the widget composes this
+	// before the session restores, and pushing the album over the login screen would strand it.
+	val deepLink by AppDeepLink.pending.collectAsStateWithLifecycle()
+	LaunchedEffect(deepLink, isLoggedIn) {
+		val target = deepLink ?: return@LaunchedEffect
+		if (!isLoggedIn) return@LaunchedEffect
+		if (backStack.lastOrNull() != target) backStack.add(target)
+		AppDeepLink.consume()
+	}
 
 	SharedTransitionLayout {
 		CompositionLocalProvider(

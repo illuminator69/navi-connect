@@ -37,6 +37,7 @@ import navic.composeapp.generated.resources.action_star
 import navic.composeapp.generated.resources.action_view_artist
 import navic.composeapp.generated.resources.action_view_on_lastfm
 import navic.composeapp.generated.resources.action_view_on_musicbrainz
+import navic.composeapp.generated.resources.action_fill_gaps_count
 import navic.composeapp.generated.resources.count_songs
 import navic.composeapp.generated.resources.info_click_to_retry
 import navic.composeapp.generated.resources.info_download_failed
@@ -92,7 +93,12 @@ fun CollectionSheet(
 	onDelete: (() -> Unit)? = null,
 	rating: Int? = null,
 	onSetRating: ((Int) -> Unit)? = null,
-	onAutoDownload: (() -> Unit)? = null
+	onAutoDownload: (() -> Unit)? = null,
+	// lb-bot knows this album is missing tracks. Passed only from the artist
+	// discography shelf, where the gap is known; null everywhere else, so the row
+	// hides itself exactly like every other optional action here.
+	missingTrackCount: Int? = null,
+	onFillGaps: (() -> Unit)? = null
 ) {
 	val preferenceManager = koinInject<PreferenceManager>()
 	val platformContext = LocalPlatformContext.current
@@ -161,6 +167,30 @@ fun CollectionSheet(
 		HorizontalDivider(Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
 
 		Column(Modifier.verticalScroll(rememberScrollState())) {
+			// First, because it is the only row here that says something is *wrong*
+			// with the album rather than offering another thing to do with it.
+			if (onFillGaps != null) {
+				ListItem(
+					content = {
+						Text(
+							pluralStringResource(
+								Res.plurals.action_fill_gaps_count,
+								missingTrackCount ?: 0,
+								missingTrackCount ?: 0
+							)
+						)
+					},
+					leadingContent = { Icon(Icons.Outlined.Download, null) },
+					onClick = {
+						platformContext.clickSound()
+						onFillGaps()
+						onDismissRequest()
+					},
+					colors = colors,
+					contentPadding = contentPadding
+				)
+			}
+
 			if (onViewOnLastFm != null && albumInfo?.lastFmUrl != null) {
 				ListItem(
 					content = { Text(stringResource(Res.string.action_view_on_lastfm)) },

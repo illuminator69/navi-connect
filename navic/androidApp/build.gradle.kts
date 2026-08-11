@@ -107,6 +107,8 @@ dependencies {
 	implementation(libs.cmp.material3)
 	implementation(libs.koin.android)
 	implementation(libs.koin.core)
+	// The widgets read the library through AlbumRepository, whose list types are immutable.
+	implementation(libs.kotlinx.collections.immutable)
 	implementation(libs.bundles.glance)
 	implementation(libs.bundles.coil)
 	implementation(libs.bundles.media3)

@@ -15,7 +15,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -25,7 +24,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import org.koin.compose.koinInject
-import paige.navic.domain.manager.CastManager
+import paige.navic.domain.manager.CastBridgeState
+import paige.navic.domain.manager.CastBridgeStatus
 import paige.navic.domain.manager.HubDevice
 import paige.navic.domain.manager.HubManager
 import paige.navic.domain.manager.PreferenceManager
@@ -43,15 +43,14 @@ import kotlin.math.roundToInt
 @Composable
 fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 	val hubManager = koinInject<HubManager>()
-	val castManager = koinInject<CastManager>()
+	val castBridgeStatus = koinInject<CastBridgeStatus>()
 	val preferenceManager = koinInject<PreferenceManager>()
 	val connected by hubManager.connected.collectAsState()
 	val connectionError by hubManager.connectionError.collectAsState()
 	val devices by hubManager.devices.collectAsState()
 	val myDeviceId by hubManager.myDeviceId.collectAsState()
 	val activeDeviceId by hubManager.activeDeviceId.collectAsState()
-	val castDevices by castManager.devices.collectAsState()
-	val castConnectedName by castManager.connectedName.collectAsState()
+	val speakers by castBridgeStatus.speakers.collectAsState()
 
 	// Snapshot-backed pref → reading recomposes when the hidden set changes.
 	val hiddenIds = remember(preferenceManager.hubHiddenDeviceIds) {
@@ -64,14 +63,6 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 		preferenceManager.hubHiddenDeviceIds = cur.joinToString(",")
 	}
 	var showExtra by remember { mutableStateOf(false) }
-
-	// Cast discovery only runs while the picker is open (active scanning is
-	// battery hungry); the device list itself stays cached between openings,
-	// so the sheet renders instantly and the scan refreshes it in place.
-	DisposableEffect(Unit) {
-		castManager.startDiscovery()
-		onDispose { castManager.stopDiscovery() }
-	}
 
 	val visibleDevices = devices.filter { it.online && it.id !in hiddenIds }
 	val extraDevices = devices.filter { !it.online || it.id in hiddenIds }
@@ -192,33 +183,33 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 				}
 			}
 
-			if (castDevices.isNotEmpty() || castConnectedName != null) {
-				Text("Cast devices", style = MaterialTheme.typography.titleMedium)
-				castDevices.forEach { cast ->
-					val isCasting = castConnectedName == cast.name
-					Row(
-						modifier = Modifier.fillMaxWidth(),
-						horizontalArrangement = Arrangement.SpaceBetween,
-						verticalAlignment = Alignment.CenterVertically
-					) {
-						Column(Modifier.weight(1f)) {
-							Text(cast.name, style = MaterialTheme.typography.bodyLarge)
-							Text(
-								if (isCasting) "casting from this device" else "Chromecast",
-								style = MaterialTheme.typography.bodySmall,
-								color = MaterialTheme.colorScheme.onSurfaceVariant
-							)
-						}
-						Button(
-							onClick = {
-								if (isCasting) castManager.disconnect()
-								else castManager.connect(cast.id)
-								onDismissRequest()
-							}
-						) {
-							Text(if (isCasting) "Disconnect" else "Cast")
-						}
-					}
+			// Chromecasts reach the list ABOVE, as ordinary hub devices, once somebody bridges
+			// them — so casting is just a transfer and transfer-with-resume works for free. What
+			// this section adds is the part you otherwise can't see: whether this phone found the
+			// speaker at all, and who is presenting it. Rendered even when empty, because a failed
+			// scan and a speaker that is simply off used to look identical.
+			Text("Chromecasts on this network", style = MaterialTheme.typography.titleMedium)
+			if (speakers.isEmpty()) {
+				Text(
+					"Searching…",
+					style = MaterialTheme.typography.bodyMedium,
+					color = MaterialTheme.colorScheme.onSurfaceVariant
+				)
+			}
+			speakers.forEach { speaker ->
+				Column {
+					Text(speaker.name, style = MaterialTheme.typography.bodyLarge)
+					Text(
+						when (speaker.state) {
+							CastBridgeState.BRIDGING -> "ready · transfer to it above"
+							CastBridgeState.CLAIMING -> "connecting…"
+							CastBridgeState.BRIDGED_ELSEWHERE -> "ready · published by another device"
+							CastBridgeState.HUB_DISABLED -> "found, but the hub is off"
+							CastBridgeState.IDLE -> "found"
+						},
+						style = MaterialTheme.typography.bodySmall,
+						color = MaterialTheme.colorScheme.onSurfaceVariant
+					)
 				}
 			}
 			Spacer(Modifier.height(24.dp))

@@ -62,6 +62,11 @@
 	<string name="title_select_lyrics">Select Lyrics</string>
 	<string name="title_advanced">Advanced Transcoding</string>
 	<string name="title_logs">Logs</string>
+	<string name="hint_logs_filter">Filter by tag or text</string>
+	<string name="action_logs_copy_all">Copy visible logs</string>
+	<string name="action_logs_follow">Follow new logs</string>
+	<string name="action_logs_unfollow">Stop following</string>
+	<string name="info_logs_empty">No lines match this filter.</string>
 
 	<string name="subtitle_appearance">Themes, colours, layout</string>
 	<string name="subtitle_now_playing">Customise the fullscreen now playing view</string>
@@ -422,7 +427,7 @@
 	<string name="action_clear_queue_history">Clear all</string>
 	<string name="title_clear_queue_history">Clear saved queues?</string>
 	<string name="message_clear_queue_history">This permanently removes every saved queue on every connected device.</string>
-	<string name="message_restore_queue_failed">Couldn\'t restore that queue</string>
+	<string name="message_restore_queue_failed">Couldn't restore that queue</string>
 	<string name="queue_song_count">%1$d songs</string>
 	<string name="action_rename">Rename</string>
 	<string name="action_delete_queue">Delete</string>
@@ -436,7 +441,7 @@
 	<string name="action_save_as_playlist">Save as playlist</string>
 	<string name="title_save_as_playlist">Save as playlist</string>
 	<string name="message_saved_as_playlist">Saved as a Navidrome playlist</string>
-	<string name="message_save_playlist_failed">Couldn\'t save the playlist</string>
+	<string name="message_save_playlist_failed">Couldn't save the playlist</string>
 	<string name="filter_all">All</string>
 	<!-- "Queue", not "Manual": Feishin labels this kind that way and the history is shared. -->
 	<string name="queue_kind_manual">Queue</string>
@@ -478,4 +483,82 @@
 	<string name="download_source_playlist">Playlist</string>
 	<string name="download_source_library">Library</string>
 	<string name="download_source_queue">Queue</string>
+
+	<!-- navi-connect lb-bot: library gaps -->
+	<string name="title_discography">Discography</string>
+	<string name="action_index_artist">Find missing albums</string>
+	<string name="action_rescan_discography">Rescan discography</string>
+	<string name="info_tracks_missing">%1$d missing</string>
+	<string name="info_indexing_artist">Searching MusicBrainz…</string>
+	<string name="info_not_in_library">Not in your library</string>
+	<string name="info_tracks_present">%1$d of %2$d tracks</string>
+	<string name="title_missing_album">Not in your library</string>
+	<string name="title_fill_gaps">Missing tracks</string>
+	<string name="label_edition">Edition</string>
+	<string name="label_version">Version</string>
+	<string name="label_quality_preference">Prefer</string>
+	<string name="quality_lbbot_default">lb-bot's default</string>
+	<string name="quality_flac_any">Best FLAC available</string>
+	<string name="quality_flac_16_44">CD quality (16-bit/44.1kHz)</string>
+	<string name="quality_highest_bitrate">Highest bitrate</string>
+	<string name="quality_prefer_opus">Prefer Opus</string>
+	<string name="action_download_album">Download</string>
+	<string name="action_fill_gaps">Find and download</string>
+	<string name="action_allow_mp3">Also accept MP3</string>
+	<string name="action_recheck_album">Re-check</string>
+	<string name="info_already_downloading">Already downloading</string>
+	<string name="info_fill_searching">Searching for a source…</string>
+	<string name="info_fill_queued">Queued</string>
+	<string name="info_fill_downloading">Downloading %1$d of %2$d</string>
+	<string name="info_fill_placing">Adding to the library…</string>
+	<string name="info_fill_placed">Added — waiting for Navidrome</string>
+	<string name="info_fill_verified">In your library</string>
+	<string name="info_fill_failed">Download failed</string>
+	<string name="info_fill_needs_match">Needs a decision in lb-bot</string>
+	<string name="info_no_sources">No sources found</string>
+	<string name="title_sources">Sources</string>
+	<string name="info_source_recommended">Recommended</string>
+	<string name="info_source_coverage">%1$d of %2$d tracks</string>
+	<string name="info_mp3_would_help">Allowing MP3 would have found a source.</string>
+	<string name="info_gap_pick_source">Sources found. Pick one below.</string>
+	<string name="info_gap_needs_lbbot">lb-bot needs a decision on this album. Finish it in lb-bot's own web interface.</string>
+
+	<!-- Release types, as lb-bot's index labels them -->
+	<string name="title_type_album">Albums</string>
+	<string name="title_type_ep">EPs</string>
+	<string name="title_type_single">Singles</string>
+	<string name="title_type_compilation">Compilations</string>
+	<string name="title_type_soundtrack">Soundtracks</string>
+	<string name="title_type_live">Live</string>
+	<string name="title_type_remix">Remixes</string>
+	<string name="title_type_demo">Demos</string>
+
+	<!-- Source picker -->
+	<string name="action_find_sources">Find sources</string>
+	<string name="info_searching_sources">Searching Soulseek…</string>
+	<string name="info_source_matches_album">Matches album title</string>
+	<string name="info_source_wrong_album">Different album?</string>
+	<string name="info_source_complete">All %1$d tracks</string>
+	<string name="info_source_partial">%1$d of %2$d tracks</string>
+	<string name="info_source_failover">lb-bot falls back to the next-best source if this peer disappears.</string>
+	<string name="action_download_from_source">Download this</string>
+	<string name="action_show_files">Show %1$d files</string>
+	<string name="info_source_files_unexpanded">Peer offline — showing search results, not the real folder.</string>
+	<string name="info_gap_progress">%1$d of %2$d tracks</string>
+	<string name="info_gap_edition">Measured against your album's tagged release</string>
+	<string name="action_auto_pick">Pick the best source for me</string>
+	<string name="info_gap_missing_count">%1$d missing</string>
+	<string name="info_gap_failed">%1$d track(s) failed</string>
+	<string name="info_pending_sync">Added — syncing</string>
+	<plurals name="action_fill_gaps_count">
+		<item quantity="one">Find %1$d missing track</item>
+		<item quantity="other">Find %1$d missing tracks</item>
+	</plurals>
+
+	<!-- lb-bot failures -->
+	<string name="error_lbbot_hub_outdated">This hub is older than the app and can't do that yet. Restart the hub.</string>
+	<string name="error_lbbot_unreachable">Couldn't reach the hub.</string>
+	<string name="error_lbbot_busy">lb-bot is busy or unreachable. It handles one request at a time while searching; try again in a moment.</string>
+	<string name="error_lbbot_not_configured">lb-bot isn't set up.</string>
+	<string name="error_lbbot_rejected">Request failed (%1$d)</string>
 </resources>

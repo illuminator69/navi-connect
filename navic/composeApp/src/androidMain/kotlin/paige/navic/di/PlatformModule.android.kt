@@ -12,8 +12,8 @@ import paige.navic.data.database.MIGRATION_CACHE_16_17
 import paige.navic.data.database.MIGRATION_CACHE_17_18
 import paige.navic.data.database.MIGRATION_CACHE_18_19
 import paige.navic.data.database.MIGRATION_DOWNLOAD_3_4
-import paige.navic.domain.manager.AndroidCastManager
-import paige.navic.domain.manager.CastManager
+import paige.navic.domain.manager.CastBridgeStatus
+import paige.navic.domain.manager.cast.CastBridgeManager
 import paige.navic.domain.manager.ConnectivityManager
 import paige.navic.domain.manager.LogManager
 import paige.navic.domain.manager.ShareManager
@@ -83,5 +83,12 @@ actual val platformModule = module {
 	singleOf(::StorageManager)
 	singleOf(::ConnectivityManager)
 	singleOf(::LogManager)
-	single<CastManager> { AndroidCastManager(androidApplication()) }
+
+	// Eager: discovery has to already be running when the picker opens, and the bridge has to be
+	// up for the speaker to appear in OTHER clients' pickers whether or not this phone's UI is
+	// on screen. Same reason HubManager is createdAtStart.
+	single(createdAtStart = true) {
+		CastBridgeManager(androidApplication(), get(), get()).apply { start() }
+	}
+	single<CastBridgeStatus> { get<CastBridgeManager>() }
 }

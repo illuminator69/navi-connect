@@ -74,7 +74,9 @@ class ScrobbleManager(
 
 		val percent = accumulatedPlayTime.toFloat() / duration.toFloat()
 		val playedEnoughPercent = percent >= preferenceManager.scrobblePercentage
-		val isValidSong = duration >= preferenceManager.minDurationToScrobble
+		// Seconds, per the settings screen's own "30s" label — `duration` is milliseconds, so the
+		// unconverted comparison excluded only tracks shorter than 30ms, i.e. nothing at all.
+		val isValidSong = duration >= preferenceManager.minDurationToScrobble * 1000
 
 		if (isValidSong && playedEnoughPercent) {
 			scrobbleSubmission(currentMediaId)
