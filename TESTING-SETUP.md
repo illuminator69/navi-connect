@@ -297,8 +297,9 @@ Then skip to the configuration bullets at the end of each Option B subsection be
 to point each client at your hub.
 
 > **Source availability:** both clients are **GPL-3.0**. Navic's source is in `navic/` in this repo;
-> Feishin's is in its own repository, linked from the README. The GPL entitles you to the
-> corresponding source for any binary here, and that's where it is.
+> Feishin's is in [feishin-gaps](https://github.com/illuminator69/feishin-gaps), a fork of
+> [jeffvli/feishin](https://github.com/jeffvli/feishin). The GPL entitles you to the corresponding
+> source for any binary here, and that's where it is.
 
 ### Option B: build from source
 

@@ -18,7 +18,7 @@ This file explains *what the project is and how it fits together*. `PROTOCOL.md`
 | Repo | What's in it |
 |---|---|
 | **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the **Navic** Android client, the docs, and the [prebuilt releases](../../releases). |
-| **[feishin](https://github.com/illuminator69/feishin)** | The desktop client. Kept separate so upstream Feishin releases can still be merged with `git merge upstream/<tag>` — flattening ~4,700 commits of upstream history into this tree would destroy that. GPL-3.0; this is also where the binaries' source lives. |
+| **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client. Kept separate so upstream Feishin releases can still be merged with `git merge upstream/<tag>` — flattening ~4,700 commits of upstream history into this tree would destroy that. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
 
 ---
