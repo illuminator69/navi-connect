@@ -39,8 +39,12 @@ PORT = int(os.environ.get("HUB_PORT", "4790"))
 HEALTH_PORT = int(os.environ.get("HUB_HEALTH_PORT", str(PORT + 1)))
 TOKEN = os.environ.get("HUB_TOKEN", "")
 STATE_PATH = os.environ.get("HUB_STATE", "/data/state.json")
-# Drop known devices not seen within this many days when the hub loads. 0 = keep forever.
-DEVICE_TTL_DAYS = float(os.environ.get("HUB_DEVICE_TTL_DAYS", "0") or "0")
+# Drop known devices not seen within this many days. 0 = keep forever.
+# Runs on load AND on a periodic sweep (DEVICE_SWEEP_INTERVAL): without the sweep a
+# long-lived hub accretes a picker row per device that ever connected — including a
+# `cast-<id>` for every speaker ever seen on any network the bridging client visited.
+DEVICE_TTL_DAYS = float(os.environ.get("HUB_DEVICE_TTL_DAYS", "7") or "0")
+DEVICE_SWEEP_INTERVAL = 3600.0  # seconds between stale-device sweeps
 
 NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").rstrip("/")
 MIRROR_PLAYQUEUE = os.environ.get("HUB_MIRROR_PLAYQUEUE", "true").lower() == "true"
@@ -59,9 +63,19 @@ LBBOT_URL = os.environ.get("LBBOT_URL", "").rstrip("/")
 
 DEBUG = os.environ.get("HUB_DEBUG", "").lower() in ("1", "true", "yes")
 
+# How long a bridge's reachability verdict stays authoritative. Bridges re-assert
+# every DEVICE_STATE_INTERVAL (30 s, client-side); past this the last verdict is
+# treated as unknown rather than kept asserting a speaker is up or down forever.
+REACHABLE_TTL_MS = 90_000
+
 PING_INTERVAL = 10  # seconds (matches Feishin's heartbeat)
 PING_TIMEOUT = 10
 RELEASE_TIMEOUT = 1.5  # seconds to wait for an old device to hand off
+# Seconds to wait for a transfer target to confirm it actually started the queue.
+# Generous on purpose: a Chromecast bridge may have to connect, LAUNCH the receiver
+# app and fetch the first bytes. Shorter than the ~22 s a failed cast load can take,
+# which is precisely the window this exists to close.
+LOAD_TIMEOUT = 10.0
 PROGRESS_THROTTLE = 1.0  # seconds between fanned-out progress broadcasts
 INTENT_GRACE = 2.0  # seconds during which receiver reports can't contradict a
                     # fresh user play/pause intent (guards against stale
@@ -180,13 +194,46 @@ class Device:
     name: str = "Unknown"
     platform: str = "unknown"
     caps: list[str] = field(default_factory=lambda: ["controller"])
+    # PRESENCE: a WebSocket claiming this id is attached right now. For a bridged
+    # Chromecast that is the BRIDGE's socket — it says nothing about the speaker.
     online: bool = False
     volume: int = 100
     last_seen: int = 0
     ws: Any = None                       # live websocket, not persisted
     release_future: Any = None           # set during a transfer handoff
+    load_future: Any = None              # set while awaiting a transfer's `loaded` ack
+    # REACHABILITY: the bridge's own verdict on the physical device behind it.
+    # None = unknown / not applicable (every ordinary client, which IS its own
+    # hardware). False = the bridge is connected but the speaker did not answer.
+    reachable: Optional[bool] = None
+    reachable_at: int = 0                # when `reachable` was last asserted
+    app_running: Optional[bool] = None   # receiver app up (cast bridges only)
+    bridged_by: Optional[str] = None     # device id of the client holding this bridge
 
-    def info(self, active_id: Optional[str]) -> dict:
+    def effective_reachable(self, now_ms: Optional[int] = None) -> Optional[bool]:
+        """`reachable`, demoted to unknown once the asserting bridge goes quiet.
+
+        A verdict is only as good as the bridge that keeps renewing it: a bridge
+        that stops sending `deviceState` (crashed, wedged, mid-teardown) must not
+        leave a speaker permanently marked up — or permanently marked down.
+        """
+        if self.reachable is None:
+            return None
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
+        if now - self.reachable_at > REACHABLE_TTL_MS:
+            return None
+        return self.reachable
+
+    def transferable(self, now_ms: Optional[int] = None) -> bool:
+        """Can this device be handed the session right now?
+
+        Unknown reachability is permissive — that is every ordinary client, and a
+        bridge that hasn't reported yet deserves the benefit of the doubt.
+        """
+        return self.online and self.effective_reachable(now_ms) is not False
+
+    def info(self, active_id: Optional[str], now_ms: Optional[int] = None) -> dict:
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
         return {
             "id": self.id,
             "name": self.name,
@@ -196,6 +243,10 @@ class Device:
             "isActive": self.id == active_id,
             "lastSeen": self.last_seen,
             "volume": self.volume,
+            # PROTOCOL §12.2: presence and reachability are different questions.
+            "reachable": self.effective_reachable(now),
+            "appRunning": self.app_running,
+            "bridgedBy": self.bridged_by,
         }
 
 
@@ -922,6 +973,9 @@ class Hub:
         self._mirror_pending = False  # a newer snapshot is waiting to be written
         self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
         self._started_at = time.monotonic()
+        # Serializes transfers, which run off the issuing socket's read loop (see
+        # _on_act's "transfer" branch) and so could otherwise interleave.
+        self._transfer_lock = asyncio.Lock()
         self._load()
 
     def _mark_play_intent(self) -> None:
@@ -990,18 +1044,33 @@ class Hub:
     def _prune_devices(self) -> None:
         """Drop known devices not seen within DEVICE_TTL_DAYS (0 = keep forever).
 
-        Runs on load only: the registry accretes a row per device that ever
-        connected, so without this a long-lived hub grows a stale picker list.
+        Runs on load and on a periodic sweep: the registry accretes a row per device
+        that ever connected, so without this a long-lived hub grows a stale picker
+        list — most visibly a `cast-<id>` for every speaker the bridging client has
+        ever been on the same network as. Never drops an online or active device.
         """
         if DEVICE_TTL_DAYS <= 0:
-            return
+            return 0
         cutoff = int(time.time() * 1000) - int(DEVICE_TTL_DAYS * 86_400_000)
         stale = [d.id for d in self.devices.values()
-                 if d.id != self.session.active_device_id and d.last_seen < cutoff]
+                 if d.id != self.session.active_device_id
+                 and not d.online and d.last_seen < cutoff]
         for did in stale:
             del self.devices[did]
         if stale:
             log(f"pruned {len(stale)} device(s) not seen in {DEVICE_TTL_DAYS}d")
+        return len(stale)
+
+    async def _device_sweep_loop(self) -> None:
+        """Expire stale picker rows while the hub runs, not just at startup."""
+        while True:
+            await asyncio.sleep(DEVICE_SWEEP_INTERVAL)
+            try:
+                if self._prune_devices():
+                    self._save()
+                    await self._broadcast_devices()
+            except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
+                log("device sweep error:", e)
 
     def health(self) -> dict:
         """Liveness snapshot for the HTTP health endpoint.
@@ -1540,6 +1609,17 @@ class Hub:
         dev.name = desc.get("name", dev.name)
         dev.platform = desc.get("platform", dev.platform)
         dev.caps = desc.get("caps", dev.caps)
+        # A bridged device (a Chromecast) is claimed on behalf of another client.
+        # Recording who holds it lets a picker say "bridged by the desktop" and lets
+        # a would-be second bridge see the slot is taken (PROTOCOL §12.2).
+        bridged_by = desc.get("bridgedBy")
+        dev.bridged_by = str(bridged_by) if bridged_by else None
+        # A fresh registration says nothing about the speaker yet — the bridge asserts
+        # that separately with `deviceState`. Starting from unknown rather than keeping
+        # the previous socket's verdict stops a stale "up" surviving a bridge restart.
+        dev.reachable = None
+        dev.reachable_at = 0
+        dev.app_running = None
         dev.online = True
         # Adopt the new socket BEFORE awaiting the old one's close: _disconnect bails
         # unless it owns dev.ws, so claiming it first is what stops the superseded
@@ -1565,6 +1645,11 @@ class Hub:
         dev.online = False
         dev.ws = None
         dev.last_seen = int(time.time() * 1000)
+        # Reachability was the bridge's claim; with the bridge gone nobody is making it.
+        dev.reachable = None
+        dev.reachable_at = 0
+        dev.app_running = None
+        dev.bridged_by = None
         log(f"- {dev.name} ({dev.id[:8]}) disconnected")
         # If the active receiver dropped, pause the session AND relinquish the active
         # slot (keep the queue/position). Clearing active_device_id is the "no live
@@ -1588,6 +1673,12 @@ class Hub:
         dev.last_seen = int(time.time() * 1000)
         if t == "act":
             await self._on_act(dev, msg)
+        elif t == "deviceState":
+            await self._on_device_state(dev, msg)
+        elif t == "loaded":
+            fut = dev.load_future
+            if fut is not None and not fut.done():
+                fut.set_result(msg)
         elif t == "report":
             await self._on_report(dev, msg)
         elif t == "released":
@@ -1932,7 +2023,13 @@ class Hub:
             await self._send_to(active, relay)
 
         elif action == "transfer":
-            await self._transfer(msg.get("target"), msg.get("play"))
+            # Deliberately NOT awaited here. A transfer awaits the old device's
+            # `released` frame, and the overwhelmingly common case is the active
+            # receiver transferring away from itself — same socket, so awaiting
+            # inside its read loop means the hub cannot read the very frame it is
+            # waiting for. That deadlock always ended in a RELEASE_TIMEOUT and a
+            # resume up to one report interval (~1 s) stale.
+            asyncio.create_task(self._transfer_locked(msg.get("target"), msg.get("play")))
 
         elif action == "renameSavedQueue":
             rid = msg.get("id")
@@ -1998,12 +2095,57 @@ class Hub:
             await self._send(dev, {"t": "error", "code": "bad_action",
                                    "message": f"unknown action {action!r}"})
 
+    async def _on_device_state(self, dev: Device, msg: dict) -> None:
+        """A bridge's verdict on the hardware behind it (PROTOCOL §12.2).
+
+        Only meaningful from a bridged device: an ordinary client IS its own
+        hardware, so a socket from it already proves reachability. Rebroadcast only
+        on an actual change — bridges re-assert on a timer and a 30 s device fan-out
+        to every client would be pure noise.
+        """
+        reachable = msg.get("reachable")
+        app_running = msg.get("appRunning")
+        before = dev.effective_reachable()
+        if reachable is not None:
+            dev.reachable = bool(reachable)
+            dev.reachable_at = int(time.time() * 1000)
+        if app_running is not None:
+            dev.app_running = bool(app_running)
+        if dev.effective_reachable() != before:
+            log(f"~ {dev.name} ({dev.id[:8]}) reachable={dev.reachable}")
+            await self._broadcast_devices()
+            # A speaker that just went away while holding the session is not paused by
+            # anything else: its bridge keeps a healthy hub socket, so _disconnect never
+            # fires. Without this the whole stack shows a playing bar over silence.
+            if dev.reachable is False and self.session.active_device_id == dev.id:
+                self._touch_saved_queue_progress()
+                self.session.is_playing = False
+                self.session.active_device_id = None
+                self.session.bump()
+                await self._broadcast_session()
+                await self._broadcast_devices()
+
+    async def _transfer_locked(self, target_id: Optional[str], play: Optional[bool]) -> None:
+        try:
+            async with self._transfer_lock:
+                await self._transfer(target_id, play)
+        except Exception as e:  # noqa: BLE001 — a detached task's traceback would be lost
+            log("transfer error:", e)
+
     async def _transfer(self, target_id: Optional[str], play: Optional[bool]) -> None:
         s = self.session
         target = self.devices.get(target_id) if target_id else None
         if not target or not target.online:
             await self._broadcast({"t": "error", "code": "target_offline",
                                    "message": "target device is not connected"})
+            return
+        # `online` only means a bridge holds the socket. For a Chromecast the speaker
+        # itself can be off, asleep, or on a network this hub can't reach — handing it
+        # the session there is exactly the "player says playing, nothing plays" bug.
+        if target.effective_reachable() is False:
+            await self._broadcast({"t": "error", "code": "target_unreachable",
+                                   "message": f"{target.name} is not responding"})
+            log(f"transfer rejected: {target.name} reported unreachable")
             return
         if "receiver" not in (target.caps or []):
             await self._send(target, {"t": "error", "code": "not_a_receiver",
@@ -2054,10 +2196,64 @@ class Hub:
         # believes another device is active, which can misroute them.
         await self._broadcast_session()
         await self._broadcast_devices()
+        # Only receivers that advertise `loadAck` are held to it. An older client
+        # never sends `loaded`, and treating its silence as failure would roll back
+        # every transfer it ever wins. Armed BEFORE the send so a fast receiver's ack
+        # can't arrive first and be dropped on the floor.
+        fut = None
+        if "loadAck" in (target.caps or []):
+            fut = asyncio.get_running_loop().create_future()
+            target.load_future = fut
         await self._send(target, {"t": "do", "cmd": "load",
                                   "tracks": s.queue, "index": s.index,
                                   "positionMs": s.position_ms, "play": play})
         log(f"transfer -> {target.name} @ index {s.index}, {s.position_ms}ms")
+        # Awaited off to the side: this runs inside the *controller's* read loop, and
+        # blocking it for LOAD_TIMEOUT would stall every other frame that controller
+        # sends while a slow speaker warms up.
+        if fut is not None:
+            asyncio.create_task(self._await_load_ack(target, old_id, fut))
+
+    async def _await_load_ack(self, target: Device, old_id: Optional[str], fut: Any) -> None:
+        """Roll the active slot back if a transfer target never starts playing.
+
+        The hub commits `active_device_id` before sending `do:load` on purpose (the
+        target must know it is active before its load side effects fire), which used
+        to mean a failed load was invisible: every client showed a playing bar over a
+        silent speaker until someone pressed something. A receiver that cannot start
+        answers `loaded {ok:false}`; one that is wedged answers nothing.
+        """
+        ok, err = False, "timeout"
+        try:
+            msg = await asyncio.wait_for(fut, LOAD_TIMEOUT)
+            ok = bool(msg.get("ok", True))
+            err = str(msg.get("error") or "load failed")
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        finally:
+            if target.load_future is fut:
+                target.load_future = None
+        if ok:
+            return
+        s = self.session
+        # A newer transfer (or a takeover) already moved on — that decision wins.
+        if s.active_device_id != target.id:
+            log(f"load ack for {target.name} failed ({err}) but it is no longer active")
+            return
+        # Hand the slot back only if the previous owner is still there to take it;
+        # otherwise leave it orphaned, which is the signal every client already knows
+        # how to read (adopt the queue locally, paused).
+        old = self.devices.get(old_id) if old_id else None
+        s.active_device_id = old.id if (old is not None and old.transferable()) else None
+        s.is_playing = False
+        s.bump()
+        log(f"transfer to {target.name} FAILED ({err}); active -> {s.active_device_id}")
+        await self._broadcast_session()
+        await self._broadcast_devices()
+        await self._broadcast({"t": "error", "code": "load_failed",
+                               "message": f"{target.name} could not start playback"})
 
 
 # --------------------------------------------------------------------------- #
@@ -2216,10 +2412,13 @@ async def main() -> None:
     if proxy_protocol is not None:
         serve_kwargs["create_protocol"] = proxy_protocol
 
+    sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
                                 max_size=4 * 1024 * 1024, **serve_kwargs):
         await stop  # run until a stop signal arrives
+
+    sweep.cancel()
 
     health_server.close()
     await health_server.wait_closed()

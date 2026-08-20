@@ -61,12 +61,22 @@ it is purely a controller. Every device is always a potential controller.
 - **Reconnect:** clients reconnect with exponential backoff and re-send `hello`
   with their persisted `deviceId` to reclaim their registry slot.
 
+**Close codes.**
+
+| Code | Meaning | Client response |
+|---|---|---|
+| `4001` | bad or missing token | stop; do not retry until settings change |
+| `4002` | protocol violation (bad first frame, malformed JSON) | reconnect with backoff |
+| `4003` | superseded — another socket registered this same `device.id` | **stand down**; for a cast bridge that means 5 minutes (§12.2) |
+| `4004` | bad path (not `/connect`) | fix the URL; do not retry |
+
 ### 3.1 Connection handshake
 
 ```
 Client → Hub : { "t":"hello", "token":"<shared-secret>",
                  "device": { "id":"<persisted-uuid|null>", "name":"Feishin-PC",
-                             "platform":"desktop|android", "caps":["receiver","controller"] } }
+                             "platform":"desktop|android", "caps":["receiver","controller"],
+                             "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...] }   // §8.3
@@ -75,6 +85,37 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 - Bad/missing `token` → hub sends `{ "t":"error", "code":"auth", ... }` and closes.
 - If `device.id` is null the hub mints a UUID; the client persists it and reuses
   it on every future `hello` (so reconnects don't create duplicate devices).
+- `caps` is also how a client opts into optional behaviour. `"loadAck"` means this
+  receiver answers a transfer's `do:load` with a `loaded` frame (§7.1); a receiver
+  that does not advertise it is never held to the timeout.
+- `bridgedBy` is set only by a **virtual** device — a receiver whose socket is held
+  on behalf of hardware the hub cannot reach itself (today: a Chromecast, §12.2).
+  It names the client process holding the bridge.
+
+### 3.2 DeviceInfo
+
+```json
+{ "id":"cast-abc", "name":"📺 Living Room", "platform":"chromecast",
+  "caps":["receiver","loadAck"], "online":true, "isActive":false,
+  "lastSeen":1755500000000, "volume":40,
+  "reachable":true, "appRunning":true, "bridgedBy":"feishin-pc" }
+```
+
+**`online` and `reachable` answer different questions, and conflating them is a
+bug.** `online` means *a WebSocket claiming this id is attached right now*. For a
+bridged device that is the **bridge's** socket — it says nothing about whether the
+speaker is powered on, on this network, or answering. `reachable` is the bridge's
+verdict on the hardware:
+
+| `reachable` | Meaning | Picker |
+|---|---|---|
+| `true` | the bridge reached the device recently | available |
+| `null` | unknown / not applicable — every ordinary client, and a bridge that hasn't reported yet | available |
+| `false` | the bridge is connected but the device did not answer | shown, greyed, **not** selectable |
+
+A verdict expires: if the asserting bridge stops renewing it (90 s), the hub
+demotes it back to `null` rather than keep asserting a speaker is up — or down —
+on the strength of a report from a bridge that may itself be wedged.
 
 ---
 
@@ -122,9 +163,14 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 
 ```jsonc
 { "id":"uuid", "name":"Feishin-PC", "platform":"desktop",
-  "caps":["receiver","controller"], "online":true,
-  "isActive":false, "lastSeen": 1730000000000 }
+  "caps":["receiver","controller","loadAck"], "online":true,
+  "isActive":false, "lastSeen": 1730000000000, "volume": 100,
+  // presence (`online`) and reachability are different questions — see §3.2
+  "reachable": null, "appRunning": null, "bridgedBy": null }
 ```
+
+Full field semantics — in particular why `online:true` on a Chromecast row does
+**not** mean the speaker is on — are in **§3.2**.
 
 ---
 
@@ -193,6 +239,28 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 - The hub updates `session.positionMs/index/isPlaying` from this and rebroadcasts
   (throttled; position-only updates need not bump `rev`).
 
+**`t:"loaded"` — transfer acknowledgement** (receivers advertising `loadAck` only):
+
+```jsonc
+{ "t":"loaded", "ok":false, "error":"no route to host" }
+```
+
+Answers a `do:load` that arrived as part of a transfer (§7). `ok:true` means audio
+is actually running (or paused at the requested spot, if `play:false`); `ok:false`
+means the receiver could not start. Silence for 10 s counts as failure. See §7.1.
+
+**`t:"deviceState"` — a bridge's verdict on its hardware** (bridged devices only):
+
+```jsonc
+{ "t":"deviceState", "reachable":true, "appRunning":true }
+```
+
+Sent on change and at least every 30 s. Only meaningful from a device with
+`bridgedBy` set: an ordinary client *is* its own hardware, so its socket already
+proves reachability. `reachable:false` while that device holds the session makes
+the hub pause and relinquish the active slot — nothing else can notice, because
+the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
+
 ### 5.4 Hub → all: **broadcasts**
 
 | `t` | Payload | When |
@@ -202,7 +270,7 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
 | `library` | `{ event, releaseMbid, rgid, artist, album }` | lb-bot placed an album into the library (§15.1) |
-| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `no_active_device`, `unknown_saved_queue` (§8.3) |
+| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
 own id.
@@ -260,6 +328,9 @@ the hub.
 - *Transfer from an offline device:* step 1 times out (≈1.5 s) → hub uses last
   known position. Still resumes correctly within ~1 s of granularity.
 - *Target offline:* hub replies `error{code:"target_offline"}`, no state change.
+- *Target unreachable:* its bridge is connected but the hardware is not answering
+  (§3.2) → `error{code:"target_unreachable"}`, no state change. This is the check
+  that stops "cast to the TV in the other house" from silently committing.
 - *Target is already the active device:* **no-op**. The hub does NOT re-issue
   `do:load` — `session.positionMs` trails the live position by up to a report
   interval, so reloading would visibly rewind playback. If `play` differs from the
@@ -278,6 +349,39 @@ the hub.
   last-known queue locally (paused) and can resume by pressing play (which claims the
   active slot); an explicit transfer still works too. A device that was genuinely still
   playing re-claims active via its normal reporter on reconnect.
+
+### 7.1 Confirming the handoff (`loaded`)
+
+Step 2 commits `activeDeviceId` **before** step 3's `do:load` on purpose: the target
+must know it is active before its load side effects fire, or it misroutes them. The
+cost is that a load which then fails is invisible — every client shows a playing bar
+over a silent device until a human presses something. A Chromecast makes that
+failure both likely (the speaker is off, asleep, or on another network) and slow
+(connect + LAUNCH + first-byte timeouts stack to ~20 s).
+
+So a receiver advertising `caps:["loadAck"]` must answer every transfer `do:load`:
+
+```
+3.  Hub → B : { t:do, cmd:load, ... }
+3a. B   → Hub: { t:loaded, ok:true }            // audio is actually running
+    …or  { t:loaded, ok:false, error:"…" }      // could not start
+```
+
+If the answer is `ok:false`, or none arrives within **10 s**, the hub **rolls the
+active slot back** to the previous device — or to `null` if that device is gone,
+which is the orphaned-session signal every client already knows how to read — sets
+`isPlaying:false`, and broadcasts `error{code:"load_failed"}`.
+
+Two deliberate limits:
+- The rollback is skipped if a newer transfer or takeover already moved the active
+  slot. That later decision wins; this ack is stale by then.
+- A receiver that does **not** advertise `loadAck` is never held to the timeout, so
+  an older client's transfers are unaffected.
+
+The wait runs off the issuing socket's read loop, as does the `release` handshake in
+step 1 — the common case is the active receiver transferring away from *itself*, and
+awaiting inside its own read loop means the hub cannot read the very `released`
+frame it is waiting for.
 
 ---
 
@@ -477,7 +581,8 @@ mDNS and opens **one hub WebSocket per speaker**, registering it as
 
 ```json
 {"t":"hello","token":"…","device":{
-  "id":"cast-<txt.id>","name":"📺 <txt.fn>","platform":"chromecast","caps":["receiver"]}}
+  "id":"cast-<txt.id>","name":"📺 <txt.fn>","platform":"chromecast",
+  "caps":["receiver","loadAck"],"bridgedBy":"<bridging client's device id>"}}
 ```
 
 so it joins the ordinary device picker and transfer flow. Casting is therefore a
@@ -488,6 +593,26 @@ directly, which is why every published track carries `streamUrl` + `mime`.
 Neither client uses a Cast SDK; both speak castv2 (TLS to port 8009) directly.
 **Feishin** uses `bonjour-service` + `castv2-client`; **Navic** uses `NsdManager`
 + its own castv2 implementation (`domain/manager/cast/`).
+
+**Reachability.** The bridge's hub socket lives in a client process on the LAN; the
+speaker does not. So `online` on a `cast-<id>` row means *the bridge is up*, which is
+a different and much weaker claim than *the speaker is up* — see §3.2. The bridge is
+the only party that can tell the difference, and it must say so:
+
+- Assert `deviceState {reachable, appRunning}` on change and at least every 30 s.
+  Reachability is a cheap TCP connect to port **8009** with a short budget; do not
+  LAUNCH the receiver app to find out, because launching seizes the speaker's audio
+  output (a speaker playing over Bluetooth would go silent just from being probed).
+- Do not report `reachable:false` on the first miss. A speaker genuinely powered off
+  mid-session should carry a grace window (~90 s) plus a failed probe before the
+  bridge gives up on it; a phantom receiver for 90 s is much cheaper than dropping a
+  live one.
+- Answer `do:load` with `loaded` (§7.1). This is what turns "transferred to a TV that
+  has been off for days" from a 20-second silent lie into an immediate, visible
+  failure with the session handed back.
+- Tear the bridge down once the speaker is gone for good — an unplugged Chromecast
+  emits no mDNS goodbye, so a bridge that waits for one waits forever, and its
+  healthy socket keeps advertising a dead speaker to every client on every network.
 
 **Ownership.** Both clients can see the same speaker and would register the same
 `cast-<id>`. The hub closes the older socket with **`4003 superseded`** (§3), so
