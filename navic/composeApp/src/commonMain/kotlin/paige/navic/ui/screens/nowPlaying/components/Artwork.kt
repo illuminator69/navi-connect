@@ -30,7 +30,7 @@ fun NowPlayingArtwork(
 	song: DomainSong
 ) {
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 
 	val isRadio = song.id.startsWith("radio_")
 

@@ -91,7 +91,12 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 							when {
 								device.isActive -> "playing"
 								device.id == myDeviceId -> "this device"
-								device.online -> "online"
+								// `online` on a Chromecast row means the BRIDGING CLIENT's socket is
+								// up, not the speaker. A TV that is off in another house stays online
+								// and used to be offered as a perfectly good target — the transfer
+								// then committed and every device showed a playing bar over silence.
+								device.online && !device.transferable -> "not responding"
+								device.online -> "available"
 								else -> "offline"
 							}
 						)
@@ -104,7 +109,9 @@ fun DevicePickerSheet(onDismissRequest: () -> Unit) {
 				horizontalArrangement = Arrangement.spacedBy(4.dp),
 				verticalAlignment = Alignment.CenterVertically
 			) {
-				if (device.online && device.id != activeDeviceId) {
+				// Shown but not offered: the speaker is real and will come back, so hiding it
+				// would be a lie of omission — but handing it the session right now cannot work.
+				if (device.transferable && device.id != activeDeviceId) {
 					Button(
 						onClick = {
 							hubManager.transfer(device.id)

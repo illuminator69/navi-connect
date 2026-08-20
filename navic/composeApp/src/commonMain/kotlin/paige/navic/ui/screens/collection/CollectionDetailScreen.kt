@@ -92,7 +92,7 @@ fun CollectionDetailScreen(
 	)
 
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 
 	val collectionState by viewModel.collectionState.collectAsState()
 	val collection = collectionState.data
@@ -115,6 +115,26 @@ fun CollectionDetailScreen(
 		.collectAsState(DownloadStatus.NOT_DOWNLOADED)
 
 	val rating by viewModel.rating.collectAsStateWithLifecycle()
+
+	// The disc-sorted album and its per-disc grouping, computed once per collection.
+	//
+	// Both used to be built inside the LazyColumn's content lambda, which re-runs whenever this
+	// screen recomposes (a download-progress tick, a selection, a starred flag). Worse, the
+	// "does this album have more than one disc" check re-ran `groupBy` over every song a SECOND
+	// time, once per group. None of it depends on anything but the collection.
+	val sortedAlbum = remember(collection) {
+		(collection as? DomainAlbum)?.let { album ->
+			album.copy(
+				songs = album.songs.sortedWith(
+					compareBy({ it.discNumber }, { it.trackNumber })
+				)
+			)
+		}
+	}
+	val discGroups = remember(sortedAlbum) {
+		sortedAlbum?.songs?.groupBy { it.discNumber }?.entries?.toList().orEmpty()
+	}
+	val multipleDiscs = discGroups.size > 1
 
 	val titleAlpha by remember {
 		derivedStateOf {
@@ -243,15 +263,9 @@ fun CollectionDetailScreen(
 					)
 				}
 
-				if (collection is DomainAlbum) {
-					collection.copy(
-						songs = collection.songs.sortedWith(compareBy(
-							{ it.discNumber },
-							{ it.trackNumber }
-						))
-					).let { album ->
-						album.songs.groupBy {it.discNumber}.forEach { group ->
-							val multipleDiscs = album.songs.groupBy { it.discNumber }.size > 1
+				if (sortedAlbum != null) {
+					sortedAlbum.let { album ->
+						discGroups.forEach { group ->
 							if (group.key != null && multipleDiscs) {
 								item {
 									Row(

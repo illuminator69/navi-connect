@@ -100,7 +100,10 @@ fun LyricsScreen(
 		parameters = { parametersOf(song) }
 	)
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	// The lyrics view genuinely follows the playhead (line highlighting + autoscroll), so it takes
+	// the narrow [progress] flow; everything else comes off steadyState.
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
+	val progress by player.progress.collectAsStateWithLifecycle()
 	val state by viewModel.lyricsState.collectAsState()
 
 	if (preferenceManager.lyricsKeepAlive) {
@@ -127,7 +130,7 @@ fun LyricsScreen(
 	val song = song ?: return placeholder()
 	val duration = song.duration
 
-	val progressState = playerState.progress
+	val progressState = progress
 	val currentDuration = duration * progressState.toDouble()
 
 	val density = LocalDensity.current

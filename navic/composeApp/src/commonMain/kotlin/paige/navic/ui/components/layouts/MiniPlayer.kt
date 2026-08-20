@@ -19,6 +19,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -50,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.dropShadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.shadow.Shadow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -117,15 +119,19 @@ fun MiniPlayer(
 	val expressiveBlur = LocalExpressiveBlur.current
 	val navtabsViewModel = koinViewModel<NavtabsViewModel>()
 	val navtabsState by navtabsViewModel.state.collectAsState()
-	val tabs = ((navtabsState as? UiState.Success)?.data ?: NavbarConfig.default)
-		.tabs.filter { tab -> tab.visible }
+	val tabs = remember(navtabsState) {
+		((navtabsState as? UiState.Success)?.data ?: NavbarConfig.default)
+			.tabs.filter { tab -> tab.visible }
+	}
 	val backStack = LocalNavStack.current
 	val haptics = LocalHapticFeedback.current
 	val navBarPadding = if (tabs.size < 2)
 		with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
 	else 0.dp
 
-	val playerState by player.uiState.collectAsState()
+	// steadyState: the mini-player is on screen almost everywhere, and the only thing here that
+	// follows the playhead is [MiniPlayerProgressBar], which collects it in its own scope.
+	val playerState by player.steadyState.collectAsState()
 	val song = playerState.currentSong
 
 	val coilPlatformContext = LocalCoilPlatformContext.current
@@ -380,97 +386,130 @@ fun MiniPlayer(
 			if (preferenceManager.miniPlayerProgressStyle == MiniPlayerProgressStyle.Visible
 				|| preferenceManager.miniPlayerProgressStyle == MiniPlayerProgressStyle.Seekable
 			) {
-				var dragging by remember { mutableStateOf(false) }
-				val alpha by animateFloatAsState(
-					if (dragging) 1f else .7f
+				MiniPlayerProgressBar(
+					hasSong = hasSong,
+					durationMs = song?.duration?.inWholeMilliseconds ?: 0L,
+					detached = detached,
+					shape = shape,
+					isInteractive = isInteractive,
+					isRemoteActive = isRemoteActive
 				)
-				val progress by animateFloatAsState(
-					playerState.progress.coerceIn(0f, 1f)
-				)
-				val alignment = if (detached) Alignment.BottomStart else Alignment.TopStart
-				Box(
-					modifier = Modifier
-						.matchParentSize()
-						.clip(shape)
-						.align(alignment),
-					contentAlignment = alignment
-				) {
-					if (!detached) {
-						Box(
-							Modifier
-								.background(MaterialTheme.colorScheme.surfaceBright)
-								.fillMaxWidth()
-								.height(3.dp)
-						)
-					}
-					// AudioMuse mix indicator: while a similarity radio plays, the
-					// progress bar drifts through the AudioMuse logo palette
-					// (periwinkle → pink → orange).
-					val isAudioMuseMix by radioManager.isAudioMuseMix.collectAsState()
-					val audioMuseColor = if (isAudioMuseMix) {
-						val transition = rememberInfiniteTransition(label = "audiomuse")
-						val shift by transition.animateFloat(
-							initialValue = 0f,
-							targetValue = 2f,
-							animationSpec = infiniteRepeatable(
-								animation = tween(durationMillis = 6000),
-								repeatMode = RepeatMode.Reverse
-							),
-							label = "audiomuse-color"
-						)
-						val periwinkle = Color(0xFF93A2E8)
-						val pink = Color(0xFFEE7B90)
-						val orange = Color(0xFFF5A661)
-						if (shift < 1f) lerp(periwinkle, pink, shift)
-						else lerp(pink, orange, shift - 1f)
-					} else null
-					Box(
-						Modifier
-							.background(
-								(audioMuseColor ?: MaterialTheme.colorScheme.primary)
-									.copy(alpha = alpha)
-							)
-							.fillMaxWidth(if (song != null) progress else 0f)
-							.height(3.dp)
-					)
-					Box(
-						Modifier
-							.fillMaxWidth()
-							.height(14.dp)
-							.then(
-								if (song != null
-									&& preferenceManager.miniPlayerProgressStyle == MiniPlayerProgressStyle.Seekable
-									&& isInteractive
-								)
-									Modifier.pointerInput(Unit) {
-										detectDragGestures(
-											onDragStart = {
-												dragging = true
-												haptics.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
-											},
-											onDragEnd = {
-												dragging = false
-												haptics.performHapticFeedback(HapticFeedbackType.GestureEnd)
-											}
-										) { change, _ ->
-											val fraction =
-												(change.position.x / size.width.toFloat())
-													.coerceIn(0f, 1f)
-											if (isRemoteActive) {
-												val durationMs =
-													song?.duration?.inWholeMilliseconds ?: 0L
-												hubManager.actSeek((fraction * durationMs).toLong())
-											} else {
-												player.seek(fraction)
-											}
-											change.consume()
-										}
-									}
-								else Modifier
-							)
-					)
-				}
 			}
 		}
+	}
+}
+
+/**
+ * The mini-player's own progress line, in its own composable ON PURPOSE.
+ *
+ * It is the one part of the mini-player that has to follow the playhead, so it collects
+ * [MediaPlayerViewModel.progress] itself instead of reading it off the state the parent already
+ * holds. Inlined into [MiniPlayer], that read invalidated the whole bar — cover art, marquee text,
+ * buttons and (with Expressive blur on) the pill's blur node — five times a second for the whole
+ * of playback. Here, only these three Boxes recompose.
+ */
+@Composable
+private fun BoxScope.MiniPlayerProgressBar(
+	hasSong: Boolean,
+	durationMs: Long,
+	detached: Boolean,
+	shape: Shape,
+	isInteractive: Boolean,
+	isRemoteActive: Boolean
+) {
+	val preferenceManager = koinInject<PreferenceManager>()
+	val player = koinInject<MediaPlayerViewModel>()
+	val hubManager = koinInject<HubManager>()
+	val radioManager = koinInject<RadioManager>()
+	val haptics = LocalHapticFeedback.current
+	val rawProgress by player.progress.collectAsState()
+
+	var dragging by remember { mutableStateOf(false) }
+	val alpha by animateFloatAsState(
+		if (dragging) 1f else .7f
+	)
+	val progress by animateFloatAsState(
+		rawProgress.coerceIn(0f, 1f)
+	)
+	val alignment = if (detached) Alignment.BottomStart else Alignment.TopStart
+	Box(
+		modifier = Modifier
+			.matchParentSize()
+			.clip(shape)
+			.align(alignment),
+		contentAlignment = alignment
+	) {
+		if (!detached) {
+			Box(
+				Modifier
+					.background(MaterialTheme.colorScheme.surfaceBright)
+					.fillMaxWidth()
+					.height(3.dp)
+			)
+		}
+		// AudioMuse mix indicator: while a similarity radio plays, the
+		// progress bar drifts through the AudioMuse logo palette
+		// (periwinkle → pink → orange).
+		val isAudioMuseMix by radioManager.isAudioMuseMix.collectAsState()
+		val audioMuseColor = if (isAudioMuseMix) {
+			val transition = rememberInfiniteTransition(label = "audiomuse")
+			val shift by transition.animateFloat(
+				initialValue = 0f,
+				targetValue = 2f,
+				animationSpec = infiniteRepeatable(
+					animation = tween(durationMillis = 6000),
+					repeatMode = RepeatMode.Reverse
+				),
+				label = "audiomuse-color"
+			)
+			val periwinkle = Color(0xFF93A2E8)
+			val pink = Color(0xFFEE7B90)
+			val orange = Color(0xFFF5A661)
+			if (shift < 1f) lerp(periwinkle, pink, shift)
+			else lerp(pink, orange, shift - 1f)
+		} else null
+		Box(
+			Modifier
+				.background(
+					(audioMuseColor ?: MaterialTheme.colorScheme.primary)
+						.copy(alpha = alpha)
+				)
+				.fillMaxWidth(if (hasSong) progress else 0f)
+				.height(3.dp)
+		)
+		Box(
+			Modifier
+				.fillMaxWidth()
+				.height(14.dp)
+				.then(
+					if (hasSong
+						&& preferenceManager.miniPlayerProgressStyle == MiniPlayerProgressStyle.Seekable
+						&& isInteractive
+					)
+						Modifier.pointerInput(Unit) {
+							detectDragGestures(
+								onDragStart = {
+									dragging = true
+									haptics.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
+								},
+								onDragEnd = {
+									dragging = false
+									haptics.performHapticFeedback(HapticFeedbackType.GestureEnd)
+								}
+							) { change, _ ->
+								val fraction =
+									(change.position.x / size.width.toFloat())
+										.coerceIn(0f, 1f)
+								if (isRemoteActive) {
+									hubManager.actSeek((fraction * durationMs).toLong())
+								} else {
+									player.seek(fraction)
+								}
+								change.consume()
+							}
+						}
+					else Modifier
+				)
+		)
 	}
 }

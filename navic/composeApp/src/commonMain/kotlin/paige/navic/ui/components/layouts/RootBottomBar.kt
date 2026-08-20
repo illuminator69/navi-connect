@@ -4,7 +4,6 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.material3.MaterialTheme
@@ -12,6 +11,7 @@ import androidx.compose.material3.NavigationBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import org.koin.compose.koinInject
@@ -42,10 +42,17 @@ fun RootBottomBar(
 			stiffness = Spring.StiffnessMediumLow
 		)
 	)
-	val shadowFadeProgress by animateFloatAsState(
+	// NOT `by`: this is read in the DRAW phase below, not at composition.
+	//
+	// Read as a plain value here, it recomposed this whole function — mini-player included, and
+	// with Expressive blur on that means rebuilding the pill's blur node — on every frame of a
+	// 600 ms tween, which fires at every scroll start and every scroll stop. `progress` above is
+	// already deferred correctly into its `graphicsLayer` lambdas; this was the one that leaked.
+	val shadowFadeProgress = animateFloatAsState(
 		targetValue = if (scrolled || !shadows) 0f else 1f,
 		animationSpec = tween(durationMillis = 600)
 	)
+	val surfaceColor = MaterialTheme.colorScheme.surface
 	Column(
 		// Frost the backdrop (the screen content marked as the app's blur source) behind the
 		// bar when Expressive blur is on — but ONLY for the docked/full-bleed style. When
@@ -55,9 +62,13 @@ fun RootBottomBar(
 			.then(if (detached) Modifier else Modifier.expressiveBlurEffect(expressiveBlur))
 			.then(
 				if (detached)
-					Modifier.background(
-						Brush.easedVerticalGradient(color = MaterialTheme.colorScheme.surface.copy(alpha = shadowFadeProgress))
-					)
+					Modifier.drawBehind {
+						drawRect(
+							Brush.easedVerticalGradient(
+								color = surfaceColor.copy(alpha = shadowFadeProgress.value)
+							)
+						)
+					}
 				else Modifier
 			)
 	) {

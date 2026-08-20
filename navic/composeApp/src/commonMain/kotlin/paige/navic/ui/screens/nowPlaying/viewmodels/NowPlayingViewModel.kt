@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.koin.core.component.KoinComponent
 import paige.navic.domain.repositories.SongRepository
@@ -22,12 +24,19 @@ class NowPlayingViewModel(
 
 	init {
 		viewModelScope.launch {
-			player.uiState.collect { state ->
-				state.currentSong?.let { song ->
-					_songIsStarred.value = songRepository.isSongStarred(song)
-					_songRating.value = songRepository.getSongRating(song)
+			// Distinct on the song, NOT the whole state: `uiState` re-emits every 200 ms with a
+			// new playhead, and this used to fire two Room queries on each of those — twice a
+			// second's worth of database work forever, to answer a question that can only change
+			// when the track does.
+			player.uiState
+				.map { it.currentSong }
+				.distinctUntilChangedBy { it?.id }
+				.collect { song ->
+					song?.let {
+						_songIsStarred.value = songRepository.isSongStarred(it)
+						_songRating.value = songRepository.getSongRating(it)
+					}
 				}
-			}
 		}
 	}
 

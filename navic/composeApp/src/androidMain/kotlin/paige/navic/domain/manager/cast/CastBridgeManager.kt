@@ -104,7 +104,12 @@ class CastBridgeManager(
 		scope.launch {
 			// Re-evaluate whenever the world changes: a new speaker appears, a speaker moves,
 			// or the hub's device list shifts (which is how "Feishin just quit" reaches us).
-			combine(discovery.devices, hubManager.devices) { found, hubDevices ->
+			// bridgeStateChanged is in the combine deliberately: a bridge whose hub socket just
+			// dropped is a state change nothing else reports, and it is precisely the state the
+			// picker must show honestly. Without it the manager reported BRIDGING off the mere
+			// existence of a bridge object, so a bridge looping on a refused hub connection was
+			// advertised as ready to receive a transfer.
+			combine(discovery.devices, hubManager.devices, bridgeStateChanged) { found, hubDevices, _ ->
 				found to hubDevices
 			}.collect { (found, hubDevices) -> reconcile(found, hubDevices) }
 		}
@@ -163,7 +168,12 @@ class CastBridgeManager(
 					// id, and pinning the first-seen host is how a bridge dials a dead IP forever.
 					existing.updateHost(device.host)
 					existing.friendlyName = device.name
-					states[device.id] = CastBridgeState.BRIDGING
+					// CLAIMING until the hub says welcome. A bridge object that exists proves only
+					// that we intend to bridge this speaker — CastScrobbler gates on BRIDGING to
+					// decide it is the one client responsible for the play, so the difference is
+					// the difference between one scrobble and none.
+					states[device.id] =
+						if (existing.connected.value) CastBridgeState.BRIDGING else CastBridgeState.CLAIMING
 					continue
 				}
 
@@ -254,10 +264,16 @@ class CastBridgeManager(
 				hubUrl = hubUrl,
 				token = token,
 				discovery = discovery,
+				ownerDeviceId = { hubManager.myDeviceId.value },
 				onSuperseded = { onSuperseded(device.id) }
 			)
 			bridges[device.id] = bridge
 			bridge.start()
+			// Nudge reconcile when this bridge's hub link comes up or goes down, so the picker
+			// state above tracks reality instead of intent.
+			scope.launch {
+				bridge.connected.collect { bridgeStateChanged.value = bridgeStateChanged.value + 1 }
+			}
 		}
 	}
 

@@ -16,6 +16,26 @@ import org.koin.compose.koinInject
 import paige.navic.domain.manager.PreferenceManager
 import paige.navic.domain.models.settings.AnimationStyle
 
+/**
+ * Built once, not per composition.
+ *
+ * Every argument is a compile-time constant from [ShapeDefaults], so there was nothing to
+ * recompute — but [Shapes] has identity equality, so allocating a fresh one inside [NavicTheme]
+ * made `MaterialExpressiveTheme` publish a new `LocalShapes` on every recomposition, invalidating
+ * every descendant that reads `MaterialTheme.shapes`. Same reasoning as `typography()`.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+private val NavicShapes = Shapes(
+	extraSmall = ContinuousRoundedRectangle(ShapeDefaults.ExtraSmall.topStart),
+	small = ContinuousRoundedRectangle(ShapeDefaults.Small.topStart),
+	medium = ContinuousRoundedRectangle(ShapeDefaults.Medium.topStart),
+	large = ContinuousRoundedRectangle(ShapeDefaults.Large.topStart),
+	extraLarge = ContinuousRoundedRectangle(ShapeDefaults.ExtraLarge.topStart),
+	largeIncreased = ContinuousRoundedRectangle(ShapeDefaults.LargeIncreased.topStart),
+	extraLargeIncreased = ContinuousRoundedRectangle(ShapeDefaults.ExtraLargeIncreased.topStart),
+	extraExtraLarge = ContinuousRoundedRectangle(ShapeDefaults.ExtraExtraLarge.topStart)
+)
+
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun NavicTheme(
@@ -32,34 +52,32 @@ fun NavicTheme(
 			AnimationStyle.Standard -> MotionScheme.standard()
 		}
 	}
-	MaterialExpressiveTheme(
-		colorScheme = colorScheme
-			?: chosenScheme,
-		motionScheme = motionScheme,
-		typography = typography(),
-		shapes = Shapes(
-			extraSmall = ContinuousRoundedRectangle(ShapeDefaults.ExtraSmall.topStart),
-			small = ContinuousRoundedRectangle(ShapeDefaults.Small.topStart),
-			medium = ContinuousRoundedRectangle(ShapeDefaults.Medium.topStart),
-			large = ContinuousRoundedRectangle(ShapeDefaults.Large.topStart),
-			extraLarge = ContinuousRoundedRectangle(ShapeDefaults.ExtraLarge.topStart),
-			largeIncreased = ContinuousRoundedRectangle(ShapeDefaults.LargeIncreased.topStart),
-			extraLargeIncreased = ContinuousRoundedRectangle(ShapeDefaults.ExtraLargeIncreased.topStart),
-			extraExtraLarge = ContinuousRoundedRectangle(ShapeDefaults.ExtraExtraLarge.topStart)
-		),
-		// When a cover scheme is supplied, also drive the default content colour from
-		// it. MaterialExpressiveTheme only sets the colorScheme, not LocalContentColor,
-		// so text/icons with no explicit colour would otherwise keep the parent
-		// (system) content colour and never adapt to the cover.
-		content = if (colorScheme != null) {
+	// When a cover scheme is supplied, also drive the default content colour from
+	// it. MaterialExpressiveTheme only sets the colorScheme, not LocalContentColor,
+	// so text/icons with no explicit colour would otherwise keep the parent
+	// (system) content colour and never adapt to the cover.
+	//
+	// Remembered so the wrapper isn't a fresh lambda every pass — a new `content` value is by
+	// itself enough to stop MaterialExpressiveTheme skipping.
+	val themedContent: @Composable () -> Unit = if (colorScheme != null) {
+		remember(colorScheme, contentColor, content) {
 			{
 				CompositionLocalProvider(
 					LocalContentColor provides (contentColor ?: colorScheme.onSurface),
 					content = content
 				)
 			}
-		} else {
-			content
 		}
+	} else {
+		content
+	}
+
+	MaterialExpressiveTheme(
+		colorScheme = colorScheme
+			?: chosenScheme,
+		motionScheme = motionScheme,
+		typography = typography(),
+		shapes = NavicShapes,
+		content = themedContent
 	)
 }

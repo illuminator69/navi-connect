@@ -20,7 +20,10 @@ import kotlin.time.Duration.Companion.seconds
 @Composable
 fun NowPlayingDurationsRow() {
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsState()
+	// Draws the elapsed time, so it takes the narrow [progress] flow; everything else it reads
+	// comes off steadyState, which no longer emits on a playhead tick.
+	val playerState by player.steadyState.collectAsState()
+	val progress by player.progress.collectAsState()
 	val duration = playerState.currentSong?.duration
 	val style = MaterialTheme.typography.bodyMedium
 		.copy(
@@ -40,7 +43,7 @@ fun NowPlayingDurationsRow() {
 			}
 			duration != null -> {
 				Text(
-					text = ((duration.inWholeSeconds * playerState.progress).toDouble().seconds).toHoursMinutesSeconds(),
+					text = ((duration.inWholeSeconds * progress).toDouble().seconds).toHoursMinutesSeconds(),
 					color = color, style = style
 				)
 				Spacer(Modifier.weight(1f))

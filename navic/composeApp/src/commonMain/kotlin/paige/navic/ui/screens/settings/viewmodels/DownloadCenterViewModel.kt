@@ -13,6 +13,7 @@ import paige.navic.data.database.entities.DownloadEntity
 import paige.navic.data.database.entities.DownloadStatus
 import paige.navic.data.database.mappers.toDomainModel
 import paige.navic.domain.manager.DownloadManager
+import paige.navic.domain.manager.LbBotManager
 import paige.navic.domain.manager.PreferenceManager
 import paige.navic.domain.models.DomainSong
 
@@ -45,8 +46,43 @@ data class DownloadSettings(
 class DownloadCenterViewModel(
 	private val downloadManager: DownloadManager,
 	private val songDao: SongDao,
-	private val preferenceManager: PreferenceManager
+	private val preferenceManager: PreferenceManager,
+	private val lbBotManager: LbBotManager
 ) : ViewModel() {
+
+	/**
+	 * Albums being acquired from Soulseek, and the ones that have finished trying.
+	 *
+	 * A different kind of thing from the sections below — those are files this app is
+	 * fetching from Navidrome, this is lb-bot fetching a record the library never had —
+	 * but the same question ("what is downloading, and what went wrong?"), and this was
+	 * the only screen in the app that could answer it for one of them. Until now a fill
+	 * was visible solely from the artist page that started it.
+	 *
+	 * Empty whenever lb-bot is unconfigured, which is also how the section stays hidden:
+	 * nothing can ever have been started.
+	 */
+	val fills = lbBotManager.ledger
+
+	/**
+	 * Re-issue a fill. Never automatic — lb-bot walks its whole ranked source list before
+	 * reporting failure, so an unattended retry re-runs the identical search; the user
+	 * asking again is the new information.
+	 */
+	fun retryFill(key: String) {
+		viewModelScope.launch { lbBotManager.retry(key) }
+	}
+
+	/** Widen this one album's search to include mp3, then try again. Offered only when
+	 *  lb-bot said the search rejected mp3s and would otherwise have found something. */
+	fun allowMp3AndRetry(entry: paige.navic.domain.manager.LbFillEntry) {
+		viewModelScope.launch {
+			if (entry.groupId.isNotBlank()) lbBotManager.allowMp3(entry.groupId, allow = true)
+			lbBotManager.retry(entry.key)
+		}
+	}
+
+	fun dismissFill(key: String) = lbBotManager.dismiss(key)
 
 	private val _state = MutableStateFlow(DownloadCenterState())
 	val state = _state.asStateFlow()

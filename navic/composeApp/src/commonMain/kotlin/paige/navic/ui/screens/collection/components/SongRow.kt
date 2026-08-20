@@ -68,7 +68,9 @@ fun CollectionDetailScreenSongRow(
 	isOffline: Boolean = false
 ) {
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	// steadyState, not uiState — see the note on the common SongRow: one collector per visible
+	// row, none of which draws the playhead.
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 
 	val isDownloaded = download?.status == DownloadStatus.DOWNLOADED
 	val isCurrentTrack = playerState.currentSong?.id == song.id

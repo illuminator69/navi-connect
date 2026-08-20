@@ -30,6 +30,18 @@ private const val REQUERY_FAST_MS = 3_000L
 private const val REQUERY_FAST_TRIES = 10
 private const val REQUERY_SLOW_MS = 60_000L
 
+/**
+ * How long a speaker stays in the list after it was last announced.
+ *
+ * There is no removal path worth relying on. `onServiceLost` only fires from a live listener, and
+ * every loss emitted while a listener is being torn down is discarded on purpose (see
+ * [CastDiscovery.endDiscovery]) — otherwise the 60 s re-query ladder wiped the picker every minute.
+ * The result was a list that only ever grew: a speaker seen once on a friend's Wi-Fi stayed in it
+ * for the life of the process. Generous on purpose — a Chromecast announces every couple of
+ * minutes and we re-query every 60 s, so ten minutes of total silence really does mean gone.
+ */
+private const val DEVICE_TTL_MS = 10 * 60 * 1_000L
+
 /** A Chromecast seen on the LAN. [id] is the mDNS TXT `id`, stable across address changes. */
 data class DiscoveredCast(
 	val id: String,
@@ -70,6 +82,9 @@ class CastDiscovery(private val context: Context) {
 
 	private var listener: NsdManager.DiscoveryListener? = null
 	private var requeryJob: Job? = null
+
+	/** deviceId → epoch ms of the last announcement. Drives [expireStaleDevices]. */
+	private val lastSeen = mutableMapOf<String, Long>()
 
 	/**
 	 * Resolves must be serialised. Below API 34 a second `resolveService` while one is in flight
@@ -122,7 +137,21 @@ class CastDiscovery(private val context: Context) {
 	 */
 	private fun restartDiscovery() {
 		endDiscovery()
+		expireStaleDevices()
 		if (_running.value) beginDiscovery()
+	}
+
+	/** Drop speakers nothing has announced for [DEVICE_TTL_MS]. */
+	private fun expireStaleDevices() {
+		val cutoff = System.currentTimeMillis() - DEVICE_TTL_MS
+		val stale = _devices.value.filter { (lastSeen[it.id] ?: 0L) < cutoff }
+		if (stale.isEmpty()) return
+		stale.forEach {
+			Logger.i(TAG, "${it.name}: not announced for ${DEVICE_TTL_MS / 60_000} min — forgetting it")
+			lastSeen.remove(it.id)
+		}
+		val goneIds = stale.map { it.id }.toSet()
+		_devices.value = _devices.value.filterNot { it.id in goneIds }
 	}
 
 	private fun beginDiscovery() {
@@ -219,6 +248,7 @@ class CastDiscovery(private val context: Context) {
 	 * is how a bridge ends up dialling a dead IP forever.
 	 */
 	private fun upsert(device: DiscoveredCast) {
+		lastSeen[device.id] = System.currentTimeMillis()
 		val current = _devices.value
 		val existing = current.firstOrNull { it.id == device.id }
 		if (existing == device) return

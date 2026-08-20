@@ -7,6 +7,7 @@ import android.os.Build
 import android.view.SoundEffectConstants
 import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -82,8 +83,16 @@ actual fun rememberPlatformContext(): PlatformContext {
 				context.packageManager
 					.getPackageInfo(context.packageName, 0)
 					.versionName.toString()
-			override val colorScheme
-				get() = if (Build.VERSION.SDK_INT >= 31)
+			// A `val`, NOT a `get()`. Building this resolves ~49 Android system colour
+			// resources and returns a fresh ColorScheme — and ColorScheme has identity
+			// equality, so as a getter every read handed MaterialExpressiveTheme a
+			// different instance and invalidated every descendant reading
+			// MaterialTheme.colorScheme. NavicTheme reads it on each recomposition, so
+			// that was the whole app, on every navigation. The enclosing object is
+			// already remembered on [isDark], which is this value's only input, so
+			// computing it once here is exactly as correct and vastly cheaper.
+			override val colorScheme: ColorScheme =
+				if (Build.VERSION.SDK_INT >= 31)
 					if (isDark)
 						dynamicDarkColorScheme(context)
 					else dynamicLightColorScheme(context)

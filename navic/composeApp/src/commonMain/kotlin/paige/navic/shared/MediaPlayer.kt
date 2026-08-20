@@ -2,6 +2,7 @@ package paige.navic.shared
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -10,6 +11,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -224,6 +228,40 @@ abstract class MediaPlayerViewModel(
 	/** What the UI observes: the remote session when active, else local. */
 	val uiState: StateFlow<PlayerUiState> =
 		combine(_uiState, _remoteState) { local, remote -> remote ?: local }
+			.stateIn(viewModelScope, SharingStarted.Eagerly, PlayerUiState())
+
+	/**
+	 * The playhead on its own — for the handful of things that actually DRAW it.
+	 *
+	 * [uiState] carries `progress` in the same object as `queue`/`currentSong`, and the playhead is
+	 * re-stamped every 200 ms locally (the progress job) / 250 ms remotely (the hub mirror). So
+	 * every collector of [uiState] used to recompose ~5x a second for the whole of playback, even
+	 * ones that only read the current song's id. Read this instead of `uiState.progress`, and
+	 * [steadyState] for everything else.
+	 */
+	val progress: StateFlow<Float> =
+		uiState
+			.map { it.progress }
+			.distinctUntilChanged()
+			.stateIn(viewModelScope, SharingStarted.Eagerly, 0f)
+
+	/**
+	 * [uiState] with the playhead zeroed, so a progress tick alone no longer emits.
+	 *
+	 * Deliberately the SAME type as [uiState] with the same field names: every collector that
+	 * doesn't draw the playhead swaps one for the other and needs no other change. `progress` reads
+	 * 0f here — that is the point, not an oversight; anything needing the real value takes
+	 * [progress].
+	 *
+	 * The `distinctUntilChanged` walks the queue via structural equality, so it runs on
+	 * [Dispatchers.Default] rather than the main thread it would otherwise inherit from
+	 * `viewModelScope`.
+	 */
+	val steadyState: StateFlow<PlayerUiState> =
+		uiState
+			.map { it.copy(progress = 0f) }
+			.distinctUntilChanged()
+			.flowOn(Dispatchers.Default)
 			.stateIn(viewModelScope, SharingStarted.Eagerly, PlayerUiState())
 
 	protected fun isAvailable(songId: String): Boolean {

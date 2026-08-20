@@ -159,7 +159,7 @@ class NowPlayingSceneStrategy<T : Any> : SceneStrategy<T> {
 @Composable
 private fun colorSchemeForCurrentSong(): ColorScheme {
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 	return rememberCoverColorScheme(
 		coverArtId = playerState.currentSong?.coverArtId,
 		isDark = true,

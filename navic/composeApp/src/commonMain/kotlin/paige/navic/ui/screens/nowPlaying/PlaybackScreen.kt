@@ -36,7 +36,7 @@ fun PlaybackSpeedScreen() {
 	val player = koinInject<MediaPlayerViewModel>()
 	val lazyListState = rememberLazyListState()
 	val haptic = LocalHapticFeedback.current
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 
 	val draggableState = rememberDraggableListState(lazyListState) { from, to ->
 		player.moveQueueItem(from, to)

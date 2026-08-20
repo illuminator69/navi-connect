@@ -4,7 +4,9 @@ import androidx.compose.foundation.ScrollState
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -308,10 +310,18 @@ class ArtistDetailViewModel(
 		}
 	}
 
-	private fun buildSections(
+	/**
+	 * Pure list-crunching, so it runs on [Dispatchers.Default].
+	 *
+	 * `viewModelScope` dispatches on `Main.immediate`, so without this the whole matching pass —
+	 * two maps over every lb-bot release, a pass over every owned album, then a groupBy and a sort
+	 * per section — ran on the UI thread, landing precisely as the discography painted. A prolific
+	 * artist with a large lb-bot index is where that was felt.
+	 */
+	private suspend fun buildSections(
 		albums: List<DomainAlbum>,
 		releases: List<LbRelease>
-	): List<DiscographySection> {
+	): List<DiscographySection> = withContext(Dispatchers.Default) {
 		val claimedRelease = mutableMapOf<String, LbRelease>()
 		val usedRgids = mutableSetOf<String>()
 
@@ -362,7 +372,7 @@ class ArtistDetailViewModel(
 				)
 			}
 
-		return (owned + absent)
+		(owned + absent)
 			.groupBy { sectionType(it) }
 			.map { (type, entries) ->
 				DiscographySection(

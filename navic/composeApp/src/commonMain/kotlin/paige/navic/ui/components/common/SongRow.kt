@@ -68,7 +68,10 @@ fun SongRow(
 	val preferenceManager = koinInject<PreferenceManager>()
 	val player = koinInject<MediaPlayerViewModel>()
 	val radioManager = koinInject<RadioManager>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	// steadyState, not uiState: this row is rendered once per visible song in every list in the
+	// app, and only reads currentSong/isPaused — collecting the playhead too would recompose all
+	// of them ~5x a second for the whole of playback.
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 	val sonicAvailable by radioManager.sonicSimilarityAvailable.collectAsStateWithLifecycle()
 
 	val backStack = LocalNavStack.current

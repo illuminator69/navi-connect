@@ -125,7 +125,7 @@ fun ArtistDetailScreen(
 	)
 	val platformContext = LocalPlatformContext.current
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 
 	val selection by viewModel.selectedSong.collectAsStateWithLifecycle()
 	val selectedSongIsStarred by viewModel.selectedSongIsStarred.collectAsStateWithLifecycle()
@@ -426,15 +426,19 @@ fun ArtistDetailScreen(
 							// better of the two — but without lb-bot the page has to
 							// look exactly as it always has.
 							val hasDiscography = discography.available && discography.indexed
-							ArtCarousel(
-								stringResource(Res.string.title_albums),
+							val carouselAlbums = remember(state.albums, hasDiscography) {
 								if (hasDiscography) persistentListOf()
 								else state.albums.sortedByDescending { album -> album.playCount }
 									.toImmutableList()
+							}
+							ArtCarousel(
+								stringResource(Res.string.title_albums),
+								carouselAlbums
 							) { album ->
-								val albumDownloadStatus by downloadManager
-									.getCollectionDownloadStatus(album.songs.map { it.id })
-									.collectAsState(initial = DownloadStatus.NOT_DOWNLOADED)
+								// (There was a `getCollectionDownloadStatus` collect here whose
+								// result nothing read. Each visible tile was building a fresh flow
+								// over the whole downloads table, re-filtering it on every
+								// recomposition, and throwing the answer away.)
 								ArtCarouselItem(
 									coverArtId = album.coverArtId, 
 									title = album.name, 
@@ -513,8 +517,13 @@ fun ArtistDetailScreen(
 	// time. Keeping the sheet inside either would tie it to whichever row happened
 	// to be showing.
 	selectedAlbum?.let { album ->
-		val albumDownloadStatus by downloadManager
-			.getCollectionDownloadStatus(album.songs.map { it.id })
+		// Remembered on the album: `getCollectionDownloadStatus` builds a new flow over the
+		// app-wide downloads list each call, so an unremembered one re-subscribed and re-filtered
+		// on every recomposition of this sheet.
+		val albumDownloadFlow = remember(album.id) {
+			downloadManager.getCollectionDownloadStatus(album.songs.map { it.id })
+		}
+		val albumDownloadStatus by albumDownloadFlow
 			.collectAsState(initial = DownloadStatus.NOT_DOWNLOADED)
 		// Filling gaps is offered only when lb-bot actually has a group for this
 		// album — the sheet hides the row when these are null, like every other

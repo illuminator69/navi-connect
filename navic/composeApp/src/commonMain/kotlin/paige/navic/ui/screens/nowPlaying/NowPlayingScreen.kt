@@ -85,7 +85,7 @@ fun NowPlayingScreen() {
 	// The player UI mirrors the remote session directly when another
 	// navi-connect device is active (MediaPlayerViewModel.uiState blends it in),
 	// so this screen no longer needs to minimize itself on a handoff.
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 	val song = playerState.currentSong
 
 	val viewModel = koinViewModel<NowPlayingViewModel> { parametersOf(player) }

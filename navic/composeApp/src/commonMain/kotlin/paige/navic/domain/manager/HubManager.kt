@@ -53,10 +53,28 @@ data class HubDevice(
 	val id: String,
 	val name: String,
 	val platform: String,
+	/**
+	 * A socket claiming this id is attached to the hub.
+	 *
+	 * For a bridged Chromecast that is the *bridging client's* socket, which lives on some other
+	 * phone or desktop — it says nothing about whether the speaker is powered on or even on the
+	 * same continent. See [reachable]; PROTOCOL §3.2.
+	 */
 	val online: Boolean,
 	val isActive: Boolean,
-	val volume: Int
-)
+	val volume: Int,
+	/**
+	 * The bridge's verdict on the hardware: true reached recently, false connected-but-silent,
+	 * null unknown or not applicable — which is every ordinary client, since a client is its own
+	 * hardware and its socket already proves it.
+	 */
+	val reachable: Boolean? = null,
+	/** For a virtual device, the hub id of the client bridging it. */
+	val bridgedBy: String? = null
+) {
+	/** Can the session be handed here right now? Unknown reachability is permissive. */
+	val transferable: Boolean get() = online && reachable != false
+}
 
 data class RemoteTrack(
 	val id: String,
@@ -613,6 +631,10 @@ class HubManager(
 					putJsonArray("caps") {
 						add("receiver")
 						add("controller")
+						// PROTOCOL §7.1: we answer every transfer's do:load with a `loaded` frame,
+						// so a transfer here that can't start hands the session back instead of
+						// reading as playing on every device.
+						add("loadAck")
 					}
 				}
 			})
@@ -934,7 +956,13 @@ class HubManager(
 				val code = msg["code"]?.jsonPrimitive?.content
 				val message = msg["message"]?.jsonPrimitive?.content
 				Logger.e("HubManager", "hub error: $code $message")
-				_connectionError.value = message ?: code
+				_connectionError.value = when (code) {
+					// Both mean "the transfer you just asked for did not happen" — say which,
+					// because the two have different fixes (turn the speaker on vs. try again).
+					"target_unreachable" -> message ?: "That device isn't responding"
+					"load_failed" -> message ?: "That device could not start playback"
+					else -> message ?: code
+				}
 				// A bad token never resolves by retrying — stop the reconnect loop.
 				if (code == "auth") authFailed = true
 			}
@@ -1041,9 +1069,20 @@ class HubManager(
 				platform = d["platform"]?.jsonPrimitive?.content ?: "unknown",
 				online = d["online"]?.jsonPrimitive?.booleanOrNull ?: false,
 				isActive = d["isActive"]?.jsonPrimitive?.booleanOrNull ?: false,
-				volume = d["volume"]?.jsonPrimitive?.intOrNull ?: 100
+				volume = d["volume"]?.jsonPrimitive?.intOrNull ?: 100,
+				reachable = d["reachable"]?.jsonPrimitive?.booleanOrNull,
+				bridgedBy = d["bridgedBy"]?.jsonPrimitive?.contentOrNullSafe()
 			)
 		}
+	}
+
+	/** Acknowledge a transfer's `do:load` — see PROTOCOL §7.1. */
+	private suspend fun sendLoaded(ok: Boolean, error: String?) {
+		sendAsync(buildJsonObject {
+			put("t", "loaded")
+			put("ok", ok)
+			if (error != null) put("error", error)
+		})
 	}
 
 	private suspend fun handleDo(msg: JsonObject) {
@@ -1057,6 +1096,10 @@ class HubManager(
 				val songs = resolveQueue(tracks)
 				if (songs.isEmpty()) {
 					Logger.e("HubManager", "do:load — empty track list")
+					// PROTOCOL §7.1: the hub commits the active slot before sending this load, so
+					// staying silent would leave the whole stack believing this device took a
+					// session it cannot play a note of.
+					sendLoaded(false, "nothing in the queue resolved")
 					return
 				}
 				val index = msg["index"]?.jsonPrimitive?.intOrNull ?: 0
@@ -1064,6 +1107,7 @@ class HubManager(
 				val play = msg["play"]?.jsonPrimitive?.booleanOrNull ?: true
 				lastQueueSig = songs.joinToString(",") { it.id }
 				mediaPlayer.loadRemoteQueue(songs, index, positionMs, play)
+				sendLoaded(true, null)
 			}
 
 			"play" -> mediaPlayer.resume()

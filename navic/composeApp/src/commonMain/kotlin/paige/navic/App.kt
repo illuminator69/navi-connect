@@ -29,6 +29,7 @@ import androidx.compose.material3.adaptive.navigation3.rememberListDetailSceneSt
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -55,9 +56,14 @@ import coil3.compose.setSingletonImageLoaderFactory
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.modules.SerializersModule
 import kotlinx.serialization.modules.polymorphic
+import navic.composeapp.generated.resources.Res
+import navic.composeapp.generated.resources.lbbot_fill_landed
+import navic.composeapp.generated.resources.lbbot_fill_lost
+import org.jetbrains.compose.resources.stringResource
 import org.koin.compose.koinInject
 import paige.navic.di.initializeSingletonImageLoader
 import paige.navic.domain.manager.BottomBarScrollManager
+import paige.navic.domain.manager.LbBotManager
 import paige.navic.domain.manager.PreferenceManager
 import paige.navic.domain.manager.SessionManager
 import paige.navic.shared.MediaPlayerViewModel
@@ -184,6 +190,54 @@ fun App() {
 	// chooser on every launch, which grants nothing. No-op once granted.
 	LaunchedEffect(Unit) { platformContext.checkLocalNetworkPermission() }
 
+	// The nav graph, built once rather than on every navigation.
+	//
+	// `entryProvider` needs to know whether we're on a root tab (it picks a different transition
+	// for those), and it used to read `backStack.size` itself — but that read happens DURING App's
+	// composition, so it subscribed App to the backstack and every push/pop recomposed the whole
+	// of App: rebuilding all ~50 entries, handing NavDisplay a brand-new lambda it therefore
+	// couldn't skip, and re-running NavicTheme over the entire tree — all while the 450 ms
+	// SharedXAxis transition was animating. Behind `derivedStateOf`, App is invalidated only when
+	// the root/non-root boundary is actually crossed.
+	val isRoot by remember(backStack) { derivedStateOf { backStack.size == 1 } }
+	val entries = remember(backStack, isRoot) { entryProvider(isRoot) }
+
+	// The individual strategies were already remembered; the enclosing list was not, so
+	// NavDisplay still received a new `sceneStrategies` value on every pass.
+	val nowPlayingScene = remember { NowPlayingSceneStrategy<NavKey>() }
+	val bottomSheetScene = remember { BottomSheetSceneStrategy<NavKey>() }
+	val listDetailScene = rememberListDetailSceneStrategy<NavKey>()
+	val sceneStrategies = remember(nowPlayingScene, bottomSheetScene, listDetailScene) {
+		listOf(nowPlayingScene, bottomSheetScene, listDetailScene)
+	}
+
+
+	// Announce a fill landing (or failing) wherever the user happens to be.
+	//
+	// Collected here rather than in the sheet that started it: a fill takes minutes and
+	// routinely outlives that sheet, the artist page and the process. The manager emits
+	// exactly once per fill, from `settle`, so however many screens are watching there is
+	// only ever one snackbar. The system-notification half lives in androidMain — it needs
+	// a runtime permission, and commonMain still has to compile for iOS.
+	val lbBot = koinInject<LbBotManager>()
+	val fillLanded = stringResource(Res.string.lbbot_fill_landed)
+	val fillLost = stringResource(Res.string.lbbot_fill_lost)
+	LaunchedEffect(Unit) {
+		lbBot.fillEvents.collect { event ->
+			val name = event.album.ifBlank { event.artist }.ifBlank { return@collect }
+			// Only the two outcomes worth interrupting for. `needs_pick` is the picker
+			// waiting on the user and `cancelled` is something they just did, both of
+			// which announce themselves; `gave_up` means we stopped looking, not that
+			// anything happened.
+			val message = when (event.outcome) {
+				LbBotManager.OUTCOME_DONE -> fillLanded.replace("%1\$s", name)
+				LbBotManager.OUTCOME_FAILED -> fillLost.replace("%1\$s", name)
+				else -> return@collect
+			}
+			snackbarState.showSnackbar(message)
+		}
+	}
+
 	// A screen requested from outside the composition (a Quick Picks widget tile). Held until
 	// there is a signed-in session to show it in — a cold start from the widget composes this
 	// before the session restores, and pushing the album over the login screen would strand it.
@@ -228,17 +282,13 @@ fun App() {
 							.background(rememberLibraryTabBackground())
 							.expressiveBlurSource(expressiveBlur),
 						backStack = backStack,
-						sceneStrategies = listOf(
-							remember { NowPlayingSceneStrategy() },
-							remember { BottomSheetSceneStrategy() },
-							rememberListDetailSceneStrategy()
-						),
+						sceneStrategies = sceneStrategies,
 						onBack = {
 							if (backStack.isNotEmpty()) {
 								backStack.removeLastOrNull()
 							}
 						},
-						entryProvider = entryProvider(backStack),
+						entryProvider = entries,
 						transitionSpec = {
 							Material3Transitions.SharedXAxisEnterTransition(
 								density
@@ -280,9 +330,9 @@ fun App() {
 
 @OptIn(ExperimentalMaterial3AdaptiveApi::class, ExperimentalMaterial3Api::class)
 private fun entryProvider(
-	backStack: NavBackStack<NavKey>
+	isRoot: Boolean
 ): (NavKey) -> (NavEntry<NavKey>) {
-	val navtabMetadata = if (backStack.size == 1)
+	val navtabMetadata = if (isRoot)
 		listPane("root") + transitionSpec {
 			ContentTransform(fadeIn(), fadeOut())
 		} + popTransitionSpec {
@@ -330,7 +380,7 @@ private fun entryProvider(
 		}
 		entry<Screen.Lyrics>(metadata = NowPlayingSceneStrategy.bottomSheet(isTransparent = true)) {
 			val player = koinInject<MediaPlayerViewModel>()
-			val playerState by player.uiState.collectAsState()
+			val playerState by player.steadyState.collectAsState()
 			val song = playerState.currentSong
 			LyricsScreen(song)
 		}

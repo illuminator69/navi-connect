@@ -31,13 +31,27 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import navic.composeapp.generated.resources.Res
+import navic.composeapp.generated.resources.action_allow_mp3_retry
 import navic.composeapp.generated.resources.action_cancel_all
 import navic.composeapp.generated.resources.action_cancel_download
 import navic.composeapp.generated.resources.action_clear_failed
 import navic.composeapp.generated.resources.action_delete_download
+import navic.composeapp.generated.resources.action_dismiss
 import navic.composeapp.generated.resources.action_repair_downloads
 import navic.composeapp.generated.resources.action_retry
 import navic.composeapp.generated.resources.action_retry_all
+import navic.composeapp.generated.resources.lbbot_fill_cancelled
+import navic.composeapp.generated.resources.lbbot_fill_downloading
+import navic.composeapp.generated.resources.lbbot_fill_failed
+import navic.composeapp.generated.resources.lbbot_fill_gave_up
+import navic.composeapp.generated.resources.lbbot_fill_needs_match
+import navic.composeapp.generated.resources.lbbot_fill_needs_pick
+import navic.composeapp.generated.resources.lbbot_fill_placed
+import navic.composeapp.generated.resources.lbbot_fill_placing
+import navic.composeapp.generated.resources.lbbot_fill_queued
+import navic.composeapp.generated.resources.lbbot_fill_searching
+import navic.composeapp.generated.resources.lbbot_fill_verified
+import navic.composeapp.generated.resources.section_lbbot_fills
 import navic.composeapp.generated.resources.banner_downloads_waiting
 import navic.composeapp.generated.resources.section_download_settings
 import navic.composeapp.generated.resources.setting_download_charging_only
@@ -62,6 +76,8 @@ import org.jetbrains.compose.resources.stringResource
 import org.koin.compose.viewmodel.koinViewModel
 import androidx.compose.ui.graphics.vector.ImageVector
 import paige.navic.data.database.entities.DownloadSource
+import paige.navic.domain.manager.LbBotManager
+import paige.navic.domain.manager.LbFillEntry
 import paige.navic.icons.Icons
 import paige.navic.icons.outlined.Delete
 import paige.navic.icons.outlined.Queue
@@ -69,6 +85,7 @@ import paige.navic.ui.components.common.ContentUnavailable
 import paige.navic.ui.components.common.Form
 import paige.navic.ui.components.common.FormRow
 import paige.navic.ui.components.common.FormTitle
+import paige.navic.ui.components.common.RemoteCoverArt
 import paige.navic.ui.components.layouts.NestedTopBar
 import paige.navic.ui.screens.settings.viewmodels.DownloadCenterItem
 import paige.navic.ui.screens.settings.viewmodels.DownloadCenterViewModel
@@ -84,6 +101,7 @@ fun DownloadCenterScreen() {
 	val state by viewModel.state.collectAsStateWithLifecycle()
 	val settings by viewModel.settings.collectAsStateWithLifecycle()
 	val constrained by viewModel.constrained.collectAsStateWithLifecycle()
+	val fills by viewModel.fills.collectAsStateWithLifecycle()
 
 	Scaffold(
 		topBar = {
@@ -125,8 +143,29 @@ fun DownloadCenterScreen() {
 					ConstrainedBanner()
 				}
 
+				// Above the offline sections, and separate from them: these are albums
+				// lb-bot is acquiring from Soulseek, not files being cached for offline
+				// playback. Empty whenever lb-bot is unconfigured, since nothing can then
+				// ever have been started — which is also how the section stays hidden.
+				if (fills.isNotEmpty()) {
+					SectionHeader(
+						title = stringResource(Res.string.section_lbbot_fills),
+						count = fills.size
+					)
+					Form {
+						fills.forEach { fill ->
+							FillRow(
+								fill = fill,
+								onRetry = { viewModel.retryFill(fill.key) },
+								onAllowMp3 = { viewModel.allowMp3AndRetry(fill) },
+								onDismiss = { viewModel.dismissFill(fill.key) }
+							)
+						}
+					}
+				}
+
 				val isEmpty = state.active.isEmpty() && state.queued.isEmpty() &&
-					state.failed.isEmpty() && state.completed.isEmpty()
+					state.failed.isEmpty() && state.completed.isEmpty() && fills.isEmpty()
 
 				if (isEmpty) {
 					ContentUnavailable(
@@ -396,6 +435,123 @@ private fun DownloadRow(
 			}
 		}
 	}
+}
+
+/**
+ * One album lb-bot is fetching, or has finished trying to fetch.
+ *
+ * Not [DownloadRow]: that one is built around a `DownloadCenterItem` — a song row with a
+ * cached file behind it — and these have no song, no file and no local id. What they have
+ * instead is a release-group, cover art from the Cover Art Archive (lb-bot's own cover
+ * route serves Navidrome art keyed by a Navidrome album id, which a release the library
+ * lacks does not have), and lb-bot's own sentence for why it failed.
+ */
+@Composable
+private fun FillRow(
+	fill: LbFillEntry,
+	onRetry: () -> Unit,
+	onAllowMp3: () -> Unit,
+	onDismiss: () -> Unit
+) {
+	FormRow {
+		RemoteCoverArt(
+			url = fill.coverUrl,
+			modifier = Modifier.size(44.dp).padding(end = 12.dp),
+			contentDescription = null
+		)
+		Column(Modifier.weight(1f)) {
+			Text(
+				text = fill.album.ifBlank { fill.artist }.ifBlank { fill.key },
+				maxLines = 1,
+				overflow = TextOverflow.Ellipsis
+			)
+			val failed = fill.settled && !fill.succeeded
+			Text(
+				text = fillStateLabel(fill),
+				style = MaterialTheme.typography.bodyMedium,
+				color = if (failed) MaterialTheme.colorScheme.error
+				else MaterialTheme.colorScheme.onSurfaceVariant,
+				maxLines = 1,
+				overflow = TextOverflow.Ellipsis
+			)
+			// lb-bot's reason, verbatim. It is the only thing that distinguishes "no peer
+			// had it" from "every source was rejected for format" — and the second of
+			// those is what the Allow MP3 button below is for.
+			if (failed && fill.reason.isNotBlank()) {
+				Text(
+					text = fill.reason,
+					style = MaterialTheme.typography.bodySmall,
+					color = MaterialTheme.colorScheme.onSurfaceVariant,
+					maxLines = 3,
+					overflow = TextOverflow.Ellipsis
+				)
+			}
+			if (fill.isRunning) {
+				// Determinate only once lb-bot is counting transfers; before that it is
+				// searching, and a bar sitting at zero reads as a stall.
+				if (fill.total > 0) {
+					LinearProgressIndicator(
+						progress = { fill.percent / 100f },
+						modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+					)
+				} else {
+					LinearProgressIndicator(
+						modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+					)
+				}
+			}
+		}
+
+		if (fill.settled) {
+			Row(verticalAlignment = Alignment.CenterVertically) {
+				if (!fill.succeeded) {
+					if (fill.mp3WouldHelp && fill.groupId.isNotBlank()) {
+						TextButton(onClick = onAllowMp3) {
+							Text(stringResource(Res.string.action_allow_mp3_retry))
+						}
+					}
+					TextButton(onClick = onRetry) {
+						Text(stringResource(Res.string.action_retry))
+					}
+				}
+				IconButton(onClick = onDismiss) {
+					Icon(
+						Icons.Outlined.Delete,
+						contentDescription = stringResource(Res.string.action_dismiss),
+						modifier = Modifier.size(20.dp)
+					)
+				}
+			}
+		}
+	}
+}
+
+/**
+ * What a fill is doing, in the user's terms rather than lb-bot's.
+ *
+ * The outcome is checked before the state because a settled row's last state is not the
+ * whole story: a fill given up on still reads `unknown`, and a cancelled one keeps
+ * whatever it was doing when it was cancelled.
+ */
+@Composable
+private fun fillStateLabel(fill: LbFillEntry): String = when {
+	fill.settled -> when (fill.outcome) {
+		LbBotManager.OUTCOME_DONE -> stringResource(Res.string.lbbot_fill_verified)
+		LbBotManager.OUTCOME_CANCELLED -> stringResource(Res.string.lbbot_fill_cancelled)
+		LbBotManager.OUTCOME_NEEDS_PICK -> stringResource(Res.string.lbbot_fill_needs_pick)
+		LbBotManager.OUTCOME_GAVE_UP -> stringResource(Res.string.lbbot_fill_gave_up)
+		else -> if (fill.state == "needs_match")
+			stringResource(Res.string.lbbot_fill_needs_match)
+		else stringResource(Res.string.lbbot_fill_failed)
+	}
+	fill.state == "downloading" && fill.total > 0 ->
+		stringResource(Res.string.lbbot_fill_downloading, fill.done, fill.total)
+	fill.state == "queued" -> stringResource(Res.string.lbbot_fill_queued)
+	fill.state == "placing" -> stringResource(Res.string.lbbot_fill_placing)
+	fill.state == "placed" -> stringResource(Res.string.lbbot_fill_placed)
+	// `searching` and the ambiguous `unknown` — which for a live row means lb-bot's
+	// worker has not written its first ledger row yet — read the same to the user.
+	else -> stringResource(Res.string.lbbot_fill_searching)
 }
 
 /** Human label for a download's [DownloadSource]; unknown values fall back to the raw string. */

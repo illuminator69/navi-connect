@@ -27,7 +27,7 @@ fun NowPlayingTechnicalInfoRow() {
 	val preferenceManager = koinInject<PreferenceManager>()
 	val connectivityManager = koinInject<ConnectivityManager>()
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 	val song = playerState.currentSong
 
 	val style = MaterialTheme.typography.bodySmall

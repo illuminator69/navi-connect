@@ -26,7 +26,7 @@ fun NowPlayingStarButton(
 ) {
 	val platformContext = LocalPlatformContext.current
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 	IconButton(
 		onClick = {
 			platformContext.clickSound()

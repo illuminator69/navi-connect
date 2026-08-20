@@ -34,11 +34,13 @@ import com.kmpalette.loader.rememberNetworkLoader
 import com.kmpalette.palette.graphics.Palette
 import com.kmpalette.palette.graphics.Palette.Swatch
 import com.materialkolor.PaletteStyle
+import com.materialkolor.dynamicColorScheme
 import com.materialkolor.dynamiccolor.ColorSpec
-import com.materialkolor.rememberDynamicColorScheme
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.http.Url
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import org.koin.compose.koinInject
@@ -84,6 +86,34 @@ private val paletteCache = object {
 	operator fun set(id: String, palette: Palette) {
 		entries[id] = palette
 		while (entries.size > PALETTE_CACHE_MAX) {
+			entries.remove(entries.keys.first())
+		}
+	}
+}
+
+/**
+ * Derived Material schemes, keyed by the inputs that produce them.
+ *
+ * [paletteCache] above stops the artwork being re-downloaded and re-quantised, but the step AFTER
+ * it — materialKolor's HCT/CAM16 derivation of ~30 colour roles from the seed — is a `remember`
+ * inside `rememberDynamicColorScheme`, so it dies with the composition that made it. That matters
+ * because `RootBottomBar` (and so the mini-player, which reads the now-playing cover) is built
+ * fresh inside EVERY screen's own Scaffold: navigating anywhere tore its composition down and paid
+ * for the whole derivation again on the UI thread, mid-transition, for a song that hadn't changed.
+ *
+ * Small, because the key is (seed, brightness, style) and a session only plays so many covers.
+ * Main-thread only, like [paletteCache].
+ */
+private const val SCHEME_CACHE_MAX = 64
+private data class SchemeKey(val seed: Color, val isDark: Boolean, val style: PaletteStyle)
+private val schemeCache = object {
+	private val entries = mutableMapOf<SchemeKey, ColorScheme>()
+
+	operator fun get(key: SchemeKey): ColorScheme? = entries[key]
+
+	operator fun set(key: SchemeKey, scheme: ColorScheme) {
+		entries[key] = scheme
+		while (entries.size > SCHEME_CACHE_MAX) {
 			entries.remove(entries.keys.first())
 		}
 	}
@@ -141,8 +171,13 @@ fun rememberCoverColorScheme(
 			palette = it
 			return@LaunchedEffect
 		}
+		// LaunchedEffect bodies run on the composition dispatcher (main). The Ktor fetch suspends
+		// off it on its own, but the quantisation afterwards is plain CPU work, and it lands
+		// exactly when the artwork changes — i.e. the moment the colour adaptation is visible.
 		val result = runCatching {
-			networkLoader.load(Url("$uri&size=128")).generatePalette()
+			withContext(Dispatchers.Default) {
+				networkLoader.load(Url("$uri&size=128")).generatePalette()
+			}
 		}.getOrNull() ?: return@LaunchedEffect
 		paletteCache[id] = result
 		palette = result
@@ -184,19 +219,33 @@ fun rememberCoverColorScheme(
 	val style = if (coverUri != null) PaletteStyle.Content else PaletteStyle.Monochrome
 	// Seed the SCHEME from the vivid swatch (saturation-boosted) so muted/dark artwork still
 	// yields an OBVIOUS cover accent (Symfonium-like) rather than a washed near-grey `primary`.
-	val rawScheme = rememberDynamicColorScheme(
-		seedColor = accentSeed,
-		isDark = coverIsDark,
-		style = style,
-		specVersion = ColorSpec.SpecVersion.SPEC_2021,
-	)
+	//
+	// The non-composable `dynamicColorScheme` behind our own [schemeCache], rather than
+	// `rememberDynamicColorScheme`: its remember dies with the composition, and the mini-player's
+	// composition is destroyed on every navigation, so the HCT derivation was being repeated on
+	// the UI thread mid-transition for a cover that hadn't changed. The trailing `.copy` used to
+	// sit outside any remember too — and since ColorScheme has identity equality, that alone
+	// re-published LocalColorScheme (and so invalidated the whole subtree) at every
+	// `NavicTheme(coverColors.scheme)` call site, on every recomposition.
+	//
 	// materialKolor gives LIGHT schemes a near-neutral (almost black) onSurface, so light
 	// pages read as "just black text". Tint the content colours toward the cover's `primary`
 	// so text carries the artwork's hue on light AND dark pages (matching the queue's look).
-	val scheme = rawScheme.copy(
-		onSurface = lerp(rawScheme.onSurface, rawScheme.primary, 0.14f),
-		onSurfaceVariant = lerp(rawScheme.onSurfaceVariant, rawScheme.primary, 0.18f)
-	)
+	val scheme = remember(accentSeed, coverIsDark, style) {
+		val key = SchemeKey(accentSeed, coverIsDark, style)
+		schemeCache[key] ?: run {
+			val raw = dynamicColorScheme(
+				seedColor = accentSeed,
+				isDark = coverIsDark,
+				style = style,
+				specVersion = ColorSpec.SpecVersion.SPEC_2021
+			)
+			raw.copy(
+				onSurface = lerp(raw.onSurface, raw.primary, 0.14f),
+				onSurfaceVariant = lerp(raw.onSurfaceVariant, raw.primary, 0.18f)
+			).also { schemeCache[key] = it }
+		}
+	}
 
 	return CoverColors(
 		scheme = scheme,

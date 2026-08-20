@@ -56,7 +56,7 @@ fun NowPlayingButtonsRow() {
 	val player = koinInject<MediaPlayerViewModel>()
 	val hubManager = koinInject<HubManager>()
 	val isRemoteActive by hubManager.isRemoteActive.collectAsState()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 	val interactionSource = remember { MutableInteractionSource() }
 	val isPressed by interactionSource.collectIsPressedAsState()
 	val scale = remember { Animatable(1f) }

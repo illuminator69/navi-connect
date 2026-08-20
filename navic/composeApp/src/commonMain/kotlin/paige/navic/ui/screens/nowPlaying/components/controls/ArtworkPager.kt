@@ -40,7 +40,7 @@ fun NowPlayingArtworkPager(
 	val player = koinInject<MediaPlayerViewModel>()
 	val hubManager = koinInject<HubManager>()
 	val isRemoteActive by hubManager.isRemoteActive.collectAsState()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 
 	val pagerState = rememberPagerState(
 		initialPage = playerState.currentIndex.coerceAtLeast(0),

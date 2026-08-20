@@ -1,3 +1,8 @@
 <resources>
 	<string name="app_name" translatable="false">Navic</string>
+	<!-- lb-bot fill outcomes, posted while Navic is in the background. The in-app
+	     equivalents live in composeApp's strings.xml; these exist separately because the
+	     notifier is Android-only and cannot reach Compose resources. -->
+	<string name="notif_fill_landed">%1$s is in your library</string>
+	<string name="notif_fill_lost">Couldn\'t get %1$s</string>
 </resources>

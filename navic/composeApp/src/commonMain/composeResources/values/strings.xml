@@ -471,6 +471,28 @@
 	<string name="action_clear_failed">Clear failed</string>
 	<string name="action_cancel_all">Cancel all</string>
 	<string name="info_download_attempts">Attempt %1$d</string>
+	<!-- lb-bot acquisition. A different kind of download from the ones above: not a file
+	     being cached offline, but an album the library never had being fetched from
+	     Soulseek. Worded so the two can't be confused on the same screen. -->
+	<string name="section_lbbot_fills">Getting from Soulseek</string>
+	<string name="action_dismiss">Dismiss</string>
+	<string name="action_allow_mp3_retry">Allow MP3 and retry</string>
+	<string name="lbbot_fill_searching">Looking for a source</string>
+	<string name="lbbot_fill_queued">Waiting for the peer</string>
+	<string name="lbbot_fill_downloading">Downloading %1$d of %2$d</string>
+	<string name="lbbot_fill_placing">Adding to the library</string>
+	<string name="lbbot_fill_placed">Added — waiting for the library scan</string>
+	<string name="lbbot_fill_verified">In your library</string>
+	<string name="lbbot_fill_failed">Couldn\'t get this one</string>
+	<string name="lbbot_fill_needs_match">Downloaded, but needs sorting out in lb-bot</string>
+	<string name="lbbot_fill_needs_pick">Waiting for you to pick a source</string>
+	<string name="lbbot_fill_cancelled">Cancelled</string>
+	<!-- Shown when lb-bot never acknowledged the request, or forgot it: its own record of
+	     in-flight fills is in memory, so restarting it loses them. -->
+	<string name="lbbot_fill_gave_up">Stopped tracking this one</string>
+	<string name="lbbot_fill_done_at">Finished</string>
+	<string name="lbbot_fill_landed">%1$s is in your library</string>
+	<string name="lbbot_fill_lost">Couldn\'t get %1$s</string>
 	<string name="title_download_quality">Downloads</string>
 	<string name="title_download_format">Download format</string>
 	<string name="title_cellular_playback_source">On mobile data</string>

@@ -410,6 +410,19 @@ Navic (basic operation confirmed live).
   rejoined on restart. There's no way to distinguish "our paused session" from "someone else's
   speaker" without launching the receiver, and launching it is the harmful act.
 - Navic's native cast lifecycle after a **process restart** is still open (the crash itself is fixed).
+- **Reachability (2026-08-18).** A cast row's `online` flag means the *bridging client* is connected,
+  not that the speaker is. Bridges now probe TCP:8009 every 30 s and publish `deviceState`; a speaker
+  that fails twice in a row is shown in the picker as **not responding**, greyed and not selectable,
+  and the hub refuses a transfer to it (`target_unreachable`). Two consequences worth knowing while
+  testing: a speaker takes up to a minute to be marked down, and an *unplugged* one also needs 90 s of
+  mDNS silence before its bridge is torn down entirely.
+- **A failed cast load is now visible.** Transfers are acknowledged (`loaded`, PROTOCOL §7.1); if the
+  speaker doesn't start within 10 s the hub hands the session back to the previous device and every
+  client toasts `load_failed`. Previously this took ~20 s of stacked castv2 timeouts during which the
+  whole stack showed a playing bar over silence.
+- **Feishin's bridge now arbitrates** (§12.2 steps 1-3), reading the device registry off the main hub
+  client's socket before claiming, with 0-3 s jitter. Its reconnect backoff also only resets after a
+  connection survives 60 s, so an accept-then-evict loop can actually decay instead of running flat out.
 
 **Saved queues**
 - The 80 % track-overlap merge rule will fold two genuinely different queues into one card if they

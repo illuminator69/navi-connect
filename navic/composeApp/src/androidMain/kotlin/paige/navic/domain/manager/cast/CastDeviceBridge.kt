@@ -95,6 +95,18 @@ private const val ADOPTION_SLACK_MS = 10 * 60 * 1_000L
 /** Plain TCP reachability probe budget — a speaker on the LAN answers in milliseconds. */
 private const val REACHABILITY_TIMEOUT_MS = 2_000
 
+/** How often the bridge re-asserts its verdict on the speaker (PROTOCOL §3.2). */
+private const val DEVICE_STATE_INTERVAL_MS = 30_000L
+
+/**
+ * Consecutive failed probes before calling a speaker down.
+ *
+ * One miss is a dropped multicast-adjacent packet on a phone that just turned its screen off; a run
+ * of them spread over a minute is a speaker that has genuinely gone. A phantom receiver for a
+ * minute is much cheaper than dropping a live one.
+ */
+private const val REACHABILITY_FAILS_BEFORE_DOWN = 2
+
 /** One track as it arrives over the hub wire. */
 private data class BridgeTrack(
 	val id: String,
@@ -130,6 +142,8 @@ internal class CastDeviceBridge(
 	private val hubUrl: String,
 	private val token: String,
 	private val discovery: CastDiscovery,
+	/** This client's own hub device id, stamped as `bridgedBy` so pickers can name the holder. */
+	private val ownerDeviceId: () -> String?,
 	/** Told when the hub supersedes us, so the manager can stand down instead of fighting back. */
 	private val onSuperseded: () -> Unit
 ) {
@@ -160,6 +174,9 @@ internal class CastDeviceBridge(
 
 	private var channel: CastChannel? = null
 	private val castMutex = Mutex()
+	private var deviceStateJob: Job? = null
+	@Volatile
+	private var lastReportedReachable: Boolean? = null
 
 	private var tracks: List<BridgeTrack> = emptyList()
 	private var index = 0
@@ -228,6 +245,7 @@ internal class CastDeviceBridge(
 	fun destroy() {
 		destroyed = true
 		connectJob?.cancel()
+		deviceStateJob?.cancel()
 		tickerJob?.cancel()
 		scope.launch { teardownCast() }
 		runCatching { client.close() }
@@ -285,7 +303,10 @@ internal class CastDeviceBridge(
 					// identically whichever client happens to be bridging it.
 					put("name", "📺 $friendlyName")
 					put("platform", "chromecast")
-					putJsonArray("caps") { add("receiver") }
+					// `loadAck` (PROTOCOL §7.1) makes a failed cast load visible immediately instead
+					// of leaving the hub convinced this speaker took the session for ~20 seconds.
+					putJsonArray("caps") { add("receiver"); add("loadAck") }
+					ownerDeviceId()?.let { put("bridgedBy", it) }
 				})
 			})
 
@@ -304,12 +325,53 @@ internal class CastDeviceBridge(
 		}
 	}
 
+	/**
+	 * Tell the hub whether the speaker itself is there — PROTOCOL §3.2.
+	 *
+	 * The hub sees this bridge's socket, which lives on a phone, and calls the row `online` on the
+	 * strength of it. That is a much weaker claim than "the speaker is on": a Chromecast that is
+	 * unplugged, asleep, or in a house nobody here is in leaves the socket perfectly healthy. Only
+	 * the bridge can tell the difference, so the bridge has to say.
+	 *
+	 * Reported on a timer rather than only on change, because the hub expires a verdict whose
+	 * bridge has gone quiet instead of continuing to speak for it.
+	 */
+	private fun startDeviceStateLoop() {
+		deviceStateJob?.cancel()
+		deviceStateJob = scope.launch {
+			var failures = 0
+			while (isActive) {
+				val probed = speakerReachable()
+				failures = if (probed) 0 else failures + 1
+				// An open cast channel is proof on its own — a probe that lost a packet must not
+				// contradict a speaker we are actively talking to. And one miss is a dropped
+				// packet; only a run of them is a speaker that has gone away.
+				// Read once: ensureCast() can hold this mutex for the whole session-setup
+				// budget, and taking it twice per tick doubles the wait for no benefit.
+				val channelOpen = castMutex.withLock { channel?.isOpen == true }
+				val reachable = probed || channelOpen ||
+					failures < REACHABILITY_FAILS_BEFORE_DOWN
+				if (reachable != lastReportedReachable) {
+					Logger.i(TAG, "$friendlyName: reachable -> $reachable")
+					lastReportedReachable = reachable
+				}
+				sendFrame(buildJsonObject {
+					put("t", "deviceState")
+					put("reachable", reachable)
+					put("appRunning", channelOpen)
+				})
+				delay(DEVICE_STATE_INTERVAL_MS)
+			}
+		}
+	}
+
 	private suspend fun handleHubFrame(msg: JsonObject) {
 		when (msg["t"]?.jsonPrimitive?.content) {
 			"welcome" -> {
 				_connected.value = true
 				Logger.i(TAG, "$friendlyName: registered with hub as $hubDeviceId")
 				adopted = false
+				startDeviceStateLoop()
 				msg["session"]?.jsonObject?.let { maybeAdopt(it) }
 			}
 
@@ -359,7 +421,15 @@ internal class CastDeviceBridge(
 					// PAUSED — and since engines act on status *changes*, every later pause,
 					// ours or the user's, became a no-op.
 					val play = msg["play"]?.jsonPrimitive?.content != "false"
-					loadCurrent(msg["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L, play)
+					val ok = loadCurrent(msg["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L, play)
+					// PROTOCOL §7.1. Without this the hub commits the active slot and never learns
+					// the speaker didn't start, so casting to a TV that has been off for days reads
+					// as playing on every device until somebody notices the silence.
+					sendFrame(buildJsonObject {
+						put("t", "loaded")
+						put("ok", ok)
+						if (!ok) put("error", "the speaker did not start playback")
+					})
 				}
 
 				"jump" -> {
@@ -383,15 +453,29 @@ internal class CastDeviceBridge(
 				}
 
 				"pause" -> {
-					channel?.pause()
+					// A dropped PAUSE used to be reported as a pause anyway: the commands return
+					// null when there is no transport or media session, and the null was discarded.
+					// The hub then held a state the speaker had never been in.
+					if (channel?.pause() == null) {
+						Logger.w(TAG, "$friendlyName: pause never reached the device")
+						teardownCast()
+					}
 					playing = false
 					report()
 				}
 
 				"seek" -> {
 					val pos = msg["positionMs"]?.jsonPrimitive?.longOrNull ?: 0L
-					channel?.seek(pos)
-					lastPositionMs = pos
+					if (channel?.seek(pos) != null) {
+						lastPositionMs = pos
+					} else {
+						// Recording the position regardless meant the hub could hand the next device
+						// a spot the speaker had never reached. Reload there instead — that IS where
+						// the user asked to be.
+						Logger.w(TAG, "$friendlyName: seek never reached the device — reloading")
+						teardownCast()
+						loadCurrent(pos, playing)
+					}
 				}
 
 				"queueChanged" -> {
@@ -520,12 +604,15 @@ internal class CastDeviceBridge(
 	 * how a speaker that idled out while paused went unnoticed until someone pressed play.
 	 */
 	private suspend fun castSessionAlive(): Boolean {
-		val ch = channel ?: return false
+		// Read the channel under the mutex teardownCast() nulls it under. Unsynchronised,
+		// a teardown racing this returned a stale channel and the caller then drove it.
+		val ch = castMutex.withLock { channel } ?: return false
 		if (!ch.isOpen) return false
 		return ch.mediaStatus(ALIVE_PROBE_TIMEOUT) != null
 	}
 
-	private suspend fun loadCurrent(positionMs: Long, play: Boolean) {
+	/** @return whether the speaker actually started — PROTOCOL §7.1's `loaded.ok`. */
+	private suspend fun loadCurrent(positionMs: Long, play: Boolean): Boolean {
 		val track = tracks.getOrNull(index) ?: run {
 			// Silent before. "Hub sent a load we couldn't act on" and "we loaded and the speaker
 			// ignored it" are very different bugs and produced identical (empty) logs.
@@ -533,7 +620,7 @@ internal class CastDeviceBridge(
 				TAG,
 				"$friendlyName: load ignored — index $index of ${tracks.size} track(s)"
 			)
-			return
+			return false
 		}
 		val url = track.streamUrl
 		if (url.isNullOrBlank()) {
@@ -542,7 +629,7 @@ internal class CastDeviceBridge(
 				"$friendlyName: \"${track.title}\" has no streamUrl — the queue was published " +
 					"by an older client; start playback again on the sending device to republish it"
 			)
-			return
+			return false
 		}
 
 		Logger.i(TAG, "$friendlyName: loading \"${track.title}\" at ${positionMs}ms (play=$play)")
@@ -553,7 +640,7 @@ internal class CastDeviceBridge(
 			Logger.e(TAG, "$friendlyName: giving up — no cast session")
 			playing = false
 			report()
-			return
+			return false
 		}
 
 		// The speaker may already be playing this very track — that is the normal state of affairs
@@ -575,7 +662,7 @@ internal class CastDeviceBridge(
 				)
 				report()
 				startTicker()
-				return
+				return true
 			}
 		}
 
@@ -616,7 +703,7 @@ internal class CastDeviceBridge(
 				Logger.e(TAG, "$friendlyName: load gave up for \"${track.title}\"")
 				playing = false
 				report()
-				return
+				return false
 			}
 		}
 
@@ -624,6 +711,7 @@ internal class CastDeviceBridge(
 		playing = play
 		report()
 		if (play) startTicker()
+		return true
 	}
 
 	private suspend fun capturePosition() {

@@ -41,7 +41,7 @@ fun NowPlayingMoreButton(
 	val platformContext = LocalPlatformContext.current
 	val player = koinInject<MediaPlayerViewModel>()
 	val radioManager = koinInject<RadioManager>()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 	val song = playerState.currentSong
 	var expanded by remember { mutableStateOf(false) }
 	var playlistDialogShown by rememberSaveable { mutableStateOf(false) }

@@ -174,7 +174,18 @@ fun MissingAlbumSheet(
 				is LbBotManager.LbResult.Ok -> {
 					alreadyRunning = result.value.existing
 					if (result.value.ok && result.value.releaseMbid.isNotBlank()) {
-						lbBot.startAlbumFill(release.rgid, result.value.releaseMbid, quality)
+						// Artist and title are carried into the watch, not looked up
+						// later: the downloads view may be opened days afterwards, on a
+						// screen with no artist page behind it, and by then lb-bot's own
+						// (in-memory, capped) ledger may have forgotten the fill entirely.
+						lbBot.startAlbumFill(
+							rgid = release.rgid,
+							releaseMbid = result.value.releaseMbid,
+							quality = quality,
+							artist = detail?.artist.orEmpty(),
+							album = release.title,
+							source = source
+						)
 					}
 				}
 			}

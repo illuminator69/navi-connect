@@ -99,7 +99,7 @@ fun QueueScreen() {
 	val player = koinInject<MediaPlayerViewModel>()
 	val hubManager = koinInject<HubManager>()
 	val isRemoteActive by hubManager.isRemoteActive.collectAsState()
-	val playerState by player.uiState.collectAsStateWithLifecycle()
+	val playerState by player.steadyState.collectAsStateWithLifecycle()
 	val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
 	val downloadedSongs by viewModel.downloadedSongs.collectAsStateWithLifecycle()
 	val queue = playerState.queue

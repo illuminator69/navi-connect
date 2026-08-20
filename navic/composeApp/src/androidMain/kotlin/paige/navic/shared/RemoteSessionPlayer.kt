@@ -69,11 +69,22 @@ class RemoteSessionPlayer(
 		.setMaxVolume(100)
 		.build()
 
-	/** The active receiver's volume, or a middling default until the hub says. */
+	/**
+	 * The active receiver's volume.
+	 *
+	 * Falls back to the last value we saw rather than a hardcoded 50: the device list and the
+	 * active id arrive in separate frames, so a device that is momentarily absent from the list
+	 * made the hardware rocker jump to half volume and then stay there until the next update.
+	 */
 	private fun remoteVolume(): Int {
 		val activeId = hubManager.activeDeviceId.value
-		return hubManager.devices.value.firstOrNull { it.id == activeId }?.volume ?: 50
+		val known = hubManager.devices.value.firstOrNull { it.id == activeId }?.volume
+		if (known != null) lastKnownVolume = known
+		return lastKnownVolume
 	}
+
+	@Volatile
+	private var lastKnownVolume: Int = 100
 
 	// Ignore transport commands briefly after this facade is swapped into the
 	// session. media3 / the system controller re-syncs state on swap-in and can

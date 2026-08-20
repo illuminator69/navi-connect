@@ -39,7 +39,7 @@ fun NowPlayingInfoRow(
 ) {
 	val backStack = LocalNavStack.current
 	val player = koinInject<MediaPlayerViewModel>()
-	val playerState by player.uiState.collectAsState()
+	val playerState by player.steadyState.collectAsState()
 	val song = playerState.currentSong
 	// Spotify-style "Playing on <device>" cue when the session runs on another device.
 	val hubManager = koinInject<HubManager>()

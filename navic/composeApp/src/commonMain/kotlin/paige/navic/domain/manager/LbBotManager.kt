@@ -5,6 +5,7 @@ import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.UserAgent
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
@@ -19,9 +20,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -123,6 +130,33 @@ class LbBotManager(
 	private val _gaps = MutableStateFlow<Map<String, LbGap>>(emptyMap())
 	val gaps: StateFlow<Map<String, LbGap>> = _gaps.asStateFlow()
 
+	/**
+	 * Every fill this device has started, newest first — in flight *and* finished.
+	 *
+	 * The watch map used to be pruned the moment a fill settled, which meant a failure
+	 * was indistinguishable from never having happened: the sheet was long closed, the
+	 * artist page showed the album as still missing, and there was nowhere to ask why.
+	 * Keeping the terminal rows is what makes a downloads view, a retry button and a
+	 * completion notice possible without any of them growing state of their own.
+	 *
+	 * It also covers a case nothing else can. lb-bot's own fill ledger is in memory and
+	 * capped, so restarting it mid-fill makes `album/status` answer `unknown` forever;
+	 * this is then the only record that the download was ever asked for.
+	 */
+	private val _ledger = MutableStateFlow<List<LbFillEntry>>(emptyList())
+	val ledger: StateFlow<List<LbFillEntry>> = _ledger.asStateFlow()
+
+	/**
+	 * One event per fill reaching a terminal outcome, for whoever wants to announce it.
+	 *
+	 * Emitted from [settle] and nowhere else, so a sheet and a page both watching the
+	 * same fill cannot produce two notifications. `extraBufferCapacity` because there is
+	 * no subscriber at all until something mounts a collector, and a fill that lands
+	 * while the app is backgrounded must not block the poll loop.
+	 */
+	private val _fillEvents = MutableSharedFlow<LbFillEvent>(extraBufferCapacity = 8)
+	val fillEvents: SharedFlow<LbFillEvent> = _fillEvents.asSharedFlow()
+
 	/** The user's sticky quality preference. Empty means "lb-bot's own default". */
 	var preferredQuality: String
 		get() = preferenceManager.lbBotQuality
@@ -193,15 +227,28 @@ class LbBotManager(
 		)
 	}
 
+	/**
+	 * @param timeoutMs overrides the client's 60 s for one call. Only the two polled
+	 *   routes pass it: they run every five seconds, so a tick that hasn't answered in
+	 *   twelve has already missed its slot and the next one will do — whereas holding
+	 *   the connection for a full minute stalls every other watch behind it. The hub's
+	 *   own timeouts (20 s for `album/status`, 45 s for the gap) sit above this on
+	 *   purpose; the client is the side that has to give up first.
+	 */
 	private suspend inline fun <reified T> getJson(
 		path: String,
-		params: List<Pair<String, String>>
+		params: List<Pair<String, String>>,
+		timeoutMs: Long? = null
 	): LbResult<T> {
 		val base = hubBase() ?: return LbResult.Failed(LbError.NotConfigured)
 		return try {
 			val response = client.get(base + path) {
 				header("Authorization", "Bearer ${preferenceManager.hubToken}")
 				params.forEach { (key, value) -> if (value.isNotBlank()) parameter(key, value) }
+				if (timeoutMs != null) timeout {
+					requestTimeoutMillis = timeoutMs
+					socketTimeoutMillis = timeoutMs
+				}
 			}
 			if (response.status.isSuccess()) LbResult.Ok(response.body<T>())
 			else failureFor(response.status.value, "GET $path", response.bodyAsText())
@@ -405,10 +452,27 @@ class LbBotManager(
 		}
 	}
 
-	/** Where one release's fill has got to. */
+	/**
+	 * Where one release's fill has got to, failure and all.
+	 *
+	 * The poll path must use this rather than [fillStatus]. Collapsing a failure into a
+	 * default `LbFillStatus` makes it arrive as `state = "unknown"`, which is a real
+	 * lb-bot answer meaning "nothing is filling this" — so a transient 502 (on this
+	 * route almost always "lb-bot is busy holding its lock", not "lb-bot is gone") both
+	 * blanked a downloading tile for five seconds and spent one of the eighteen
+	 * `unknown` credits that exist to detect a fill which never started.
+	 */
+	suspend fun fillStatusResult(releaseMbid: String): LbResult<LbFillStatus> =
+		getJson(
+			"/lb/album/status",
+			listOf("release_mbid" to releaseMbid),
+			timeoutMs = POLL_TIMEOUT_MS
+		)
+
+	/** Where one release's fill has got to. For one-shot reads, where "no answer" and
+	 *  "no fill" are equally uninteresting; polls want [fillStatusResult]. */
 	suspend fun fillStatus(releaseMbid: String): LbFillStatus =
-		getJson<LbFillStatus>("/lb/album/status", listOf("release_mbid" to releaseMbid))
-			.valueOrNull() ?: LbFillStatus()
+		fillStatusResult(releaseMbid).valueOrNull() ?: LbFillStatus()
 
 	/**
 	 * Widen the accepted formats for one album's searches. lb-bot's global policy stays
@@ -430,11 +494,16 @@ class LbBotManager(
 	 * lb-bot's discography scan does not merely label such a release — it builds the
 	 * review group at the same time — so the handle is live without any separate scan.
 	 */
-	suspend fun gapDetail(groupId: String, sourcePage: Int = 0): LbResult<LbGap> {
+	suspend fun gapDetail(
+		groupId: String,
+		sourcePage: Int = 0,
+		polling: Boolean = false
+	): LbResult<LbGap> {
 		if (groupId.isBlank()) return LbResult.Failed(LbError.Rejected(400, ""))
 		return getJson(
 			"/lb/gap",
-			listOf("group_id" to groupId, "sourcePage" to sourcePage.toString())
+			listOf("group_id" to groupId, "sourcePage" to sourcePage.toString()),
+			timeoutMs = if (polling) POLL_TIMEOUT_MS else null
 		)
 	}
 
@@ -505,7 +574,7 @@ class LbBotManager(
 		if (groupId.isBlank()) return LbResult.Failed(LbError.Rejected(400, ""))
 		val res = postJson<_, LbOk>("/lb/gap/cancel", LbGroupRequest(groupId))
 		if (res is LbResult.Ok) {
-			settle(groupId)
+			settle(groupId, OUTCOME_CANCELLED, state = "cancelled")
 			refreshGap(groupId)
 		}
 		return res
@@ -546,7 +615,14 @@ class LbBotManager(
 	 * persisted for the same reason one step further out — the app is routinely killed
 	 * inside that window.
 	 */
-	fun startAlbumFill(rgid: String, releaseMbid: String, quality: String) {
+	fun startAlbumFill(
+		rgid: String,
+		releaseMbid: String,
+		quality: String,
+		artist: String = "",
+		album: String = "",
+		source: LbGapSource? = null
+	) {
 		if (rgid.isBlank() || releaseMbid.isBlank()) return
 		putWatch(
 			LbWatch(
@@ -554,14 +630,72 @@ class LbBotManager(
 				key = rgid,
 				releaseMbid = releaseMbid,
 				quality = quality,
-				startedAt = nowMs()
+				startedAt = nowMs(),
+				// Carried purely so the downloads view and a retry need no second read.
+				// The artist page has all of this at the moment of the tap; a ledger row
+				// re-read hours later, possibly after lb-bot forgot the fill, has none.
+				artist = artist,
+				album = album,
+				sourcePeer = source?.peer.orEmpty(),
+				sourceFolder = source?.folder.orEmpty()
 			)
 		)
 	}
 
-	fun startGapWatch(groupId: String) {
+	fun startGapWatch(groupId: String, artist: String = "", album: String = "") {
 		if (groupId.isBlank()) return
-		putWatch(LbWatch(kind = KIND_GAP, key = groupId, startedAt = nowMs()))
+		putWatch(
+			LbWatch(
+				kind = KIND_GAP,
+				key = groupId,
+				startedAt = nowMs(),
+				artist = artist,
+				album = album
+			)
+		)
+	}
+
+	/**
+	 * Re-issue a fill the ledger remembers, with the options it was started with.
+	 *
+	 * Not automatic, and that is the point: lb-bot already walks its entire ranked source
+	 * list before it reports a failure, so an unattended retry would re-run the identical
+	 * search against the identical peers. The user asking again is new information — the
+	 * swarm has moved on, or they have just allowed mp3.
+	 *
+	 * A gap retries as `search`, never `auto`: `auto` is what failed, and `search` stops
+	 * after ranking so the candidates can be judged.
+	 */
+	suspend fun retry(key: String): LbResult<LbOk> {
+		val watch = loadWatches()[key] ?: return LbResult.Failed(LbError.Rejected(404, ""))
+		return when (watch.kind) {
+			KIND_GAP -> gapSearch(watch.key, force = true)
+			else -> {
+				val res = download(
+					rgid = watch.key,
+					quality = watch.quality,
+					source = watch.sourcePeer.takeIf { it.isNotBlank() }?.let {
+						LbGapSource(peer = it, folder = watch.sourceFolder)
+					}
+				)
+				when (res) {
+					is LbResult.Failed -> LbResult.Failed(res.error)
+					is LbResult.Ok -> {
+						// Re-open the same row rather than adding a second one, so the
+						// history stays one line per album rather than one per attempt.
+						reopen(watch.key, res.value.releaseMbid)
+						LbResult.Ok(LbOk(ok = true))
+					}
+				}
+			}
+		}
+	}
+
+	/** Forget one finished row. Only ever offered on a settled fill. */
+	fun dismiss(key: String) {
+		scope.launch {
+			watchLock.withLock { saveWatches(loadWatches() - key) }
+		}
 	}
 
 	/** Whether this release-group has a fill we're still watching. */
@@ -580,14 +714,33 @@ class LbBotManager(
 	private val watchLock = Mutex()
 	private var pollJob: Job? = null
 
+	/**
+	 * Two retention rules, because a running row and a finished one are different things.
+	 *
+	 * A row still being polled is dropped at [WATCH_TIMEOUT_MS] — twenty minutes, the
+	 * wall clock that exists because lb-bot's verifier gives up and leaves a fill on
+	 * `placed` forever. A settled one is *history* and is kept for [LEDGER_RETAIN_MS],
+	 * capped at [LEDGER_MAX] rows so a heavy week can't grow the preference without
+	 * bound. Before this, settling and deleting were the same act.
+	 */
 	private fun loadWatches(): Map<String, LbWatch> = try {
-		json.decodeFromString<Map<String, LbWatch>>(preferenceManager.lbBotWatches)
-			.filterValues { nowMs() - it.startedAt < WATCH_TIMEOUT_MS }
+		val now = nowMs()
+		val all = json.decodeFromString<Map<String, LbWatch>>(preferenceManager.lbBotWatches)
+			.filterValues { watch ->
+				if (watch.settled) now - watch.finishedAtOrStart() < LEDGER_RETAIN_MS
+				else now - watch.startedAt < WATCH_TIMEOUT_MS
+			}
+		if (all.size <= LEDGER_MAX) all
+		else all.entries
+			.sortedByDescending { it.value.finishedAtOrStart() }
+			.take(LEDGER_MAX)
+			.associate { it.key to it.value }
 	} catch (e: Exception) {
 		Logger.w("LbBotManager", "could not read persisted fills, starting empty", e)
 		emptyMap()
 	}
 
+	/** The single write point, so publishing the ledger cannot be forgotten anywhere. */
 	private fun saveWatches(watches: Map<String, LbWatch>) {
 		preferenceManager.lbBotWatches = try {
 			json.encodeToString(watches)
@@ -595,21 +748,94 @@ class LbBotManager(
 			Logger.e("LbBotManager", "could not persist fills", e)
 			"{}"
 		}
+		_ledger.value = watches.values
+			.sortedWith(
+				// In flight first — that is what someone opening this view came to see —
+				// then most recent. `startedAt` for a live row, `finishedAt` for a dead
+				// one, so a fill that ran for ten minutes doesn't sort above one that
+				// failed since.
+				compareBy<LbWatch> { it.settled }.thenByDescending { it.finishedAtOrStart() }
+			)
+			.map { it.toEntry() }
 	}
 
 	private fun putWatch(watch: LbWatch) {
 		scope.launch {
-			watchLock.withLock { saveWatches(loadWatches() + (watch.key to watch)) }
+			watchLock.withLock {
+				val existing = loadWatches()[watch.key]
+				// Keep whatever the previous attempt knew about the album; a retry or a
+				// second tap must not blank the title the row is displayed under.
+				saveWatches(
+					loadWatches() + (watch.key to watch.copy(
+						artist = watch.artist.ifBlank { existing?.artist.orEmpty() },
+						album = watch.album.ifBlank { existing?.album.orEmpty() },
+						quality = watch.quality.ifBlank { existing?.quality.orEmpty() }
+					))
+				)
+			}
 			ensurePolling()
 		}
 	}
 
-	private suspend fun settle(key: String) {
+	/** Re-open a settled row for another attempt, keeping its display fields. */
+	private suspend fun reopen(key: String, releaseMbid: String) {
 		watchLock.withLock {
 			val watches = loadWatches()
 			val watch = watches[key] ?: return@withLock
-			saveWatches(watches + (key to watch.copy(settled = true)))
+			saveWatches(
+				watches + (key to watch.copy(
+					settled = false,
+					outcome = OUTCOME_RUNNING,
+					reason = "",
+					state = "",
+					unknownPolls = 0,
+					quietTicks = 0,
+					fingerprint = "",
+					nextPollAt = 0L,
+					finishedAt = 0L,
+					startedAt = nowMs(),
+					releaseMbid = releaseMbid.ifBlank { watch.releaseMbid }
+				))
+			)
 		}
+		ensurePolling()
+	}
+
+	/**
+	 * Close a watch and record how it ended.
+	 *
+	 * The only place [fillEvents] is emitted, so however many screens are watching a
+	 * fill it is announced exactly once.
+	 */
+	private suspend fun settle(
+		key: String,
+		outcome: String = OUTCOME_GAVE_UP,
+		state: String = "",
+		reason: String = ""
+	) {
+		val settledWatch = watchLock.withLock {
+			val watches = loadWatches()
+			val watch = watches[key] ?: return@withLock null
+			if (watch.settled) return@withLock null
+			val next = watch.copy(
+				settled = true,
+				finishedAt = nowMs(),
+				outcome = outcome,
+				state = state.ifBlank { watch.state },
+				reason = reason.ifBlank { watch.reason }
+			)
+			saveWatches(watches + (key to next))
+			next
+		} ?: return
+		_fillEvents.emit(
+			LbFillEvent(
+				key = settledWatch.key,
+				artist = settledWatch.artist,
+				album = settledWatch.album,
+				outcome = settledWatch.outcome,
+				reason = settledWatch.reason
+			)
+		)
 	}
 
 	private fun ensurePolling() {
@@ -625,24 +851,131 @@ class LbBotManager(
 	 */
 	private suspend fun pollLoop() {
 		while (true) {
+			val startedTick = nowMs()
 			val live = watchLock.withLock { loadWatches().values.filter { !it.settled } }
 			if (live.isEmpty()) return
-			for (watch in live) {
-				if (nowMs() - watch.startedAt > WATCH_TIMEOUT_MS) {
-					settle(watch.key)
-					continue
-				}
-				when (watch.kind) {
-					KIND_ALBUM -> pollAlbum(watch)
-					KIND_GAP -> pollGap(watch)
-				}
+
+			// Time out the stale ones first, without spending a slot on them.
+			val expired = live.filter { startedTick - it.startedAt > WATCH_TIMEOUT_MS }
+			expired.forEach { settle(it.key, OUTCOME_GAVE_UP) }
+
+			// Each watch carries its own next slot (see `intervalFor`), so a fill that
+			// has looked identical for a minute steps back to a slower cadence while one
+			// that is actually moving keeps the full five seconds. Oldest slot first, so
+			// capping the fan-out delays a watch by one tick rather than starving it.
+			val due = (live - expired.toSet())
+				.filter { startedTick >= it.nextPollAt }
+				.sortedBy { it.nextPollAt }
+				.take(MAX_POLLS_PER_TICK)
+
+			// Concurrent, not sequential: the old loop delayed *after* walking every
+			// watch in turn, so three fills meant the interval was five seconds plus
+			// three round trips, and each tick hit lb-bot's process-wide lock in a burst.
+			// Bounded by the same take() above, at the hub's own in-flight limit.
+			coroutineScope {
+				due.map { watch ->
+					async {
+						when (watch.kind) {
+							KIND_ALBUM -> pollAlbum(watch)
+							KIND_GAP -> pollGap(watch)
+						}
+					}
+				}.awaitAll()
 			}
-			delay(POLL_INTERVAL_MS)
+
+			// Subtract the work from the wait, so the cadence is the interval rather
+			// than the interval plus however long lb-bot took.
+			val elapsed = nowMs() - startedTick
+			delay((POLL_INTERVAL_MS - elapsed).coerceIn(MIN_POLL_GAP_MS, POLL_INTERVAL_MS))
+		}
+	}
+
+	/**
+	 * How long before this watch is polled again.
+	 *
+	 * Five seconds is the floor and stays the answer for anything that is moving. But
+	 * lb-bot only refreshes slskd's transfer state every sixty seconds and
+	 * `album/status` just reads the counters that loop last wrote, so a long download
+	 * spends eleven ticks in twelve returning a byte-identical body — each one taking
+	 * the process-wide review lock that lb-bot's own 2s-polling web UI is already on.
+	 * An unchanged payload is free information: back off, and snap straight back the
+	 * moment anything at all differs.
+	 */
+	private fun intervalFor(quietTicks: Int): Long = when {
+		quietTicks < QUIET_TICKS_FIRST -> POLL_INTERVAL_MS
+		quietTicks < QUIET_TICKS_SECOND -> POLL_INTERVAL_MS * 2
+		else -> POLL_INTERVAL_MS * 4
+	}
+
+	/**
+	 * Record a tick's outcome: the fingerprint that drives the backoff, the display
+	 * fields the ledger shows, and the consecutive-unknown count.
+	 *
+	 * [unknown] is null when the answer was neither progress nor an ambiguous idle —
+	 * i.e. a genuine state — which resets the give-up counter. That reset is the fix
+	 * for a fill that answered `unknown` intermittently over twenty minutes and was
+	 * given up on while it was still alive: the eighteen only ever meant *consecutive*.
+	 */
+	private suspend fun recordTick(
+		key: String,
+		fingerprint: String,
+		unknown: Boolean,
+		state: String,
+		reason: String = "",
+		percent: Int = 0,
+		done: Int = 0,
+		total: Int = 0,
+		artist: String = "",
+		album: String = "",
+		mp3WouldHelp: Boolean = false,
+		groupId: String = ""
+	): Int {
+		return watchLock.withLock {
+			val watches = loadWatches()
+			val current = watches[key] ?: return@withLock UNKNOWN_POLL_LIMIT
+			val quiet = if (fingerprint == current.fingerprint) current.quietTicks + 1 else 0
+			val next = current.copy(
+				fingerprint = fingerprint,
+				quietTicks = quiet,
+				nextPollAt = nowMs() + intervalFor(quiet),
+				unknownPolls = if (unknown) current.unknownPolls + 1 else 0,
+				state = state,
+				reason = reason.ifBlank { current.reason },
+				percent = percent,
+				done = done,
+				total = total,
+				artist = artist.ifBlank { current.artist },
+				album = album.ifBlank { current.album },
+				mp3WouldHelp = mp3WouldHelp || current.mp3WouldHelp,
+				groupId = groupId.ifBlank { current.groupId }
+			)
+			saveWatches(watches + (key to next))
+			next.unknownPolls
+		}
+	}
+
+	/** A failed tick is not an answer: leave everything as it was and try again later. */
+	private suspend fun deferWatch(key: String) {
+		watchLock.withLock {
+			val watches = loadWatches()
+			val current = watches[key] ?: return@withLock
+			saveWatches(watches + (key to current.copy(nextPollAt = nowMs() + POLL_INTERVAL_MS)))
 		}
 	}
 
 	private suspend fun pollAlbum(watch: LbWatch) {
-		val status = fillStatus(watch.releaseMbid)
+		// The result form, not `fillStatus`: a failure there arrives as the default
+		// `state = "unknown"`, which is indistinguishable from lb-bot saying "nothing is
+		// filling this". A 502 on this route usually means lb-bot is *busy* holding its
+		// lock rather than gone, and treating that as an answer both blanked a
+		// downloading tile for five seconds and burned one of the eighteen credits.
+		val status = when (val result = fillStatusResult(watch.releaseMbid)) {
+			is LbResult.Ok -> result.value
+			is LbResult.Failed -> {
+				deferWatch(watch.key)
+				return
+			}
+		}
 		_fills.value = _fills.value + (watch.key to status)
 
 		// `placed` says the files are in the library folder. Navidrome may not have
@@ -651,63 +984,128 @@ class LbBotManager(
 		// minute later.
 		if (status.state == "placed" || status.state == "verified") _libraryRevision.value += 1
 
-		// `unknown` is ambiguous: both "nothing is filling this" and "the POST returned
-		// but lb-bot's worker hasn't written its first ledger row", which is the normal
-		// first second or two. Treating it as terminal stopped the poll before the fill
-		// began; treating it as live forever polls a release nobody is filling.
+		val seen = recordTick(
+			key = watch.key,
+			fingerprint = "${status.state}|${status.done}/${status.total}|${status.failed}",
+			// `unknown` is ambiguous: both "nothing is filling this" and "the POST
+			// returned but lb-bot's worker hasn't written its first ledger row", which is
+			// the normal first second or two. Treating it as terminal stopped the poll
+			// before the fill began; treating it as live forever polls a release nobody
+			// is filling.
+			unknown = status.state == "unknown",
+			state = status.state,
+			reason = status.reason,
+			percent = status.percent,
+			done = status.done,
+			total = status.total,
+			artist = status.artist,
+			album = status.album,
+			mp3WouldHelp = status.mp3WouldHelp,
+			groupId = status.groupId
+		)
 		if (status.state == "unknown") {
-			val seen = watchLock.withLock {
-				val watches = loadWatches()
-				val current = watches[watch.key] ?: return@withLock UNKNOWN_POLL_LIMIT
-				val next = current.copy(unknownPolls = current.unknownPolls + 1)
-				saveWatches(watches + (watch.key to next))
-				next.unknownPolls
-			}
-			if (seen >= UNKNOWN_POLL_LIMIT) settle(watch.key)
+			if (seen >= UNKNOWN_POLL_LIMIT) settle(watch.key, OUTCOME_GAVE_UP, status.state)
 			return
 		}
 		// A backwards step is normal, not an error: lb-bot reports `downloading` for as
 		// long as a transfer group is pending, which can follow `placing`.
-		if (status.state in TERMINAL_FILL_STATES) settle(watch.key)
+		if (status.state in TERMINAL_FILL_STATES) {
+			settle(
+				watch.key,
+				outcome = if (status.state == "verified") OUTCOME_DONE else OUTCOME_FAILED,
+				state = status.state,
+				reason = status.reason
+			)
+		}
+	}
+
+	/**
+	 * Why a gap fill ended, in lb-bot's own words, most specific first.
+	 *
+	 * `noSourceReason` is the attributable one ("103 peers offered 2,047 files, but none
+	 * in FLAC…") and is what makes the Allow-MP3 offer make sense; `failReason` names the
+	 * failure; the task error is the fallback for a search that itself broke.
+	 */
+	private fun gapReason(gap: LbGap): String = when {
+		gap.failReason.isNotBlank() -> gap.failReason
+		gap.noSourceReason.isNotBlank() -> gap.noSourceReason
+		else -> gap.sourceTask?.error.orEmpty()
 	}
 
 	private suspend fun pollGap(watch: LbWatch) {
-		val gap = gapDetail(watch.key).valueOrNull() ?: return
+		val gap = when (val result = gapDetail(watch.key, polling = true)) {
+			is LbResult.Ok -> result.value
+			is LbResult.Failed -> {
+				deferWatch(watch.key)
+				return
+			}
+		}
 		_gaps.value = _gaps.value + (watch.key to gap)
 
 		if (gap.status == "complete") _libraryRevision.value += 1
+
+		val filling = gap.tracks.filter { it.state != "present" }
+		val filled = filling.count { it.state == "done" || it.state == "downloaded" }
+		val searching = gap.sourceTask?.status.orEmpty() in SEARCH_IN_FLIGHT
+		// `ready` after an auto run means the search found nothing, or every source
+		// rejected the enqueue. Give it the same bounded patience `unknown` gets on the
+		// album path, but don't count polls where a source search is visibly running.
+		val idle = gap.status == "ready" && gap.sourceTask?.status != "running"
+		val seen = recordTick(
+			key = watch.key,
+			fingerprint = "${gap.status}|${gap.sourceTask?.status}|$filled/${filling.size}",
+			unknown = idle,
+			state = gap.status,
+			reason = gapReason(gap),
+			percent = if (filling.isEmpty()) 0 else filled * 100 / filling.size,
+			done = filled,
+			total = filling.size,
+			artist = gap.artist,
+			album = gap.album,
+			mp3WouldHelp = gap.mp3WouldHelp
+		)
 
 		// A source search in flight is never a reason to stop. Asking for one flips
 		// the group to `picking` *immediately* — the POST approves the pending tracks
 		// before the search has found anything — so treating `picking` as terminal
 		// settled the watch on the first poll and the results, arriving 30s later,
 		// were never read. The sheet sat on "asking slskd" until a second press.
-		if (gap.sourceTask?.status.orEmpty() in SEARCH_IN_FLIGHT) return
+		if (searching) return
 
-		// `ready` after an auto run means the search found nothing, or every source
-		// rejected the enqueue. Give it the same bounded patience `unknown` gets on the
-		// album path, but don't count polls where a source search is visibly running.
-		if (gap.status == "ready" && gap.sourceTask?.status != "running") {
-			val seen = watchLock.withLock {
-				val watches = loadWatches()
-				val current = watches[watch.key] ?: return@withLock UNKNOWN_POLL_LIMIT
-				val next = current.copy(unknownPolls = current.unknownPolls + 1)
-				saveWatches(watches + (watch.key to next))
-				next.unknownPolls
-			}
-			if (seen >= UNKNOWN_POLL_LIMIT) settle(watch.key)
+		if (idle) {
+			if (seen >= UNKNOWN_POLL_LIMIT) settle(watch.key, OUTCOME_GAVE_UP, gap.status)
 			return
 		}
 		// `picking` is not a failure, and — since the picker exists here — usually not
 		// even a hand-off: with the search finished it means "the candidates are on
 		// screen, waiting for you". Nothing left to poll either way.
-		if (gap.status in TERMINAL_GAP_STATES) settle(watch.key)
+		if (gap.status in TERMINAL_GAP_STATES) {
+			settle(
+				watch.key,
+				outcome = when (gap.status) {
+					"complete" -> OUTCOME_DONE
+					"failed" -> OUTCOME_FAILED
+					else -> OUTCOME_NEEDS_PICK
+				},
+				state = gap.status,
+				reason = gap.sourceTask?.error.orEmpty()
+			)
+		}
 	}
 
-	/** Resume any fill that outlived the process. Called once, at startup. */
+	/**
+	 * Resume any fill that outlived the process, and publish the ledger. Called once, at
+	 * startup — the downloads view must show yesterday's history without a fill running.
+	 */
 	fun resumeWatches() {
 		scope.launch {
-			val live = watchLock.withLock { loadWatches().values.count { !it.settled } }
+			val live = watchLock.withLock {
+				val watches = loadWatches()
+				// Re-save rather than just reading: this is what applies the retention
+				// rules and, being the single write point, publishes the ledger.
+				saveWatches(watches)
+				watches.values.count { !it.settled }
+			}
 			if (live > 0) ensurePolling()
 		}
 	}
@@ -742,10 +1140,39 @@ class LbBotManager(
 		private const val KIND_GAP = "gap"
 		private const val POLL_INTERVAL_MS = 5_000L
 
+		/** Never let the loop spin: a tick that overran its own interval still waits. */
+		private const val MIN_POLL_GAP_MS = 1_000L
+
+		/** Requests in flight per tick, matching the hub's own PROXY_MAX_INFLIGHT ceiling
+		 *  minus one, so a burst of watches can't crowd out an interactive call. */
+		private const val MAX_POLLS_PER_TICK = 3
+
+		/** How long the two poll routes get before the client gives up on the tick —
+		 *  well under the client's general 60 s, which is sized for `gap/search`. */
+		private const val POLL_TIMEOUT_MS = 12_000L
+
+		/** Identical answers before the interval doubles, then doubles again. */
+		private const val QUIET_TICKS_FIRST = 4
+		private const val QUIET_TICKS_SECOND = 10
+
 		/** lb-bot's verifier gives up after ten minutes and leaves a fill on `placed`
 		 *  forever, so the client needs a wall clock of its own or it polls with no end. */
 		private const val WATCH_TIMEOUT_MS = 20 * 60 * 1000L
 		private const val UNKNOWN_POLL_LIMIT = 18
+
+		/** How long a *finished* row stays readable, and how many are kept at all.
+		 *  Running rows are still bounded by WATCH_TIMEOUT_MS — different question. */
+		private const val LEDGER_RETAIN_MS = 7 * 24 * 60 * 60 * 1000L
+		private const val LEDGER_MAX = 50
+
+		const val OUTCOME_RUNNING = "running"
+		const val OUTCOME_DONE = "done"
+		const val OUTCOME_FAILED = "failed"
+		/** The gap picker has candidates and wants a choice — not a failure. */
+		const val OUTCOME_NEEDS_PICK = "needs_pick"
+		const val OUTCOME_CANCELLED = "cancelled"
+		/** Nothing ever acted on it: lb-bot never wrote a ledger row, or forgot it. */
+		const val OUTCOME_GAVE_UP = "gave_up"
 
 		/** `placed` is deliberately absent: the interesting transition is
 		 *  placed -> verified, which is Navidrome confirming the files really landed. */
@@ -1139,7 +1566,15 @@ data class LbGapCoverage(
 	val unmatched: List<String> = emptyList()
 )
 
-/** One in-flight fill, persisted so it survives leaving the screen and being killed. */
+/**
+ * One fill, persisted so it survives leaving the screen and being killed — and, once
+ * settled, so it survives *ending*. This is the stored form of a ledger row.
+ *
+ * Every field added since the first version has a default, which is what lets an older
+ * stored map decode straight into the newer shape: a fill written before the ledger
+ * existed reads back as a running row with no display fields, which the poll fills in on
+ * its next tick. A decode failure is caught and degrades to "no history", never a crash.
+ */
 @Serializable
 private data class LbWatch(
 	val kind: String,
@@ -1148,5 +1583,99 @@ private data class LbWatch(
 	val quality: String = "",
 	val startedAt: Long = 0L,
 	val settled: Boolean = false,
-	val unknownPolls: Int = 0
+	/** *Consecutive* ambiguous-idle answers. Reset by any real state; see `recordTick`. */
+	val unknownPolls: Int = 0,
+
+	// ----- ledger: enough to render and re-issue the fill with no second read ----- //
+	val artist: String = "",
+	val album: String = "",
+	val sourcePeer: String = "",
+	val sourceFolder: String = "",
+	val finishedAt: Long = 0L,
+	/** The last state lb-bot reported, kept verbatim so the row can explain itself. */
+	val state: String = "",
+	val outcome: String = "running",
+	val reason: String = "",
+	val percent: Int = 0,
+	val done: Int = 0,
+	val total: Int = 0,
+	val mp3WouldHelp: Boolean = false,
+	/** lb-bot's review group. A gap fill *is* one, so this only carries an album's —
+	 *  which `album/status` reports, and which Allow MP3 needs to address the album. */
+	val groupId: String = "",
+
+	// ----- adaptive polling ------------------------------------------------------ //
+	/** Digest of the last answer. Identical twice running means nothing is moving. */
+	val fingerprint: String = "",
+	val quietTicks: Int = 0,
+	val nextPollAt: Long = 0L
+) {
+	/** When this row last did anything — its sort key, live or dead. */
+	fun finishedAtOrStart(): Long = if (finishedAt > 0L) finishedAt else startedAt
+
+	fun toEntry(): LbFillEntry = LbFillEntry(
+		key = key,
+		isGap = kind == "gap",
+		rgid = if (kind == "gap") "" else key,
+		groupId = if (kind == "gap") key else groupId,
+		releaseMbid = releaseMbid,
+		artist = artist,
+		album = album,
+		quality = quality,
+		state = state,
+		outcome = outcome,
+		reason = reason,
+		percent = percent,
+		done = done,
+		total = total,
+		mp3WouldHelp = mp3WouldHelp,
+		settled = settled,
+		startedAt = startedAt,
+		finishedAt = finishedAt
+	)
+}
+
+/**
+ * One row of the downloads view: a fill this device asked for, in flight or finished.
+ *
+ * Deliberately flat and self-contained — the view that renders it may be opened days
+ * after the fill, on a screen that has no artist page behind it, and possibly after
+ * lb-bot has forgotten the fill entirely (its own ledger is in memory and capped).
+ */
+data class LbFillEntry(
+	val key: String,
+	/** Gap fills (an album the library holds *partly*) take a different retry path. */
+	val isGap: Boolean,
+	val rgid: String,
+	val groupId: String,
+	val releaseMbid: String,
+	val artist: String,
+	val album: String,
+	val quality: String,
+	val state: String,
+	val outcome: String,
+	/** lb-bot's own sentence for a failure. Shown verbatim — it names the cause. */
+	val reason: String,
+	val percent: Int,
+	val done: Int,
+	val total: Int,
+	/** The search rejected mp3s and would have found something with them. */
+	val mp3WouldHelp: Boolean,
+	val settled: Boolean,
+	val startedAt: Long,
+	val finishedAt: Long
+) {
+	val isRunning: Boolean get() = !settled
+	val succeeded: Boolean get() = outcome == "done"
+	/** Cover art for a release the library by definition does not have. */
+	val coverUrl: String get() = LbBotManager.caaCoverUrl(rgid)
+}
+
+/** A fill reaching a terminal outcome. Emitted once, from `settle`. */
+data class LbFillEvent(
+	val key: String,
+	val artist: String,
+	val album: String,
+	val outcome: String,
+	val reason: String
 )

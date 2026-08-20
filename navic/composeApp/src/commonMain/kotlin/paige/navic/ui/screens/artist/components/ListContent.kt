@@ -60,9 +60,15 @@ fun ArtistListScreenContent(
 
 	val totalArtistCount = data.size
 
-	val grouped = data.groupBy { it.name.firstOrNull()?.uppercaseChar() ?: '#' }
-		.toList()
-		.sortedBy { it.first }
+	// Remembered on the data: this buckets and sorts the WHOLE artist library, and it ran on every
+	// recomposition of this screen (a long-press selection, a starred flag, a download tick).
+	// `headerIndices` below was already memoized — but off `grouped`, which was a new list each
+	// pass, so that remember never actually hit either.
+	val grouped = remember(data) {
+		data.groupBy { it.name.firstOrNull()?.uppercaseChar() ?: '#' }
+			.toList()
+			.sortedBy { it.first }
+	}
 
 	val headerIndices = remember(grouped) {
 		var currentIndex = 1
