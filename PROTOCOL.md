@@ -87,7 +87,9 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
   it on every future `hello` (so reconnects don't create duplicate devices).
 - `caps` is also how a client opts into optional behaviour. `"loadAck"` means this
   receiver answers a transfer's `do:load` with a `loaded` frame (§7.1); a receiver
-  that does not advertise it is never held to the timeout.
+  that does not advertise it is never held to the timeout. `"transferAckV2"` means it
+  also echoes the directive's `transferId` on `loaded` and `released`, so the hub can
+  match a reply to the attempt that asked for it (§7.2).
 - `bridgedBy` is set only by a **virtual** device — a receiver whose socket is held
   on behalf of hardware the hub cannot reach itself (today: a Chromecast, §12.2).
   It names the client process holding the bridge.
@@ -242,12 +244,15 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 **`t:"loaded"` — transfer acknowledgement** (receivers advertising `loadAck` only):
 
 ```jsonc
-{ "t":"loaded", "ok":false, "error":"no route to host" }
+{ "t":"loaded", "transferId":"t7", "ok":false, "error":"no route to host" }
 ```
 
 Answers a `do:load` that arrived as part of a transfer (§7). `ok:true` means audio
-is actually running (or paused at the requested spot, if `play:false`); `ok:false`
-means the receiver could not start. Silence for 10 s counts as failure. See §7.1.
+is actually running (or paused at the requested spot, if `play:false`) — the receiver
+must have *observed* that, not merely called its player's API; `ok:false` means it
+could not start. Silence for the directive's `timeoutMs` (10 s) counts as failure.
+`transferId` echoes `do:load` and is required from receivers advertising
+`transferAckV2`. See §7.1-7.2.
 
 **`t:"deviceState"` — a bridge's verdict on its hardware** (bridged devices only):
 
@@ -382,6 +387,61 @@ The wait runs off the issuing socket's read loop, as does the `release` handshak
 step 1 — the common case is the active receiver transferring away from *itself*, and
 awaiting inside its own read loop means the hub cannot read the very `released`
 frame it is waiting for.
+
+### 7.2 Correlating the handoff (`transferId`, `timeoutMs`)
+
+§7.1 correlates a reply to a **device**. That is not enough, because a transfer is a
+two-phase transaction and a device outlives any one attempt at it. Three failures
+follow from device-only correlation, all ending with the hub holding a state no
+speaker agrees with:
+
+- A `loaded` delayed past its own 10 s deadline satisfies the **next** transfer to
+  the same device. The hub calls that load good on the strength of an answer to a
+  question it stopped asking.
+- **ABA.** Transfer A → X times out; B moves to Y; C moves back to X. A's expired
+  rollback sees "X is active" — true again, for an unrelated reason — and undoes C.
+- A duplicate `released` from an earlier handoff completes the release future armed
+  for the current one, ending phase 1 early *and* rewinding the session to where that
+  device stood two transfers ago.
+
+So every handoff gets an opaque hub-minted `transferId`, carried on all four frames:
+
+```
+1.  Hub → A : { t:do, cmd:release, transferId:"t7" }
+1a. A   → Hub: { t:released, transferId:"t7", index:I, positionMs:P }
+3.  Hub → B : { t:do, cmd:load, transferId:"t7", timeoutMs:10000, tracks:[…], … }
+3a. B   → Hub: { t:loaded, transferId:"t7", ok:true }
+```
+
+A receiver advertising `caps:["transferAckV2"]` **must** echo the id it was given;
+an ack whose id does not match the phase currently pending is discarded, and the
+phase runs its own course (timeout, rollback) as if nothing had arrived. A receiver
+without the cap is correlated by device exactly as in §7.1 — it was never told to
+echo anything, and holding it to a rule it cannot know about would fail every
+transfer it wins.
+
+Two further hub-side rules make the id sufficient rather than merely present:
+
+- **The active slot carries a generation.** Every assignment to `activeDeviceId`
+  bumps it, so a rollback can require *the exact assignment it made* to still stand,
+  not just the same id. This is what actually kills ABA — and the reconnect case
+  underneath it, where a dropped device takes its own orphaned session back (§7,
+  "Active receiver disappears") and an id-only check would let an abandoned load's
+  deadline tear that down.
+- **A superseded wait is cancelled, not left running.** Arming a new load future for
+  a device cancels the previous one, so two waiters never race to roll the same slot
+  back.
+
+**`timeoutMs`** is the receiver's share of the same deadline, measured from dispatch.
+The hub owns `LOAD_TIMEOUT`; without being told it, a receiver picks its own — Navic's
+Cast bridge allowed 25 s per connect attempt, and made two — and a load that lands
+after the rollback is audio on a speaker no client believes is active. A receiver must
+answer inside the budget, reserving enough of it to send the ack, and must guarantee
+that an attempt abandoned on expiry cannot still start playback afterwards.
+
+Delivery of `do:release` and `do:load` is checked rather than assumed. A send that
+fails immediately ends its phase immediately, instead of the hub sitting the full
+timeout waiting for an answer to a frame that never left the process.
 
 ---
 

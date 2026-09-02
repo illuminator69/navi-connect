@@ -38,6 +38,17 @@ PORT = int(os.environ.get("HUB_PORT", "4790"))
 # Plain-HTTP health endpoint (for Docker HEALTHCHECK / uptime probes). Defaults to PORT+1.
 HEALTH_PORT = int(os.environ.get("HUB_HEALTH_PORT", str(PORT + 1)))
 TOKEN = os.environ.get("HUB_TOKEN", "")
+# Running with no token used to be a warning. It shouldn't be: the WebSocket is a full
+# administrative surface even when the HTTP proxies correctly disable themselves without
+# one. Anybody who can reach the port can enumerate devices and sessions, rewrite the
+# queue, transfer playback, and claim an existing device id — registration deliberately
+# supersedes the socket already holding it (close 4003). This hub is documented as sitting
+# behind a publicly reachable server, so the default has to be "refuse to start".
+#
+# The escape hatch is explicit and loopback-only: a LAN experiment can set
+# HUB_ALLOW_INSECURE_NO_AUTH=true, and then HUB_HOST must be a loopback address.
+ALLOW_INSECURE_NO_AUTH = os.environ.get("HUB_ALLOW_INSECURE_NO_AUTH", "").lower() in (
+    "1", "true", "yes", "on")
 STATE_PATH = os.environ.get("HUB_STATE", "/data/state.json")
 # Drop known devices not seen within this many days. 0 = keep forever.
 # Runs on load AND on a periodic sweep (DEVICE_SWEEP_INTERVAL): without the sweep a
@@ -165,6 +176,18 @@ class Session:
     saved_queue_id: Optional[str] = None
     source_kind: str = "manual"                       # album|playlist|radio|moodFlow|journey|manual
     source_name: Optional[str] = None
+    # Bumped on EVERY assignment to active_device_id, so "is the slot still where I
+    # left it" is answerable. The device id alone can't answer it: A -> B -> A leaves
+    # the same id with a different meaning, and a timed-out transfer to A that only
+    # compared ids would roll back the *later* transfer that legitimately won A back.
+    # Runtime only — a restart clears the active slot anyway (see _load).
+    active_gen: int = 0
+
+    def set_active(self, device_id: Optional[str]) -> int:
+        """Assign the active slot and return the generation that assignment created."""
+        self.active_device_id = device_id
+        self.active_gen += 1
+        return self.active_gen
 
     def snapshot(self) -> dict:
         return {
@@ -202,6 +225,12 @@ class Device:
     ws: Any = None                       # live websocket, not persisted
     release_future: Any = None           # set during a transfer handoff
     load_future: Any = None              # set while awaiting a transfer's `loaded` ack
+    # Which transfer each of those futures belongs to (PROTOCOL §7.2). Without this,
+    # correlation is by device alone: a `loaded` delayed past its own transfer's
+    # timeout satisfies the NEXT transfer to the same device, and the hub calls a
+    # load good on the strength of a reply to a question it stopped asking.
+    release_tid: Optional[str] = None
+    load_tid: Optional[str] = None
     # REACHABILITY: the bridge's own verdict on the physical device behind it.
     # None = unknown / not applicable (every ordinary client, which IS its own
     # hardware). False = the bridge is connected but the speaker did not answer.
@@ -976,7 +1005,14 @@ class Hub:
         # Serializes transfers, which run off the issuing socket's read loop (see
         # _on_act's "transfer" branch) and so could otherwise interleave.
         self._transfer_lock = asyncio.Lock()
+        # Monotonic id for every handoff, carried on do:release/released and
+        # do:load/loaded so a reply can be matched to the attempt that asked for it.
+        self._transfer_seq = 0
         self._load()
+
+    def _next_transfer_id(self) -> str:
+        self._transfer_seq += 1
+        return f"t{self._transfer_seq}"
 
     def _mark_play_intent(self) -> None:
         self._play_intent_at = time.monotonic()
@@ -1114,6 +1150,45 @@ class Hub:
                 await dev.ws.send(json.dumps(obj))
             except Exception:  # noqa: BLE001 — drop; close handler will clean up
                 pass
+
+    async def _send_required(self, dev: Optional[Device], obj: dict) -> bool:
+        """Send a frame whose delivery the caller's correctness depends on.
+
+        `_send` is right for fan-out — one dead observer must not fail a broadcast —
+        but a transfer's do:release / do:load are half of a two-phase handoff. Swallowing
+        a send error there means the phase can only end by timing out: the hub sits the
+        full RELEASE_TIMEOUT or LOAD_TIMEOUT waiting for an answer to a frame that never
+        left the process, and logs it as if the receiver were merely slow.
+        """
+        if dev is None or dev.ws is None:
+            log(f"required send '{obj.get('cmd') or obj.get('t')}' dropped: "
+                f"{dev.name if dev else '?'} has no socket")
+            return False
+        try:
+            await dev.ws.send(json.dumps(obj))
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"required send '{obj.get('cmd') or obj.get('t')}' to {dev.name} failed: {e}")
+            return False
+
+    @staticmethod
+    def _ack_matches(dev: Device, msg: dict, expected: Optional[str], kind: str) -> bool:
+        """Does this transfer acknowledgement belong to the phase we're waiting on?
+
+        A receiver advertising `transferAckV2` must echo the directive's `transferId`,
+        and an ack that doesn't match is discarded — that is the whole point of the cap.
+        Everyone else is exempt and correlated by device as before: an older client
+        never learned to echo anything, and holding it to a rule it can't know about
+        would fail every transfer it wins.
+        """
+        if "transferAckV2" not in (dev.caps or []):
+            return True
+        got = msg.get("transferId")
+        if got == expected:
+            return True
+        dlog(f"{kind.upper()} from {dev.name}/{dev.id[:8]} IGNORED — "
+             f"transferId {got!r}, awaiting {expected!r}")
+        return False
 
     async def _send_to(self, device_id: Optional[str], obj: dict) -> None:
         if device_id:
@@ -1565,9 +1640,14 @@ class Hub:
             if msg.get("t") != "hello" or not token_ok:
                 got = str(msg.get("token") or "")
                 name = (msg.get("device") or {}).get("name", "?")
-                log(f"AUTH REJECTED for {name!r}: got token "
-                    f"{got[:4]!r}…(len {len(got)}), expected …(len {len(TOKEN)}) — "
-                    f"check HUB_TOKEN (note: docker --env-file does NOT strip quotes)")
+                # Length only, never a prefix of what was supplied. The prefix was there to
+                # catch a quoted value from docker --env-file, and the length difference it
+                # produces says the same thing without putting four characters of somebody's
+                # secret in a log file that gets pasted into bug reports.
+                log(f"AUTH REJECTED for {name!r}: supplied token has length {len(got)}, "
+                    f"expected {len(TOKEN)} — check HUB_TOKEN "
+                    f"(note: docker --env-file does NOT strip quotes, which shows up here "
+                    f"as a length two greater than expected)")
                 await ws.send(json.dumps({"t": "error", "code": "auth", "message": "bad token"}))
                 await self._close(ws, 4001, "auth")
                 return
@@ -1662,7 +1742,7 @@ class Hub:
             # final position, and after the clear below nothing else will write it.
             self._touch_saved_queue_progress()
             self.session.is_playing = False
-            self.session.active_device_id = None
+            self.session.set_active(None)
             self.session.bump()
             await self._broadcast_session()
         await self._broadcast_devices()
@@ -1677,7 +1757,11 @@ class Hub:
             await self._on_device_state(dev, msg)
         elif t == "loaded":
             fut = dev.load_future
-            if fut is not None and not fut.done():
+            if fut is None or fut.done():
+                dlog(f"LOADED from {dev.name}/{dev.id[:8]} ignored — nothing pending")
+            elif not self._ack_matches(dev, msg, dev.load_tid, "loaded"):
+                pass
+            else:
                 fut.set_result(msg)
         elif t == "report":
             await self._on_report(dev, msg)
@@ -1695,6 +1779,12 @@ class Hub:
             if not authoritative:
                 dlog(f"RELEASED from {dev.name}/{dev.id[:8]} IGNORED (not active, no pending release)")
                 return
+            # Being the active device isn't enough on its own. A duplicate `released`
+            # from a handoff two transfers ago arrives from a device that is active
+            # again, and would complete the release future armed for the CURRENT
+            # handoff — finishing phase one on the strength of an old answer.
+            if fut is not None and not self._ack_matches(dev, msg, dev.release_tid, "released"):
+                return
             changed = False
             if "positionMs" in msg:
                 pos = max(0, int(msg["positionMs"]))
@@ -1707,7 +1797,7 @@ class Hub:
                     self.session.index = idx
                     changed = True
             if self.session.active_device_id == dev.id:
-                self.session.active_device_id = None
+                self.session.set_active(None)
                 changed = True
             if fut and not fut.done():
                 fut.set_result(True)
@@ -1802,7 +1892,8 @@ class Hub:
         # Promote the sender to active when there's nothing playing yet.
         promoted = False
         if active is None and action in ("play", "setQueue"):
-            s.active_device_id = active = dev.id
+            active = dev.id
+            s.set_active(active)
             promoted = True
             await self._broadcast_devices()
 
@@ -2120,7 +2211,7 @@ class Hub:
             if dev.reachable is False and self.session.active_device_id == dev.id:
                 self._touch_saved_queue_progress()
                 self.session.is_playing = False
-                self.session.active_device_id = None
+                self.session.set_active(None)
                 self.session.bump()
                 await self._broadcast_session()
                 await self._broadcast_devices()
@@ -2174,20 +2265,28 @@ class Hub:
             log(f"transfer -> {target.name}: already active, no-op")
             return
 
+        tid = self._next_transfer_id()
         old = self.devices.get(old_id) if old_id else None
         if old is not None and old.online:
             fut = asyncio.get_running_loop().create_future()
             old.release_future = fut
-            await self._send(old, {"t": "do", "cmd": "release"})
+            old.release_tid = tid
+            sent = await self._send_required(
+                old, {"t": "do", "cmd": "release", "transferId": tid})
             try:
-                await asyncio.wait_for(fut, RELEASE_TIMEOUT)
+                # A frame that never left the process will never be answered. Waiting
+                # RELEASE_TIMEOUT for it just delays the handoff by a second and a half
+                # and then reports it as the old device being slow.
+                if sent:
+                    await asyncio.wait_for(fut, RELEASE_TIMEOUT)
             except asyncio.TimeoutError:
                 log(f"release timed out for {old.name}; using last known position")
             finally:
                 old.release_future = None
+                old.release_tid = None
         # s.position_ms / s.index now reflect the old device's final report (or last known).
 
-        s.active_device_id = target_id
+        gen = s.set_active(target_id)
         s.is_playing = play
         self._mark_play_intent()
         s.bump()
@@ -2202,19 +2301,33 @@ class Hub:
         # can't arrive first and be dropped on the floor.
         fut = None
         if "loadAck" in (target.caps or []):
+            # Whatever the previous attempt was waiting for, it is not this. Leaving it
+            # alive would keep a second waiter running against the same device until it
+            # timed out, and racing this one to roll the slot back.
+            prev = target.load_future
+            if prev is not None and not prev.done():
+                prev.cancel()
             fut = asyncio.get_running_loop().create_future()
             target.load_future = fut
-        await self._send(target, {"t": "do", "cmd": "load",
-                                  "tracks": s.queue, "index": s.index,
-                                  "positionMs": s.position_ms, "play": play})
-        log(f"transfer -> {target.name} @ index {s.index}, {s.position_ms}ms")
+            target.load_tid = tid
+        # The receiver needs the SAME deadline the hub is holding it to. Without it a
+        # bridge picks its own — Navic allowed 25s per connect attempt, twice — and a
+        # load that lands after the rollback is audio on a speaker no client believes
+        # is active. Measured from dispatch; the receiver must answer inside it.
+        await self._send_required(target, {"t": "do", "cmd": "load",
+                                           "transferId": tid,
+                                           "timeoutMs": int(LOAD_TIMEOUT * 1000),
+                                           "tracks": s.queue, "index": s.index,
+                                           "positionMs": s.position_ms, "play": play})
+        log(f"transfer {tid} -> {target.name} @ index {s.index}, {s.position_ms}ms")
         # Awaited off to the side: this runs inside the *controller's* read loop, and
         # blocking it for LOAD_TIMEOUT would stall every other frame that controller
         # sends while a slow speaker warms up.
         if fut is not None:
-            asyncio.create_task(self._await_load_ack(target, old_id, fut))
+            asyncio.create_task(self._await_load_ack(target, old_id, fut, tid, gen))
 
-    async def _await_load_ack(self, target: Device, old_id: Optional[str], fut: Any) -> None:
+    async def _await_load_ack(self, target: Device, old_id: Optional[str], fut: Any,
+                              tid: str, gen: int) -> None:
         """Roll the active slot back if a transfer target never starts playing.
 
         The hub commits `active_device_id` before sending `do:load` on purpose (the
@@ -2228,6 +2341,10 @@ class Hub:
             msg = await asyncio.wait_for(fut, LOAD_TIMEOUT)
             ok = bool(msg.get("ok", True))
             err = str(msg.get("error") or "load failed")
+        except asyncio.CancelledError:
+            # Superseded by a newer transfer to this same device, which cancelled us
+            # on its way past. It owns the outcome now.
+            return
         except asyncio.TimeoutError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -2235,18 +2352,24 @@ class Hub:
         finally:
             if target.load_future is fut:
                 target.load_future = None
+                target.load_tid = None
         if ok:
             return
         s = self.session
         # A newer transfer (or a takeover) already moved on — that decision wins.
-        if s.active_device_id != target.id:
-            log(f"load ack for {target.name} failed ({err}) but it is no longer active")
+        #
+        # The generation, not just the device id: A -> X, B -> Y, C -> X leaves X active
+        # again, so an id-only check let A's expired rollback undo C. `gen` is the exact
+        # assignment this transfer made, and any later one — including C's — invalidates it.
+        if s.active_gen != gen or s.active_device_id != target.id:
+            log(f"load ack {tid} for {target.name} failed ({err}) but a newer decision "
+                f"({s.active_gen} > {gen}) already owns the slot")
             return
         # Hand the slot back only if the previous owner is still there to take it;
         # otherwise leave it orphaned, which is the signal every client already knows
         # how to read (adopt the queue locally, paused).
         old = self.devices.get(old_id) if old_id else None
-        s.active_device_id = old.id if (old is not None and old.transferable()) else None
+        s.set_active(old.id if (old is not None and old.transferable()) else None)
         s.is_playing = False
         s.bump()
         log(f"transfer to {target.name} FAILED ({err}); active -> {s.active_device_id}")
@@ -2349,9 +2472,29 @@ async def _serve_health(hub: Hub, reader: asyncio.StreamReader,
             pass
 
 
+def _check_auth_config() -> None:
+    """Refuse to run as an open control plane. See ALLOW_INSECURE_NO_AUTH."""
+    if TOKEN:
+        return
+    if not ALLOW_INSECURE_NO_AUTH:
+        raise SystemExit(
+            "HUB_TOKEN is not set.\n"
+            "The WebSocket control plane has administrative reach — claiming device ids, "
+            "rewriting the queue, moving playback — so the hub will not run without a token.\n"
+            "Set HUB_TOKEN, or for a loopback-only experiment set "
+            "HUB_ALLOW_INSECURE_NO_AUTH=true with HUB_HOST=127.0.0.1."
+        )
+    if HOST not in ("127.0.0.1", "::1", "localhost"):
+        raise SystemExit(
+            f"HUB_ALLOW_INSECURE_NO_AUTH is set but HUB_HOST is {HOST!r}.\n"
+            "Unauthenticated mode is restricted to loopback — bind 127.0.0.1, or set HUB_TOKEN."
+        )
+    log("WARNING: running with NO AUTHENTICATION on loopback only "
+        "(HUB_ALLOW_INSECURE_NO_AUTH). Never do this on a reachable interface.")
+
+
 async def main() -> None:
-    if not TOKEN:
-        log("WARNING: HUB_TOKEN is empty — the hub will accept any client. Set it!")
+    _check_auth_config()
     if MIRROR_PLAYQUEUE and not NAVIDROME_URL:
         log("WARNING: HUB_MIRROR_PLAYQUEUE is on but NAVIDROME_URL is unset — "
             "the savePlayQueue mirror is disabled. Set it in .env.")
