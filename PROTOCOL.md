@@ -786,7 +786,7 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/status` | `GET /api/summary` | — | 60 s |
 | `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s |
 | `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
-| `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external` | — |
+| `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external`, `title`, `artist`, `type`, `year` | — |
 | `GET /lb/fresh-releases` | same | `days`, `limit` | 60 s |
 | `GET /lb/album/releases` | same | `rgid` | 6 h |
 | `GET /lb/album/tracklist` | same | `release_mbid`, `album_ids`, `group_id` | 6 h |
@@ -899,6 +899,30 @@ produces** (the scanner emits only `complete` / `incomplete` / `untagged` /
 `missing`). Every status map must tolerate it, and it is the documented reason no
 client may filter discography rows on `status === 'missing'`.
 
+It also takes an **optional caller override** — `title` (required for the
+override to apply), plus `artist`, `type`/`primary_type` and `year` — used only
+when MusicBrainz does not answer. lb-bot caches a transient failure for five
+minutes *per exact query string* and returns `{}` inside that window without
+asking again, so one 503 turned this route into a hard 502 on that album for
+everyone who asked next. Every caller reaches it from a Fresh row or an album
+page that already holds all four fields, which is the same escape hatch
+`album/sources` and `album/download` have. (The narrower half of that trap is
+gone too: the index add now asks MusicBrainz with the *same* `inc=` string the
+album page sends, so the two share a cache entry and a page that rendered cannot
+fail to index. `GET /lb/album/releases` returns `primaryType` and `year`
+alongside `title`/`artist` so a client has the override to hand.)
+
+**A discography read backfills the Navidrome album ids of `present` rows.**
+Placement can only flip a row to `present`; nothing on that path knows the album
+ids, and only a full rescan otherwise filled them in. But a `present` row counts
+as owned, so a filled album badged "in library" carried `navidrome_album_ids:
+[]` — and every "open the real album" path in both clients reads exactly that.
+`GET /lb/artist/discography` now resolves those rows against the cached Navidrome
+album index by normalized title within the artist (no MusicBrainz) and persists
+what it finds. A row that matches nothing keeps its ids empty and stays
+`present`: Navidrome may genuinely not have scanned yet, which is what Navic's
+`pendingSync` state is for.
+
 **`fresh-releases` is capped, and the cap is not cosmetic.** Unbounded, the route
 answers with the entire site-wide ListenBrainz window for the period — routinely
 past the proxy's `PROXY_MAX_RESPONSE` ceiling. Clients send `limit` (400 is
@@ -909,6 +933,15 @@ remainder by listen count, so `truncated` never means "we dropped something you
 own" — an obscure artist you have is exactly the row a plain popularity cut would
 lose. The route also carries `PROXY_SLOW_TIMEOUT`: a cold call is a ListenBrainz
 fetch plus a full Navidrome artist walk, which outlasts the default 20 s.
+
+Each row carries **three** ownership fields, and they are not interchangeable:
+`artistOwned` (+ `artistId`) says the artist is in the library, `releaseOwned`
+says this exact release-group is on disk, and **`releaseAlbumId`** is the
+Navidrome album behind `releaseOwned` — the handle a tile badged "in library"
+opens. Without it a client could only send such a row to its virtual album page
+and rely on that page's own redirect, which reads the index's album ids; an album
+lb-bot filled itself has none until the backfill above runs, so a tile that said
+the library holds the record opened a *download* page.
 
 **An oversized upstream body is a 502, never a truncated 200.** `read(n)` on the
 upstream response truncates *silently* — the status stays 200 and the body is a

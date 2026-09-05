@@ -400,8 +400,18 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # leads to an artist page that does not list the album it came from.
         #
         # Not cached: it is a write, and its answer is the row it just stored.
+        #
+        # `title`/`artist`/`type`/`year` are the caller's own metadata, used
+        # upstream ONLY when MusicBrainz doesn't answer. lb-bot caches a
+        # transient failure for five minutes per exact query string and returns
+        # {} inside that window without asking again, so one 503 was a hard 502
+        # on that album for everyone who asked next — with nothing the user
+        # could do. Every caller reaches here from a row that already names the
+        # release, which is the same escape hatch album/sources and
+        # album/download carry. Dropping them here would silently disarm it.
         "method": "POST", "path": "/api/artist/release",
-        "body": ("rgid", "mbid", "nd_id", "name", "external"), "cache": False,
+        "body": ("rgid", "mbid", "nd_id", "name", "external",
+                 "title", "artist", "type", "year"), "cache": False,
     },
     ("GET", "/lb/fresh-releases"): {
         # `limit` is not a nicety. Unbounded, this route answers with the entire
