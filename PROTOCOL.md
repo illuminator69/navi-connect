@@ -787,7 +787,7 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s |
 | `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
 | `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external` | — |
-| `GET /lb/fresh-releases` | same | `days` | 60 s |
+| `GET /lb/fresh-releases` | same | `days`, `limit` | 60 s |
 | `GET /lb/album/releases` | same | `rgid` | 6 h |
 | `GET /lb/album/tracklist` | same | `release_mbid`, `album_ids`, `group_id` | 6 h |
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
@@ -898,6 +898,25 @@ Note the status value it can store: **`present` is a fifth value no scan ever
 produces** (the scanner emits only `complete` / `incomplete` / `untagged` /
 `missing`). Every status map must tolerate it, and it is the documented reason no
 client may filter discography rows on `status === 'missing'`.
+
+**`fresh-releases` is capped, and the cap is not cosmetic.** Unbounded, the route
+answers with the entire site-wide ListenBrainz window for the period — routinely
+past the proxy's `PROXY_MAX_RESPONSE` ceiling. Clients send `limit` (400 is
+plenty; the page filters and buckets locally) and read back `total` and
+`truncated` alongside `releases`, so they can say "showing N of M". lb-bot keeps
+**every row whose artist is in the library** whatever the limit and fills the
+remainder by listen count, so `truncated` never means "we dropped something you
+own" — an obscure artist you have is exactly the row a plain popularity cut would
+lose. The route also carries `PROXY_SLOW_TIMEOUT`: a cold call is a ListenBrainz
+fetch plus a full Navidrome artist walk, which outlasts the default 20 s.
+
+**An oversized upstream body is a 502, never a truncated 200.** `read(n)` on the
+upstream response truncates *silently* — the status stays 200 and the body is a
+half-finished JSON document, which every client then fails to parse and reports
+as "couldn't reach the service". The proxy reads one byte past the ceiling and
+refuses with `{"error": …, "tooLarge": true}` instead. This was invisible on
+every route until the fresh feed grew past 4 MB and took both clients' tabs down
+at once; a corrupt success is worse than a clean error.
 
 **TTLs are not uniform, deliberately.** `artist/discography` is an instant SQLite
 read upstream, so 60 s is plenty. `album/releases` / `tracklist` / `similar` sit on

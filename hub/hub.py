@@ -404,8 +404,20 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "body": ("rgid", "mbid", "nd_id", "name", "external"), "cache": False,
     },
     ("GET", "/lb/fresh-releases"): {
+        # `limit` is not a nicety. Unbounded, this route answers with the entire
+        # site-wide ListenBrainz window, which runs past PROXY_MAX_RESPONSE — and
+        # a truncated body used to be served as a 200, so both clients showed an
+        # empty tab with nothing anywhere saying why.
+        #
+        # PROXY_SLOW_TIMEOUT for the same reason its rate-limited siblings have
+        # it: a cold call here is a ListenBrainz fetch (3 attempts, 25 s read
+        # timeout each) plus a full Navidrome artist listing plus a SQLite pass
+        # under lb-bot's index lock. One slow ListenBrainz attempt alone outlasts
+        # the default 20 s, and the 502 that produced was indistinguishable from
+        # lb-bot being down.
         "method": "GET", "path": "/api/fresh-releases",
-        "params": ("days",), "cache": True,
+        "params": ("days", "limit"), "cache": True,
+        "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/album/releases"): {
         "method": "GET", "path": "/api/album/releases",
@@ -560,7 +572,21 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return (r.status, r.read(PROXY_MAX_RESPONSE),
+            # One byte past the cap, so "exactly at the limit" and "over it" are
+            # distinguishable. `read(PROXY_MAX_RESPONSE)` alone TRUNCATES SILENTLY:
+            # the status stays 200 and the body is a half-finished JSON document,
+            # which every client then fails to parse and reports as "couldn't
+            # reach the service" — a corrupt success is worse than a clean error,
+            # and this was invisible on every route until lb-bot's fresh-releases
+            # feed grew past 4 MB and took both clients' tabs down with it.
+            raw = r.read(PROXY_MAX_RESPONSE + 1)
+            if len(raw) > PROXY_MAX_RESPONSE:
+                log(f"{label} proxy: upstream body exceeded {PROXY_MAX_RESPONSE} bytes")
+                return (502, json.dumps({
+                    "error": f"{label} response exceeded the {PROXY_MAX_RESPONSE}-byte "
+                             "proxy limit", "tooLarge": True}).encode(),
+                        "application/json")
+            return (r.status, raw,
                     r.headers.get("Content-Type") or "application/json")
     except urllib.error.HTTPError as e:
         try:
