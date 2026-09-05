@@ -786,12 +786,13 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/status` | `GET /api/summary` | — | 60 s |
 | `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s |
 | `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
+| `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external` | — |
 | `GET /lb/fresh-releases` | same | `days` | 60 s |
 | `GET /lb/album/releases` | same | `rgid` | 6 h |
 | `GET /lb/album/tracklist` | same | `release_mbid`, `album_ids`, `group_id` | 6 h |
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
-| `GET /lb/album/sources` | same | `rgid` | 60 s |
-| `POST /lb/album/download` | same | `rgid`, `sourceUsername`, `sourceFolder`, `quality` | — |
+| `GET /lb/album/sources` | same | `rgid`, `release_mbid`, `artist`, `album`, `total` | 60 s |
+| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality` | — |
 | `GET /lb/album/status` | same | `release_mbid`, `rgid` | **never** |
 | `POST /lb/album/allow-mp3` | `POST /api/gaps/{group_id}/allow-mp3` | `group_id`, `allow` | — |
 | `GET /lb/gap` | `GET /api/gaps/{group_id}` | `group_id`, `sourcePage` | **never** |
@@ -862,6 +863,41 @@ coverage, risk flags, score. This is a bandwidth control, not a security one (th
 whitelist is that), but it also keeps other people's file paths off the device. A
 non-200, a non-JSON body or an unexpected shape passes through untouched: a
 projection must never fail a request.
+
+**`album/status` says what kind of failure it was.** Alongside the free-text
+`reason` — which stays verbatim, because "103 peers offered 2,047 files, but none
+in FLAC, OPUS" is the evidence and paraphrasing it loses the answer — a failed
+fill carries `failureKind` (`no_source` | `format_rejected` | `transfer_failed` |
+`placement_failed` | `mb_unavailable`), `retryable` and `attempts`. All three are
+present and falsey on anything that has not failed, so a client reads them
+unconditionally. `retryable` means *a plain Retry is worth offering*: it is
+deliberately **false** for a format rejection that MP3 would fix, because
+re-running the identical search against the identical peers under the identical
+format policy is not a retry — Allow-MP3-and-retry is the action, and
+`mp3WouldHelp` is what says so. Only `mb_unavailable` and `transfer_failed`
+auto-retry upstream, once; `no_source` never does, since lb-bot already walked
+its whole ranked source list and the user asking again is the new information.
+`attempts` is cumulative on the ledger row and survives an lb-bot restart, so a
+client can tell one failure from four.
+
+**`artist/release` is the single-row index refresh.** The only other writers into
+lb-bot's `release_groups` table are a whole-artist delete-and-reinsert (reachable
+only from a full scan) and a flip-to-`present`, so the smallest unit of refresh
+used to be an entire artist at one MusicBrainz request per second per
+release-group. Since a stored discography is served immediately even when stale
+*by design*, a release published last week is simply absent — which is what made
+every Fresh row lead to an artist page that did not list the album it came from.
+This adds or re-classifies one release-group for one or two MusicBrainz calls,
+using the same classifier the full scan runs per row, so an `incomplete` result
+gets a real `group_id` and the gap-fill workspace is reachable from it. Call it
+when a rgid is not in the artist's discography; never offer a full rescan for one
+album. It appears in `GET /lb/status`'s `routes`, which is how a client that
+ships ahead of its hub finds out the button would do nothing.
+
+Note the status value it can store: **`present` is a fifth value no scan ever
+produces** (the scanner emits only `complete` / `incomplete` / `untagged` /
+`missing`). Every status map must tolerate it, and it is the documented reason no
+client may filter discography rows on `status === 'missing'`.
 
 **TTLs are not uniform, deliberately.** `artist/discography` is an instant SQLite
 read upstream, so 60 s is plenty. `album/releases` / `tracklist` / `similar` sit on

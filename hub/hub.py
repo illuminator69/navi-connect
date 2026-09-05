@@ -389,6 +389,20 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "method": "POST", "path": "/api/artist/discography",
         "body": ("mbid", "name", "nd_id", "external"), "cache": False,
     },
+    ("POST", "/lb/artist/release"): {
+        # Add or refresh ONE release-group in an artist's stored index.
+        #
+        # Without it the smallest unit of refresh is a whole artist, at one
+        # MusicBrainz request per second per release-group — which is what a
+        # release newer than the stored index otherwise costs to make visible.
+        # A stored discography is served immediately even when stale, by design,
+        # so a brand-new album is simply absent from it, and every Fresh row
+        # leads to an artist page that does not list the album it came from.
+        #
+        # Not cached: it is a write, and its answer is the row it just stored.
+        "method": "POST", "path": "/api/artist/release",
+        "body": ("rgid", "mbid", "nd_id", "name", "external"), "cache": False,
+    },
     ("GET", "/lb/fresh-releases"): {
         "method": "GET", "path": "/api/fresh-releases",
         "params": ("days",), "cache": True,
