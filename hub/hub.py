@@ -624,6 +624,7 @@ class HttpProxy:
     def __init__(self) -> None:
         self._sem = asyncio.Semaphore(PROXY_MAX_INFLIGHT)
         self._cache: dict[str, tuple[float, int, bytes, str]] = {}
+        self._cache_gen = 0
 
     # ----- per-upstream ---------------------------------------------------- #
     @property
@@ -703,6 +704,26 @@ class HttpProxy:
                 del self._cache[old]
         self._cache[key] = (time.monotonic() + ttl, status, body, ctype)
 
+    def invalidate(self, routes: set[tuple[str, str]]) -> int:
+        """Drop every cached answer for these routes, and void the ones in flight.
+
+        The generation bump is the half that matters under load: a read that went
+        upstream a moment BEFORE the invalidation returns the old answer a moment
+        AFTER it, and caching that would re-arm the very staleness this clears.
+        """
+        self._cache_gen += 1
+        wanted = [list(r) for r in routes]
+        dropped = 0
+        for key in list(self._cache):
+            try:
+                route = json.loads(key)[0]
+            except Exception:  # noqa: BLE001
+                continue
+            if route in wanted:
+                del self._cache[key]
+                dropped += 1
+        return dropped
+
     # ----- request handling ------------------------------------------------ #
     @staticmethod
     def _filtered_params(spec: dict, query: str) -> list[tuple[str, str]]:
@@ -772,6 +793,7 @@ class HttpProxy:
             if hit is not None:
                 return hit
 
+        gen = self._cache_gen
         url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
         if params:
@@ -786,7 +808,7 @@ class HttpProxy:
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
         data = self._strip(spec, status, data)
-        if spec.get("cache"):
+        if spec.get("cache") and gen == self._cache_gen:
             self._cache_put(key, status, data, ctype,
                             spec.get("ttl", PROXY_CACHE_TTL))
         return status, data, ctype
@@ -983,6 +1005,45 @@ HUB_INSTANCE: Optional["Hub"] = None
 # whether or not LBBOT_URL is configured, because this direction doesn't need it.
 LB_NOTIFY_PATH = "/lb/notify"
 _LB_NOTIFY_STR_MAX = 200
+_LB_NOTIFY_IDS_MAX = 16
+_LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"}
+
+# Cached lb-bot answers a landed album makes wrong. Deliberately NOT the long-TTL
+# MusicBrainz routes (editions, tracklists): a fill changes nothing about those.
+LB_LIBRARY_ROUTES = {
+    ("GET", "/lb/artist/discography"),
+    ("GET", "/lb/fresh-releases"),
+    ("GET", "/lb/status"),
+}
+
+# One discography release row, in the exact shape GET /lb/artist/discography
+# returns it, so a client can patch its copy without re-reading the page.
+_LB_ROW_STR = ("rgid", "title", "year", "primary_type", "effective_type",
+               "status", "match_method", "group_id")
+_LB_ROW_INT = ("present", "total")
+
+
+def _lb_notify_row(raw: Any) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    row: dict = {}
+    for key in _LB_ROW_STR:
+        value = _as_str(raw.get(key), _LB_NOTIFY_STR_MAX)
+        if value is not None:
+            row[key] = value
+    for key in _LB_ROW_INT:
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            row[key] = value
+    score = raw.get("match_score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        row["match_score"] = float(score)
+    for key, cap in (("secondary_types", 8), ("navidrome_album_ids", _LB_NOTIFY_IDS_MAX)):
+        values = raw.get(key)
+        if isinstance(values, list):
+            row[key] = [v for v in (_as_str(x, 128) for x in values[:cap]) if v]
+    # A row with no rgid can't be matched to anything a client holds.
+    return row if row.get("rgid") else None
 
 
 async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
@@ -1018,10 +1079,24 @@ async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
     # Rebuilt field by field rather than relayed: this goes straight out to every
     # client, so it carries only what the wire format promises, bounded in size.
     frame = {"t": "library", "event": "albumPlaced"}
-    for key in ("event", "release_mbid", "rgid", "artist", "album"):
+    for key in ("event", "release_mbid", "rgid", "artist", "album", "nd_artist_id"):
         value = _as_str(payload.get(key), _LB_NOTIFY_STR_MAX)
         if value:
-            frame["releaseMbid" if key == "release_mbid" else key] = value
+            frame[_LB_NOTIFY_RENAME.get(key, key)] = value
+    ids = payload.get("nd_album_ids")
+    if isinstance(ids, list):
+        clean = [v for v in (_as_str(i, 128) for i in ids[:_LB_NOTIFY_IDS_MAX]) if v]
+        if clean:
+            frame["ndAlbumIds"] = clean
+    row = _lb_notify_row(payload.get("row"))
+    if row:
+        frame["row"] = row
+
+    # BEFORE the broadcast. Every client answers this frame by re-reading, and a
+    # re-read served from a cache filled a minute ago is the old "missing" answer —
+    # which is exactly what made a landed album take a minute longer to show than
+    # the frame announcing it.
+    LB.invalidate(LB_LIBRARY_ROUTES)
 
     if HUB_INSTANCE is not None:
         await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
