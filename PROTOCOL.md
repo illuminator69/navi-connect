@@ -274,7 +274,7 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `progress` | `{ positionMs, index, isPlaying }` | throttled live position from active receiver |
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
-| `library` | `{ event, releaseMbid, rgid, artist, album }` | lb-bot placed an album into the library (§15.1) |
+| `library` | `{ event, releaseMbid, rgid, artist, album, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`) or Navidrome indexed it (`albumIndexed`) (§15.1) |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
@@ -1041,10 +1041,29 @@ field, into a `library` broadcast (§5.4) to every connected device.
   fine: the frame carries no authority, it only tells clients to re-read what they
   can already read.
 
-Clients treat it as "drop what you think the library holds": Feishin invalidates
-its Navidrome album queries and lb-bot's discography read. **Navic ignores it**
-today — it has no lb-bot surface yet (phase 3), so there is nothing there to
-refresh; the frame is forward-compatible with its unknown-`t` fallthrough.
+**Two events.** `albumPlaced` is sent at placement, *before* Navidrome's scan — a
+client re-reading the library then mostly sees it as it was. `albumIndexed` is sent
+by lb-bot's verifier once Navidrome's scan has finished and a placed track is found
+in it (it polls every 2 s for the first minute, then every 30 s). Only that event carries:
+
+- `ndAlbumIds` — the Navidrome album ids the matched tracks belong to (≤16 strings);
+- `ndArtistId` — the matched song's Navidrome artist id;
+- `row` — the release's updated discography row, in exactly the snake_case shape
+  `GET /lb/artist/discography` returns (rebuilt field by field, bounded).
+
+**The hub clears its cached lb-bot answers before broadcasting** (discography,
+fresh-releases, status; the long-TTL MusicBrainz routes are left alone), and bumps a
+cache generation so a read already in flight cannot write its pre-landing answer
+back. Without that, every client's re-read was served the hub's own 60 s old copy.
+
+Clients: Feishin re-reads the discography on either event, re-reads its Navidrome
+album/album-artist queries on `albumIndexed` (on `albumPlaced` only after a 20 s
+fallback, for an lb-bot that never sends the second event). Navic's `SyncManager`
+answers `albumIndexed` + `ndAlbumIds` with `DbRepository.syncAlbumsById` (one
+`getAlbum` per id, straight into Room — it used to buy a full library pull behind a
+90 s debounce), falls back to a bounded `newest` walk for events without ids, and
+then bumps `libraryRevision`, which makes the artist page re-read Room and the
+discography.
 
 Without the ping nothing breaks. lb-bot marks its own index row `present` at
 placement, so the next discography read on any client is already correct — the
