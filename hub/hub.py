@@ -476,10 +476,20 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # which also spares lb-bot a resolve that may be inside its MusicBrainz
         # failure cooldown. See /lb/album/sources above.
         "method": "POST", "path": "/api/album/download",
+        # `excludeUsers`: "try another source" — the peers that already failed or
+        # crawled for this album, so re-ranking cannot hand the fill straight back.
         "body": ("rgid", "release_mbid", "artist", "title", "total_tracks",
-                 "sourceUsername", "sourceFolder", "quality"),
+                 "sourceUsername", "sourceFolder", "quality", "excludeUsers"),
         "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/cancel"): {
+        # Stop one album fill wherever it has got to (searching, queued or
+        # transferring) and record it as a retryable `cancelled` failure. Before
+        # this the only cancel was slskd's own UI, which lb-bot misread as a
+        # transfer failure and re-queued from another peer.
+        "method": "POST", "path": "/api/album/cancel",
+        "body": ("release_mbid",), "cache": False,
     },
     ("GET", "/lb/album/status"): {
         "method": "GET", "path": "/api/album/status",
