@@ -103,7 +103,7 @@ them the features they power grey out or disappear entirely, by design. Start wi
 |---|---|---|
 | **Node.js** | Feishin | 20 LTS, then `corepack enable` (pnpm 11.5.2 is pinned via `packageManager`) |
 | **JDK** | Navic | **21** — the build sets `JavaVersion.VERSION_21` / `JVM_21`. Microsoft OpenJDK 21 works. |
-| **Android SDK** | Navic | `compileSdk`/`targetSdk` **37**, `minSdk` 24, AGP 9.2.1, Kotlin 2.3.21. Path goes in `navic/local.properties` (gitignored). |
+| **Android SDK** | Navic | `compileSdk`/`targetSdk` **37**, `minSdk` 24, AGP 9.2.1, Kotlin 2.3.21. Path goes in the client's `local.properties` (gitignored). |
 | **Python** | hub (non-Docker) | 3.11+ with `websockets`. Skip if you run the hub in Docker. |
 | An Android device | Navic | Android 7.0+ (minSdk 24). A **release** build — see §6. |
 
@@ -296,8 +296,10 @@ Two things to expect, both benign and both consequences of not paying for code-s
 Then skip to the configuration bullets at the end of each Option B subsection below — you still need
 to point each client at your hub.
 
-> **Source availability:** both clients are **GPL-3.0**. Navic's source is in `navic/` in this repo;
-> Feishin's is in [feishin-gaps](https://github.com/illuminator69/feishin-gaps), a fork of
+> **Source availability:** both clients are **GPL-3.0**, and each lives in its own repository.
+> Navic's source is in [navic-gaps](https://github.com/illuminator69/navic-gaps), a fork of
+> [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic); Feishin's is in
+> [feishin-gaps](https://github.com/illuminator69/feishin-gaps), a fork of
 > [jeffvli/feishin](https://github.com/jeffvli/feishin). The GPL entitles you to the corresponding
 > source for any binary here, and that's where it is.
 
@@ -306,7 +308,8 @@ to point each client at your hub.
 ### Feishin (Windows desktop)
 
 ```bash
-cd feishin
+git clone https://github.com/illuminator69/feishin-gaps.git
+cd feishin-gaps
 pnpm install
 pnpm dev                                            # development
 pnpm run build && pnpm exec electron-builder --win --x64 --dir   # → dist/win-unpacked/Feishin.exe
@@ -331,12 +334,14 @@ lockfile before.
 ### Navic (Android)
 
 ```bash
-set JAVA_HOME=C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot
-.\gradlew :androidApp:assembleRelease
+git clone -b navi-connect https://github.com/illuminator69/navic-gaps.git
+cd navic-gaps
+./gradlew :androidApp:assembleRelease
 ```
 
-Module layout catches people out: **`:androidApp`** is the Android application module, **`:composeApp`**
-is the shared KMP library. The release task is `:androidApp:assembleRelease` (~3 min, ~12 MB APK).
+Gradle provisions its own JDK 21 toolchain, so don't set `JAVA_HOME`. Module layout catches people
+out: **`:androidApp`** is the Android application module, **`:composeApp`** is the shared KMP
+library. The release task is `:androidApp:assembleRelease` (~6 min cold, ~12 MB APK).
 
 - **Test the release build, not debug.** Debug Compose is dramatically choppier and will send you
   chasing performance problems that don't exist.
