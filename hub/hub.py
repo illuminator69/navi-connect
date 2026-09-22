@@ -444,6 +444,42 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": ("artist_mbid", "artist_name", "rgid", "limit"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
+    ("GET", "/lb/meta/artist"): {
+        # Editorial "About": full Wikipedia text with its CC-BY-SA attribution,
+        # the Wikidata one-liner, band members / side projects, external links.
+        #
+        # PROXY_SLOW_TIMEOUT because a cold call is a MusicBrainz request
+        # (behind lb-bot's global 1 req/sec lock, so it can queue behind a
+        # running discography scan) plus two Wikimedia requests. A warm one is
+        # a SQLite read.
+        #
+        # PROXY_CACHE_TTL_LONG: encyclopaedia text is the definition of an
+        # effectively immutable upstream answer, and lb-bot caches it for 30
+        # days behind this anyway.
+        "method": "GET", "path": "/api/meta/artist",
+        "params": ("mbid", "name"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/meta/album"): {
+        # Same chain on a release-group, plus release credits (producer,
+        # engineer, writer). `release_mbid` is optional and only saves the
+        # canonical-release resolution.
+        #
+        # lb-bot caps paragraphs and credits server-side so this cannot reach
+        # PROXY_MAX_RESPONSE — a long article otherwise would, and an oversize
+        # body is answered 502 tooLarge, which is correct but user-visible.
+        "method": "GET", "path": "/api/meta/album",
+        "params": ("rgid", "release_mbid"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/artist/lookup"): {
+        # MusicBrainz artist search, so a client's own search can offer a "Not
+        # in your library" section that routes to the existing `mb:<mbid>`
+        # external artist page. Short TTL, not PROXY_CACHE_TTL_LONG: the answer
+        # is a search ranking, not an entity.
+        "method": "GET", "path": "/api/artist/lookup",
+        "params": ("q",), "cache": True, "timeout": PROXY_SLOW_TIMEOUT,
+    },
     ("GET", "/lb/album/sources"): {
         # Ranked slskd folders for a release-group, so a client can show what it is
         # about to download instead of taking lb-bot's top pick on faith. Coverage
