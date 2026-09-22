@@ -274,7 +274,7 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `progress` | `{ positionMs, index, isPlaying }` | throttled live position from active receiver |
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
-| `library` | `{ event, releaseMbid, rgid, artist, album, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`) or Navidrome indexed it (`albumIndexed`) (§15.1) |
+| `library` | `{ event, releaseMbid, rgid, artist, album, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1) |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
@@ -667,6 +667,12 @@ the only party that can tell the difference, and it must say so:
   mid-session should carry a grace window (~90 s) plus a failed probe before the
   bridge gives up on it; a phantom receiver for 90 s is much cheaper than dropping a
   live one.
+- Read the LAUNCH reply before acting on it. A `LAUNCH_ERROR` carries `reason` and
+  no `status`, and a `RECEIVER_STATUS` routinely arrives *before* the receiver app
+  is up, so a bridge that takes the first reply and looks for its appId reports a
+  refusal and a merely-slow launch identically — and discards the device's own
+  explanation while doing it. Wait for the status that carries the app, and put the
+  reason in `loaded.error`.
 - Answer `do:load` with `loaded` (§7.1). This is what turns "transferred to a TV that
   has been off for days" from a 20-second silent lie into an immediate, visible
   failure with the session handed back.
@@ -686,6 +692,13 @@ without arbitration the two would kick each other off indefinitely. The rule:
    simultaneous start without any frames being exchanged.
 4. On being closed with `4003`, **stay down for 5 minutes**. This is the circuit
    breaker; a client that reconnects immediately recreates the war.
+5. A **reconnect is a claim**. Re-run steps 1-3 before *every* re-registration,
+   not only the first — the hub evicts on any re-registration of the id, so a
+   bridge that dials straight back in after an ordinary socket blip kicks off
+   whoever took the speaker while it was away. Standing down for this reason
+   carries no 5-minute penalty: nobody was evicted, so there is no war to break,
+   and the bridge should be free to pick the speaker back up the moment the
+   holder lets go.
 
 **Adoption.** The bridge lives inside a client process, so restarting that client
 kills it while the speaker keeps playing. On reconnect a bridge must re-join the
@@ -784,16 +797,21 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | Hub route | Upstream | Forwarded | Cache |
 |---|---|---|---|
 | `GET /lb/status` | `GET /api/summary` | — | 60 s |
-| `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s |
+| `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s (cleared by `/lb/notify`) |
 | `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
 | `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external`, `title`, `artist`, `type`, `year` | — |
 | `GET /lb/fresh-releases` | same | `days`, `limit` | 60 s |
 | `GET /lb/album/releases` | same | `rgid` | 6 h |
 | `GET /lb/album/tracklist` | same | `release_mbid`, `album_ids`, `group_id` | 6 h |
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
+| `GET /lb/artist/similar` | same | `mbid`, `name`, `limit` | 60 s |
+| `GET /lb/artist/lookup` | same | `q` | 60 s |
+| `GET /lb/meta/artist` | `GET /api/meta/artist` | `mbid`, `name`, `refresh` | 6 h |
+| `GET /lb/meta/album` | `GET /api/meta/album` | `rgid`, `release_mbid`, `refresh` | 6 h |
 | `GET /lb/album/sources` | same | `rgid`, `release_mbid`, `artist`, `album`, `total` | 60 s |
-| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality` | — |
+| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality`, `excludeUsers` | — |
 | `GET /lb/album/status` | same | `release_mbid`, `rgid` | **never** |
+| `POST /lb/album/cancel` | `POST /api/album/cancel` | `release_mbid` | — |
 | `POST /lb/album/allow-mp3` | `POST /api/gaps/{group_id}/allow-mp3` | `group_id`, `allow` | — |
 | `GET /lb/gap` | `GET /api/gaps/{group_id}` | `group_id`, `sourcePage` | **never** |
 | `GET /lb/gap/source-files` | `GET /api/groups/{group_id}/sources/{source_index}/files` | `group_id`, `source_index` | 60 s |
@@ -804,6 +822,23 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `POST /lb/gap/rescan` | `POST /api/gaps/{group_id}/rescan` | `group_id` | — |
 
 No upstream token is injected — lb-bot has none to inject.
+
+**Two TTLs that look wrong and are not.** `/lb/album/similar` is cached for six
+hours and `/lb/artist/similar` for sixty seconds, from the same upstream
+similarity merge. The difference is what each answer contains: the albums route
+returns records the library already holds, which do not change; the artists route
+marks each row `owned`/`indexed`, lb-bot recomputes that marking per call, and it
+is the only part of the answer that moves. A six-hour TTL there would freeze the
+badges that decide whether a row offers a download. For the same reason
+`/lb/artist/similar` is in the set `/lb/notify` invalidates and
+`/lb/album/similar` is not — a fill changes who you own, and nothing about
+editions or tracklists.
+
+**`refresh` is not part of the cache key.** On the two `meta` routes it means
+"do not answer this from a cache", so the hub bypasses its own copy *and* writes
+the fresh answer under the ordinary key — where the next plain read finds it.
+Keying on it instead would give a refresh its own slot and leave the stale copy
+every other caller reads untouched, for the full six hours.
 
 **The `gap` group** fills the holes in an album the library already partly has —
 a different pipeline from `album/download`, which acquires a release it lacks
@@ -1064,6 +1099,26 @@ answers `albumIndexed` + `ndAlbumIds` with `DbRepository.syncAlbumsById` (one
 90 s debounce), falls back to a bounded `newest` walk for events without ids, and
 then bumps `libraryRevision`, which makes the artist page re-read Room and the
 discography.
+
+**`artistScanned`** carries only `ndArtistId` and `artist`: a discography scan
+(`POST /lb/artist/discography`) finished or failed. It changes lb-bot's index and
+nothing in Navidrome, so clients re-read that artist's discography and nothing else.
+The discography read now carries the scan's outcome — `scan: {state: running|done|failed,
+error, taskId, startedAt, finishedAt}` — because a scan MusicBrainz failed used to
+store an **empty** discography over the real one and report success, which every
+client rendered as "no releases". lb-bot now retries MusicBrainz, fails the scan
+with its reason and keeps what it had; a client matches `scan.taskId` against the
+id its POST returned and shows `error` verbatim. A POST while that artist's scan is
+running answers the running task's id instead of starting a second walk.
+
+**Not every landing is announced.** Anything placed without a tracked fill (lb-bot's
+own page, files matched by hand) or while the hub was down reaches Navidrome with
+no frame at all. Navic therefore also watches `getScanStatus` every 30 s and, when a
+scan ends or its count moves, runs `DbRepository.syncChangedAlbums`: the album list
+(a few paged requests) diffed against Room by track count and cover id, re-reading
+only what differs. Id-less `library` frames take the same sweep, which unlike the
+old `newest` walk also sees a gap fill — an album that is not new, only longer.
+
 
 Without the ping nothing breaks. lb-bot marks its own index row `present` at
 placement, so the next discography read on any client is already correct — the
