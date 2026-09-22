@@ -39,6 +39,7 @@ class Client:
         self.online = {}         # id -> online from devices/welcome
         self.saved_queue_id = None   # latest session.savedQueueId
         self.saved_queues = []       # latest savedQueues broadcast (or welcome)
+        self.mixes = []              # latest mixes broadcast (or welcome)
         self.position = None         # latest session.positionMs
         self.dos = []                # every `do` directive received
         self.errors = []             # every `error` frame received
@@ -68,12 +69,15 @@ class Client:
                 if t == "welcome":
                     self._apply_session(msg.get("session", {}))
                     self.saved_queues = msg.get("savedQueues", [])
+                    self.mixes = msg.get("mixes", [])
                     for d in msg.get("devices", []):
                         self.online[d["id"]] = d["online"]
                 elif t == "session":
                     self._apply_session(msg)
                 elif t == "savedQueues":
                     self.saved_queues = msg.get("queues", [])
+                elif t == "mixes":
+                    self.mixes = msg.get("mixes", [])
                 elif t == "devices":
                     for d in msg.get("devices", []):
                         self.online[d["id"]] = d["online"]

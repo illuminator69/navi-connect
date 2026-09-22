@@ -33,6 +33,7 @@ important for Chromecast, which must fetch stream URLs directly).
 | **Hub** | Headless relay holding session intent; routes commands; AudioMuse Tier-2 + lb-bot proxies; optional Navidrome `savePlayQueue` mirror | Python 3.11+, asyncio, `websockets`, **port 4790** | `hub/` |
 | **Feishin** (fork) | Desktop client (controller + receiver) + the **Chromecast bridge** | Electron / TypeScript / React | [feishin-gaps](https://github.com/illuminator69/feishin-gaps) |
 | **Navic** (fork) | Mobile client (controller + receiver) + native Chromecast | Kotlin Multiplatform / Compose, **Android only** | [navic-gaps](https://github.com/illuminator69/navic-gaps) |
+| **Preview sidecar** | yt-dlp preview of a track the library lacks. Its own process, and **the media origin** — the hub carries only the control plane (`PROTOCOL.md` §16) | Python 3.11+, asyncio, `yt-dlp`, **port 4792** | `preview/` |
 | **Navidrome** | The music server (not in this repo) | Go, Subsonic/OpenSubsonic API | `https://music.example.com` |
 | **AudioMuse-AI** | Recommendation engine (not in this repo) | Navidrome plugin (Tier 1) + core HTTP API (Tier 2) | server-side |
 | **lb-bot** | Library-gap filler (missing-album discography + Soulseek acquisition). Separate repo, reached **through the hub** on `/lb/*` | Python/Flask, port 8899 | [own repo](https://github.com/illuminator69/lb-bot) |
@@ -87,14 +88,14 @@ AudioMuse "Mood Flow" drives an adaptive visualizer.
 ## 4. The wire protocol (summary)
 
 Full spec in `PROTOCOL.md`. Frames are plain JSON with a `t` discriminator. (The same port also
-answers plain HTTP on `/sonic/*` and `/lb/*` — the AudioMuse Tier-2 and lb-bot proxies, §5 — which
-are not part of this catalog.)
+answers plain HTTP on `/sonic/*`, `/lb/*` and `/preview/*` — the AudioMuse Tier-2, lb-bot and
+preview-sidecar proxies, §5 — which are not part of this catalog.)
 
 | Frame | Direction | Purpose |
 |---|---|---|
 | `hello` | client → hub | announce device (id, token, name, platform, caps) |
 | `welcome` | hub → client | session snapshot + device list |
-| `act` | controller → hub | intent: `play/pause/playpause/next/previous/jump/seek/setQueue/enqueue/volume/repeat/shuffle/transfer/move/remove/clear` + saved-queue mgmt `renameSavedQueue/deleteSavedQueue/deleteSavedQueues/syncSavedQueues` |
+| `act` | controller → hub | intent: `play/pause/playpause/next/previous/jump/seek/setQueue/enqueue/volume/repeat/shuffle/transfer/move/remove/clear` + saved-queue mgmt `renameSavedQueue/deleteSavedQueue/deleteSavedQueues/syncSavedQueues` + mix mgmt `saveMix/renameMix/deleteMix/touchMix` |
 | `do` | hub → active receiver | directive: `load/play/pause/jump/seek/setVolume/setRepeat/setShuffle/release/queueChanged` |
 | `report` | active receiver → hub | ~1 Hz position/index/isPlaying |
 | `released` | receiver → hub | final index+position on release (transfer handshake) |
@@ -102,6 +103,7 @@ are not part of this catalog.)
 | `progress` | hub → clients | ~1 Hz position for remote controllers to interpolate |
 | `devices` | hub → clients | device list changes |
 | `savedQueues` | hub → clients | shared saved-queue history changed (also embedded in `welcome`) |
+| `mixes` | hub → clients | "Mixed for You" recipes changed (also embedded in `welcome`) |
 | `error` | hub → client | error |
 
 **Hub safeguards:**
@@ -118,6 +120,26 @@ are not part of this catalog.)
 
 **Track metadata** carried in the queue includes `streamUrl` + `mime` (for the cast bridge),
 `imageUrl`, `durationMs`, and per-track `userFavorite`/`userRating`.
+
+**A queue track need not be a library track.** An `ext:<provider>:<id>` track is a *preview* of
+something the library does not have, served by the preview sidecar (§5, `PROTOCOL.md` §16). It
+needs no protocol work at all, and that is why the id format was chosen: the hub's queue is opaque
+passthrough and `SQ_TRACK_FIELDS` already whitelists exactly the fields a resolved preview carries,
+so an `ext:` track survives saved-queue sanitisation, `syncSavedQueues` and a state reload
+unchanged. Transfer, the device picker and Continue Listening work with no change. The one thing
+both clients **must** add is the cast refusal: while `previewCastable` is false, a transfer to a
+cast target with an `ext:` track queued is refused *with a stated reason*, because a Chromecast
+that cannot reach the sidecar plays silence under a playing bar.
+
+**"Mixed for You" is hub-owned too, and it is a recipe rather than a result.** A saved queue stores
+the tracks; a mix stores `{kind, seedId, moodCharacter, count}` and each client **regenerates** it
+locally with the engine it already has (`RadioManager` / `auto-dj/*`). The hub never generates
+anything — it stores and broadcasts, which keeps it audio-free and AudioMuse-free. So a second play
+of the same mix gives a different queue, and that is the whole point: nothing in either client
+persisted a recipe before (`RadioManager` took those values as arguments and dropped them, and
+`playMix` exited into a frozen `SavedQueueEntity`). Capped at 30, evicted by `updatedAt`, and
+deliberately **without** tombstones — unlike a saved queue, a mix is never published concurrently
+by several devices, so there is no race to arbitrate. `PROTOCOL.md` §17.
 
 **Saved-queue history is hub-owned** (Continue Listening): the hub keeps a rolling, capped list of
 queue records, broadcasts it (`savedQueues`), and marks the current one via `session.savedQueueId`. A
@@ -170,6 +192,44 @@ in Feishin (routed through the Electron main process to avoid CORS); native Ktor
 All AudioMuse calls are **fail-soft**: a cold index, missing plugin or unreachable hub greys the
 feature out and falls back to Tier 1, never errors.
 
+### Preview sidecar — `preview/`, and why it is not in the hub
+
+A separate process (`preview/`) that answers "what does this album I don't own sound
+like". It resolves artist+title to an `ext:<provider>:<id>` track and **serves that track's audio
+itself**. Full spec: `PROTOCOL.md` §16.
+
+**The hub proxies only the control plane, and that is the round's main architectural decision.**
+`/preview/resolve` and `/preview/status` are buffered JSON and fit `HttpProxy` perfectly. The
+audio does not and structurally cannot: `HttpProxy.handle` ends in a single `bytes` body coerced
+through `AbortHandshake` with a library-computed `Content-Length`, `PROXY_MAX_RESPONSE` is 4 MB
+against a measured 11.9 MB for one four-minute track, `PROXY_MAX_INFLIGHT` is 4 slots shared with
+every lb-bot call, and the handshake deadline the proxies answer from inside would truncate a long
+body mid-stream — the exact bug the slow lb-bot routes were just bitten by. Write that down rather
+than re-deriving it: a proxy that relays everything *except* media looks like an omission.
+
+Three things about it that are load-bearing:
+
+- **The stream URL is a capability, minted by the hub.** A Chromecast fetches it itself and sends
+  no headers, so the credential lives in the URL — and `HUB_TOKEN` must never be in one, because
+  it is the hub's whole administrative surface. `PREVIEW_SECRET` is a *second* secret shared by
+  the two processes, authorising exactly one thing: one `ext:` id's audio until `exp`. The sidecar
+  returns `streamUrl` empty and the hub fills it in, which is the one place a proxy here
+  transforms a body — and it happens **after** the cache, because a resolution is cached six hours
+  while a capability lives `PREVIEW_TTL`, so signing before the cache would serve dead URLs for
+  the back half of every entry's life.
+- **`{}` is an answer.** "No preview found" is a 200, never an error, on the same rule as lb-bot's
+  `strict=False` chain. A *wrong* preview is worse than none, so a candidate whose length differs
+  by more than the tolerance is rejected whatever its title says.
+- **`mime` is resolved, not assumed.** Both clients feed it to their Cast `MediaItemConverter`, so
+  a declared type that does not match the bytes is a track that loads and never plays. The sidecar
+  extracts the format during `/resolve` and reports what it will actually send — including
+  `video/mp4` when no audio-only stream is on offer, which is currently the common case on YouTube
+  without a PO token (measured 2026-09-23: exactly one format, a muxed 360p MP4). A muxed
+  container plays; one mislabelled as audio does not.
+
+Unset `PREVIEW_URL` hides the feature entirely, like `LBBOT_URL`. Unset `PREVIEW_PUBLIC_URL`
+keeps it working locally but sets `previewCastable: false`, which both clients must honour.
+
 ### lb-bot — library-gap intelligence
 A separate self-hosted service (its own repository) that indexes each artist's full
 MusicBrainz discography, knows which releases the library lacks, and can acquire one from Soulseek
@@ -202,6 +262,23 @@ the page also reconciles missing rows against the albums Navidrome actually hold
 that fills the library *outside* a tracked fill leaves the index row stale until the next rescan.
 Downloads take a per-album `quality` (the global Source preference is the wrong granularity), and
 the watch survives a restart.
+
+**Deezer, paste-a-link and the wishlist.** Four more route groups, all whitelisted in
+`LB_ROUTES` (`PROTOCOL.md` §15). `/lb/deezer/chart` and `/lb/deezer/editorial` are Deezer's free
+unauthenticated browse, ownership-marked; `/lb/artist/related` is Deezer as a **third** similarity
+source, deliberately its own route rather than more rows on `/lb/artist/similar` — that merge is a
+ranking two providers agree on, and folding a third into it would move every existing row's
+position. `POST /lb/resolve-link` turns a pasted streaming URL into MBIDs, which is why
+`confidence` is on the wire: a MusicBrainz URL resolves with no network call, a Spotify/Deezer id
+through that provider's API, and everything else by *searching* MusicBrainz for what was scraped
+out of the URL. `/lb/wishlist` is the persisted home for a `no_source` failure — the one state
+that deliberately never auto-retries, so a wishlist is where `retryable: false` becomes an action
+instead of a dead end.
+
+All four are in `LB_LIBRARY_ROUTES`, but for two different reasons worth keeping straight. The
+Deezer rows and `artist/related` are cached six hours because a chart barely moves — what moves is
+the ownership badge on each row, and a stale one offers to fetch a record already on disk. The
+wishlist is there for the opposite reason: a landing is precisely what takes a row *off* it.
 
 **A download is reviewed, not fired blind.** `/lb/album/sources` returns the ranked Soulseek
 folders with coverage paired against the canonical MusicBrainz tracklist (never a file count) and
@@ -287,11 +364,22 @@ download succeeded.
 ### Hub — `hub/hub.py`
 Single file. `Hub` class: `handler` (per-connection), `_on_act`, `_on_report`, `_transfer`,
 `_disconnect`, `_broadcast_*`. Proxies: an `HttpProxy` base (route whitelist, token check,
-concurrency cap, per-route TTL cache) with `SonicProxy`/`SONIC_ROUTES` and `LbProxy`/`LB_ROUTES` on
-top, dispatched in order by `_build_proxy_protocol` (a `websockets` protocol subclass — the legacy
+concurrency cap, per-route TTL cache) with `SonicProxy`/`SONIC_ROUTES`, `LbProxy`/`LB_ROUTES` and
+`PreviewProxy`/`PREVIEW_ROUTES` on top, dispatched in order by `_build_proxy_protocol` (a `websockets` protocol subclass — the legacy
 server rejects non-GET and hides the request body from a plain `process_request` callable).
+`PreviewProxy` is the one that overrides `call` to rewrite a body (signing `streamUrl` after the
+cache — read its docstring before "unifying" it with the others). "Mixed for You" is `self.mixes` +
+`_sanitize_mix`/`_mixes_list`/`_broadcast_mixes` and the four `act` branches, modelled line for
+line on the saved-queue ones.
 `hub/tools/` has manual test scripts (`fake_receiver.py`,
-`controller.py`, `test_transfer.py`). Docker via `hub/Dockerfile` + `docker-compose.yml`.
+`controller.py`, `test_transfer.py`) and eleven automated suites. Docker via `hub/Dockerfile` +
+`docker-compose.yml`.
+
+### Preview sidecar — `preview/preview.py`
+Single file, stdlib + `yt-dlp`. `serve_client` is a hand-rolled HTTP/1.1 server on
+`asyncio.start_server`, deliberately not a framework: the one hard constraint is that nothing may
+buffer a whole response body. `_choose_format`/`_format_mime` decide what is served and what it is
+called, and they must stay consistent — see §5.
 
 ### Feishin (renderer unless noted)
 - **Hub transport (main):** `src/main/features/core/hub/index.ts` (+ preload `src/preload/hub.ts`,
@@ -349,8 +437,19 @@ merge playbook. The integration points from this side:
 cd hub
 # create .env from .env.example: HUB_TOKEN, NAVIDROME_URL, HUB_MIRROR_PLAYQUEUE, HUB_ND_USER/PASS,
 #                                AUDIOMUSE_URL + AUDIOMUSE_TOKEN (Tier-2 proxy; unset = disabled),
-#                                LBBOT_URL (lb-bot proxy; unset = disabled)
+#                                LBBOT_URL (lb-bot proxy; unset = disabled),
+#                                PREVIEW_URL + PREVIEW_PUBLIC_URL + PREVIEW_SECRET (preview
+#                                sidecar; unset = disabled). PREVIEW_SECRET is NOT HUB_TOKEN.
 docker compose up -d          # or: python hub.py   (Python 3.11+, `websockets`)
+```
+
+### Preview sidecar
+```
+cd preview
+# create .env from .env.example. PREVIEW_SECRET is required — it must match the hub's, and it
+# must NOT be HUB_TOKEN: /stream is authorised by an HMAC in the URL because a Chromecast sends
+# no headers, and HUB_TOKEN is the hub's whole administrative surface.
+docker compose up -d          # or: python preview.py   (Python 3.11+, `yt-dlp`)
 ```
 
 ### Feishin (Electron)
@@ -389,6 +488,18 @@ assuming an install failure is anything else.
 - Same for lb-bot, but stricter: not configured / unreachable / unindexed all render **nothing**.
   The artist page must look exactly as it does today whenever that layer is absent.
 - Cast requires **publicly reachable** stream/cover URLs (`https://music.example.com`, not Tailscale/LAN IPs).
+  The same applies to a **preview**: `PREVIEW_PUBLIC_URL` is what makes one castable, and without it
+  the hub advertises `previewCastable: false` so both clients refuse the transfer *with a reason*
+  rather than letting the speaker play silence.
+- **`PreviewProxy` rewrites a response body, and that is against the house rule on purpose.** It
+  signs `streamUrl` so `PREVIEW_SECRET` never leaves the two servers, and it does so in an override
+  of `call` **after** `super().call` — i.e. after the cache. A resolution is cached six hours
+  because an `ext:` id is stable; a capability is only good for `PREVIEW_TTL`. Signing before the
+  cache stores the signature too, and every hit past the TTL serves a URL the sidecar rejects.
+- **A mix has no tombstone and a saved queue does.** Not an oversight: a saved queue is published
+  concurrently by every receiver that plays it, so a delete races a re-publish; a mix is written
+  only by the user, through an explicit act, and nothing republishes it. `touchMix` likewise moves
+  `lastPlayedAt` and never `updatedAt` — that is the sort and eviction key.
 
 ---
 
@@ -402,6 +513,8 @@ navi-connect/
   docs/ARCHITECTURE.md           ← this file
   docs/screenshots/              images used by the README
   hub/                           Python relay hub — hub.py, Dockerfile, docker-compose.yml, tools/
+  preview/                       yt-dlp preview sidecar — preview.py, Dockerfile, docker-compose.yml,
+                                 tools/. The MEDIA origin; the hub proxies its control plane only
 ```
 Both clients and lb-bot live in their own repositories; see **Repositories** in the
 [README](../README.md).

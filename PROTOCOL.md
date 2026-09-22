@@ -206,6 +206,10 @@ issues directives to the active receiver (§5.2), then broadcasts the new sessio
 | `deleteSavedQueue` | `id` | delete a saved-queue history record (§8.3) |
 | `deleteSavedQueues` | `ids[]` | delete several records in one act — one broadcast (§8.3) |
 | `syncSavedQueues` | `queues[]`, `deleted[]?` | push a client's local/offline history **and its offline deletions** up (§8.3) |
+| `saveMix` | `id?`, `name`, `kind`, `seedId?`, `seedName?`, `moodCharacter?`, `count?` | create (no `id`) or update one "Mixed for You" recipe (§17) |
+| `renameMix` | `id`, `name` | rename a recipe (§17) |
+| `deleteMix` | `id` | delete a recipe (§17) |
+| `touchMix` | `id` | record that a recipe was just played — bumps `lastPlayedAt` only (§17) |
 
 `setQueue` additionally accepts optional `savedQueueId`, `sourceKind`
 (`album|playlist|radio|moodFlow|journey|manual`), `sourceName`, `coverImageUrl`, `serverId`
@@ -274,8 +278,9 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `progress` | `{ positionMs, index, isPlaying }` | throttled live position from active receiver |
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
+| `mixes` | `{ mixes:[<Mix>...] }` | "Mixed for You" recipes changed (§17); also in `welcome` |
 | `library` | `{ event, releaseMbid, rgid, artist, album, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1) |
-| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3) |
+| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
 own id.
@@ -805,6 +810,13 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/album/tracklist` | same | `release_mbid`, `album_ids`, `group_id` | 6 h |
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
 | `GET /lb/artist/similar` | same | `mbid`, `name`, `limit` | 60 s |
+| `GET /lb/artist/related` | same | `mbid`, `name`, `limit` | 60 s (cleared by `/lb/notify`) |
+| `GET /lb/deezer/chart` | same | `limit` | 6 h (cleared by `/lb/notify`) |
+| `GET /lb/deezer/editorial` | same | `limit` | 6 h (cleared by `/lb/notify`) |
+| `POST /lb/resolve-link` | same | body `url` | — |
+| `GET /lb/wishlist` | same | — | 60 s (cleared by `/lb/notify`) |
+| `POST /lb/wishlist` | same | `rgid`, `artist`, `title` | — |
+| `POST /lb/wishlist/remove` | same | `rgid` | — |
 | `GET /lb/artist/lookup` | same | `q` | 60 s |
 | `GET /lb/album/lookup` | same | `q` | 60 s (cleared by `/lb/notify`) |
 | `GET /lb/meta/artist` | `GET /api/meta/artist` | `mbid`, `name`, `refresh` | 6 h |
@@ -845,6 +857,37 @@ library index, at no MusicBrainz cost — so it is in the invalidation set and
 row that opens the album, never as a download; a stale badge there is the
 "the tile said the library holds it and the tap opened the download page" bug
 that the Fresh tab and the similar-albums shelf have each paid for once.
+
+**The Deezer rows and `/lb/artist/related` are cached long and invalidated
+anyway**, which looks contradictory and is not. Their *content* — a chart, an
+editorial selection, a similarity list — barely moves, so six hours is right.
+What moves is the ownership marking on each row, and a six-hour-old "you don't
+own this" badge outlives the fill that makes it false; a stale badge is a tile
+that offers to fetch a record already on disk. `/lb/wishlist` is in the
+invalidation set for the opposite reason: a landing is precisely what takes a row
+*off* it, so the whole list is what the fill falsifies.
+
+**`/lb/artist/related` is deliberately not more rows on `/lb/artist/similar`.**
+Deezer is a third similarity source beside ListenBrainz Labs and Last.fm, but the
+merge behind `similar` is a ranking those two agree on; folding a third provider
+into it would move every existing row's position for the sake of adding some. A
+client that wants both asks for both and says which is which.
+
+**`POST /lb/resolve-link`** turns a pasted streaming URL into the MBIDs behind
+it, so "share this to the app" lands on a real album page:
+
+```jsonc
+{ "kind": "artist|album|track|unknown", "mbid": "", "rgid": "",
+  "artist": "", "title": "",
+  "provider": "spotify|deezer|apple|ytmusic|tidal|qobuz|musicbrainz",
+  "confidence": 0.0-1.0 }
+```
+
+`confidence` is on the wire because the providers resolve differently: a
+MusicBrainz URL resolves directly with no network call, a Spotify or Deezer id
+resolves through that provider's API, and an Apple/YT-Music/Tidal/Qobuz URL is
+resolved by *searching* MusicBrainz for the artist and title scraped from the URL
+or its page title. Not cached — it is a one-shot the user initiated.
 
 **`refresh` is not part of the cache key.** On the two `meta` routes it means
 "do not answer this from a cache", so the hub bypasses its own copy *and* writes
@@ -1135,3 +1178,235 @@ old `newest` walk also sees a gap fill — an album that is not new, only longer
 Without the ping nothing breaks. lb-bot marks its own index row `present` at
 placement, so the next discography read on any client is already correct — the
 broadcast only closes the window where a page is *already open* somewhere else.
+
+---
+
+## 16. Preview sidecar (`/preview/*` + `ext:` track ids)
+
+"What does this album I don't own sound like." A track the library does not have,
+playable in the ordinary queue, alongside tracks it does.
+
+### 16.1 The hub does not stream, and that is the decision
+
+The obvious design is a third `PROXIES` entry relaying the audio. It is not
+implementable on this transport, and the reasons are structural rather than
+stylistic — they are written down here because this is exactly the kind of
+decision that gets re-litigated in six months by someone who sees a proxy and
+wonders why the media does not go through it.
+
+- `HttpProxy.handle` terminates in `_http_response`, whose body is a single
+  `bytes`. `process_request`'s return is coerced through `AbortHandshake` into a
+  buffered body with a `Content-Length` computed by the library
+  (`websockets/legacy/server.py:233`). There is no chunk-by-chunk path.
+- `PROXY_MAX_RESPONSE` is 4 MB. A three-minute preview is larger — measured at
+  11.9 MB for one four-minute track.
+- `PROXY_MAX_INFLIGHT` is 4 slots, shared with every lb-bot and AudioMuse call.
+  One playing stream would hold a quarter of them for its whole duration.
+- Serving media on the WebSocket port at all would mean writing to
+  `self.transport` by hand and raising `BrokenPipeError` to suppress the
+  library's own write — and even then `open_timeout` (the handshake deadline,
+  which the proxies answer from inside, §7 of CLAUDE.md's gotchas) truncates the
+  body mid-stream. That is the exact bug class the slow lb-bot routes were just
+  bitten by.
+
+So the **sidecar is the media origin** and the hub keeps only the control plane,
+which is ordinary buffered JSON and fits `HttpProxy` perfectly. The sidecar had
+to be a separate process regardless — an extractor breaks when a site changes,
+and that must not be able to take the session relay down — so serving its own
+bytes costs nothing extra and deletes the whole problem.
+
+```
+client ──/preview/resolve──▶ hub (HttpProxy, buffered JSON) ──▶ sidecar /resolve
+client ──────────────────── streamUrl ───────────────────────▶ sidecar /stream  (Range, 206)
+```
+
+### 16.2 `ext:` track ids
+
+`ext:<provider>:<providerId>` — e.g. `ext:yt:1uYWYWPc9HU`. It extends the
+`mb:<mbid>` convention lb-bot already uses for artists and albums. **Nothing
+else in the stack may mint an `ext:` id.**
+
+### 16.3 `GET /preview/resolve` → `GET /resolve`
+
+Params: `artist`, `title`, `album`, `durationMs` (optional; used to *reject* a
+bad match, not merely to rank one). Cached 6 h, `PROXY_SLOW_TIMEOUT`.
+
+The answer is **queue-track-shaped**, because that is what both clients and the
+hub already pass around:
+
+```jsonc
+{
+  "id": "ext:yt:<vid>", "title": "...", "artist": "...", "album": "...",
+  "durationMs": 213000, "imageUrl": "https://...",
+  "streamUrl": "<PREVIEW_PUBLIC_URL>/stream?id=ext:yt:<vid>&exp=<unix>&sig=<hmac>",
+  "mime": "audio/webm",
+  "provider": "yt", "confidence": 0.0-1.0
+}
+```
+
+**That shape needs no hub change at all**, which is the point of choosing it: the
+hub's queue is opaque passthrough, and `SQ_TRACK_FIELDS` already whitelists
+exactly `id, serverId, title, artist, album, durationMs, coverArtId, imageUrl,
+streamUrl, mime`. An `ext:` track therefore survives saved-queue sanitisation,
+`syncSavedQueues` and a state reload **unchanged** — so transfer, the device
+picker and Continue Listening work with no protocol work.
+
+**`{}` at HTTP 200 means "no preview found"**, a legitimate answer and never an
+error — the same rule as lb-bot's `strict=False` metadata chain. Clients render
+it as "no preview", not as a failure. A wrong preview is worse than none, so the
+sidecar refuses a candidate whose length differs by more than
+`PREVIEW_DURATION_TOLERANCE_MS` whatever its title claims (that is an album rip
+or a different recording), and one scoring below `PREVIEW_MIN_CONFIDENCE`.
+
+**`mime` is resolved, not assumed.** Both clients hand it to their Cast
+`MediaItemConverter` and to their player, so a declared type that does not match
+the bytes `/stream` will serve is a track that loads and then never plays. The
+sidecar therefore extracts the format during `/resolve` and reports what it will
+actually send — including `video/mp4` when no audio-only stream is on offer,
+which is currently the common case on YouTube without a PO token (measured
+2026-09-23: exactly one format, a muxed 360p MP4). A muxed container plays; one
+mislabelled as audio does not.
+
+### 16.4 `GET /preview/status`
+
+The liveness probe, mirroring `/lb/status`:
+`{configured, upstreamReachable, previewCastable}`. `previewCastable` is the
+**hub's** answer, not the sidecar's — only the hub knows whether it was given a
+publicly reachable address to sign stream URLs against.
+
+### 16.5 The stream URL is a capability, and the hub mints it
+
+A Chromecast fetches `streamUrl` itself and sends no headers, so the credential
+has to be in the URL — and `HUB_TOKEN` must never be, since it is the hub's
+entire administrative surface. So there is a second secret, `PREVIEW_SECRET`,
+shared by the two processes and **not** `HUB_TOKEN`. It authorises exactly one
+thing: reading one `ext:` id's audio until `exp`.
+
+```
+sig = HMAC-SHA256(PREVIEW_SECRET, f"{id}\n{exp}")      # hex
+exp = now + PREVIEW_TTL                                 # default 6 h
+```
+
+The newline matters: concatenated, `ext:yt:a` + `1` and `ext:yt:a1` + `` would
+sign the same bytes. The sidecar verifies with `hmac.compare_digest`, checks the
+signature **before** `exp` (so an unsigned request costs no clock read), and
+refuses an expired one with 403.
+
+**The sidecar returns `streamUrl` empty and the hub fills it in.** This is the
+one place a proxy in `hub.py` transforms a body rather than relaying it, and the
+reason is that `PREVIEW_SECRET` then never has to leave the two servers. It
+happens *after* the cache, deliberately: a resolution is cached for six hours
+because an `ext:` id is stable, but a capability is only good for
+`PREVIEW_TTL` — signing before the cache would store the signature too, and
+every hit past the TTL would serve a URL the sidecar rejects.
+
+### 16.6 `GET /stream?id=&exp=&sig=` — Range, always
+
+Answers `206` to a ranged request with a correct `Content-Range`, and `200` +
+`Accept-Ranges: bytes` otherwise; `HEAD` answers the headers alone, which is how
+a Chromecast and an iOS player ask whether a resource is worth committing to.
+**iOS refuses to play a resource that does not answer Range, and seeking is
+nothing but this header.**
+
+Nothing is written to disk. The sidecar opens the upstream media URL with the
+client's own `Range` header and relays the bytes, so Range support is the
+upstream's rather than a cache that would then need a size bound. Only two
+*resolutions* are cached, in memory, with different TTLs because they expire for
+different reasons: the search result (long — an `ext:` id is stable) and the
+direct media URL (short — those URLs are themselves signed upstream and expire,
+and serving an expired one reads to the user as a track that plays for zero
+seconds).
+
+### 16.7 Casting a preview is decided, not discovered at the speaker
+
+If `PREVIEW_PUBLIC_URL` is set, `streamUrl` is absolute and public and previews
+cast. If it is unset the hub emits a LAN/internal URL and advertises
+`previewCastable: false`, and **both clients must then refuse a transfer to a
+cast target while any `ext:` track is in the queue**, with a stated reason.
+Letting it fail at the speaker instead produces silence with a playing bar over
+it, which is the failure this stack has paid for twice.
+
+### 16.8 Configuration
+
+| Env (on the hub) | Meaning |
+|---|---|
+| `PREVIEW_URL` | how the **hub** reaches the sidecar (an internal Docker name is normal). Unset = proxy disabled, clients hide previews |
+| `PREVIEW_PUBLIC_URL` | how a **client or speaker** reaches it. Unset = `previewCastable: false` |
+| `PREVIEW_SECRET` | the capability secret. Unset = proxy disabled, because an unsignable stream URL fails at *playback* rather than at configuration |
+| `PREVIEW_TTL` | capability lifetime, seconds (default 21600) |
+
+The sidecar takes `PREVIEW_SECRET` (the same value; it refuses to start without
+one, since an unsigned `/stream` is an open media relay pointed at a third-party
+extractor) plus its own tuning — see `preview/.env.example`.
+
+---
+
+## 17. "Mixed for You" — the hub stores recipes, the clients regenerate
+
+**A saved queue stores a *result*; a mix stores a *recipe*.** That sentence is
+the whole feature. Nothing in either client persisted one before: `RadioManager`
+took `{mode, seedId, moodCharacter, count}` as arguments and dropped them,
+`mixSig` and the Mood Flow centroid were in-memory only, and `playMix` exited
+into a frozen `SavedQueueEntity` that replays rather than regenerates.
+
+**The hub never generates anything.** It stores and broadcasts the recipe; each
+client regenerates locally with the engine it already has (`RadioManager` /
+`auto-dj/*`). That keeps the hub audio-free and AudioMuse-free, which is the
+standing rule — and it is also why a second play of the same mix yields a
+different queue, which is the observable difference from a saved queue.
+
+**The name.** User-facing string "Mixed for You"; the noun in code is `mix`. It
+deliberately avoids both occupied words: `Screen.RadioList` and Feishin's
+create/edit-station forms are Subsonic internet radio, and
+`SavedQueueSource.RADIO` / `RadioManager.startRadio` is the *ephemeral*
+similarity mix. Navidrome's "Instant Mix" is ephemeral too, which is exactly
+what these are not.
+
+### 17.1 The record
+
+```jsonc
+{ "id": "mx_<ms>_<hex>", "name": "Your Mix",
+  "kind": "similar|fingerprint|adaptive|genre|artist",
+  "seedId": "", "seedName": "",
+  "moodCharacter": "EchoMatch|SteadyVibes|TransitionMaestro",
+  "count": 50, "coverArtId": "",
+  "createdAt": 0, "updatedAt": 0, "lastPlayedAt": 0 }
+```
+
+`kind` is validated against a closed list and `moodCharacter` against AudioMuse's
+three presets — they name a *generator on the client*, and an unknown one is a
+recipe no client can run. A client meeting a `kind` it does not know hides the
+row rather than guessing, so the list is additive-only. Optional strings are
+absent rather than null, matching the saved-queue rule.
+
+### 17.2 Acts
+
+`saveMix` (mints when `id` is absent), `renameMix`, `deleteMix`, `touchMix`.
+Each answers with a `mixes` broadcast, which is also embedded in `welcome`.
+
+- **`saveMix` with an unknown `id` is not an error** — a client can have minted
+  it offline — but a recipe with no name or an unknown `kind` is refused with
+  `bad_mix`, because these records are persisted and fanned out to devices that
+  never saw the sender.
+- **`createdAt` and `lastPlayedAt` are the hub's to keep.** A client re-saving
+  sends the recipe, not its history; taking its word would reset the age of a mix
+  every time its `count` was edited.
+- **`touchMix` bumps `lastPlayedAt` and NOT `updatedAt`.** `updatedAt` is the
+  sort and eviction key, so folding "played" into it would reorder the user's
+  list under them on every play, and let a mix they listen to evict one they just
+  made.
+
+### 17.3 Storage
+
+Capped at `MIXES_MAX = 30`, evicted by `updatedAt` like saved queues. Additive in
+exactly the way `savedQueues` is: there is no schema version and no migration
+path in `hub.py`, only `data.get(key, default)` — so a `state.json` written
+before mixes existed loads with zero of them, and an older hub reading a newer
+file silently drops the key.
+
+**No tombstones**, unlike a saved queue, and the asymmetry is deliberate rather
+than an oversight. A saved queue is published concurrently by several devices —
+every receiver stamps the one it is playing — so a delete races a re-publish and
+needs a tombstone to win. A mix is only ever written by the user, on one device,
+through an explicit act; nothing republishes it, so there is no race to arbitrate
+and union-merge has nothing to merge.

@@ -79,6 +79,7 @@ Four pieces, three of them optional:
 | **Clients** | Every client is both a controller and a receiver. **Feishin** (desktop) and **Navic** (Android) each connect over WebSocket and can play, or hand playback to someone else. |
 | **AudioMuse-AI** | Optional. The recommendation engine behind radio, Song Journey and Mood Flow. Reached through the hub, so no device carries its credentials. |
 | **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, and can acquire it. Also reached only through the hub. |
+| **Preview sidecar** | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 [`PROTOCOL.md`](PROTOCOL.md) for the wire spec.
@@ -87,7 +88,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 
 | Repo | What's in it |
 |---|---|
-| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the docs, and the [prebuilt releases](../../releases). |
+| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the preview sidecar, the docs, and the [prebuilt releases](../../releases). |
 | **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic). Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. GPL-3.0. |
 | **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening ~4,700 commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
@@ -96,6 +97,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 
 ```
 hub/                  the relay — hub.py, Dockerfile, docker-compose.yml, tools/
+preview/              the preview sidecar — preview.py, Dockerfile, docker-compose.yml, tools/
 docs/ARCHITECTURE.md  what each piece is, how they talk, and where the code lives
 docs/screenshots/     images used by this file
 PROTOCOL.md           the wire protocol spec

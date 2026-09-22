@@ -1,0 +1,21 @@
+# Separate container for the navi-connect preview sidecar. Reference only — the
+# NAS runs this from GHCR through the Compose Manager plugin, in its own project
+# beside `hub` and `lb-bot`; nothing runs the file in this repo.
+services:
+  navi-connect-preview:
+    build: .
+    image: navi-connect-preview
+    container_name: navi-connect-preview
+    restart: unless-stopped
+    # Same network as the hub, which reaches /resolve internally. The port is
+    # published because CLIENTS fetch /stream directly — the hub never relays
+    # audio, and this is the whole reason the sidecar exists as a process.
+    networks: [media]
+    ports:
+      - "4792:4792"
+    env_file: .env
+    # No volumes: nothing is persisted (see the Dockerfile).
+
+networks:
+  media:
+    external: true

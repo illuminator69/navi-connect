@@ -72,6 +72,27 @@ AUDIOMUSE_TOKEN = os.environ.get("AUDIOMUSE_TOKEN", "")
 # never be exposed directly. Unset URL = proxy disabled, clients hide the feature.
 LBBOT_URL = os.environ.get("LBBOT_URL", "").rstrip("/")
 
+# yt-dlp preview sidecar — turns "what does this album I don't own sound like"
+# into a playable track. The hub proxies its CONTROL plane only (/preview/resolve,
+# /preview/status): ordinary buffered JSON, which is exactly what HttpProxy is for.
+# The AUDIO never enters this process; clients fetch it from the sidecar directly.
+# The reason is measured, not stylistic — see the comment on PreviewProxy.
+PREVIEW_URL = os.environ.get("PREVIEW_URL", "").rstrip("/")
+# The address a CLIENT can reach the sidecar's /stream on, which is not the same
+# thing as the address the HUB reaches it on: PREVIEW_URL is typically an internal
+# Docker hostname. Unset means previews still play for a client that can route to
+# PREVIEW_URL itself, but a Chromecast cannot — so the hub advertises
+# `previewCastable: false` and both clients refuse a cast transfer while an `ext:`
+# track is queued, rather than letting the speaker play silence.
+PREVIEW_PUBLIC_URL = os.environ.get("PREVIEW_PUBLIC_URL", "").rstrip("/")
+# The stream-URL capability secret, shared with the sidecar and DELIBERATELY NOT
+# HUB_TOKEN. A Chromecast fetches streamUrl itself and sends no headers, so the
+# credential has to live in the URL — and HUB_TOKEN is the whole administrative
+# surface of this hub, which must never appear in one. This secret authorises
+# exactly one thing: reading one `ext:` id's audio until `exp`.
+PREVIEW_SECRET = os.environ.get("PREVIEW_SECRET", "")
+PREVIEW_TTL = int(os.environ.get("PREVIEW_TTL", str(6 * 3600)))
+
 DEBUG = os.environ.get("HUB_DEBUG", "").lower() in ("1", "true", "yes")
 
 # How long a bridge's reachability verdict stays authoritative. Bridges re-assert
@@ -93,6 +114,17 @@ INTENT_GRACE = 2.0  # seconds during which receiver reports can't contradict a
                     # in-flight 1 Hz reports flipping the state back)
 MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
+# "Mixed for You" — persistent regenerating recipes (PROTOCOL §17). A saved queue
+# stores a RESULT; a mix stores a RECIPE, and the hub never generates anything from
+# it: each client regenerates locally with the engine it already has. That keeps
+# this process audio-free and AudioMuse-free, which is the standing rule.
+MIXES_MAX = 30  # cap, evicted by updatedAt exactly like saved queues
+# The generator each recipe names. A client that meets an unknown kind hides the
+# row rather than guessing, so this list is additive-only.
+MIX_KINDS = ("similar", "fingerprint", "adaptive", "genre", "artist")
+# AudioMuse's three Mood Flow characters. Only meaningful for `adaptive`.
+MIX_MOODS = ("EchoMatch", "SteadyVibes", "TransitionMaestro")
+MIX_COUNT_MAX = 500  # a recipe asks for a queue, not a library dump
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
 TOMBSTONE_MAX = 200  # remembered saved-queue deletions (so a client re-sync can't resurrect)
 SAVED_QUEUE_SONGS_MAX = 1000  # per-record track cap for CLIENT-SUPPLIED history (syncSavedQueues)
@@ -531,6 +563,70 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": ("mbid", "name", "limit"), "cache": True,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
+    ("GET", "/lb/artist/related"): {
+        # Deezer as a THIRD similarity source, beside ListenBrainz Labs and
+        # Last.fm. Deliberately its own route rather than more rows on
+        # `/lb/artist/similar`: the merge there is a ranking the other two agree
+        # on, and folding a third provider into it would change every existing
+        # row's position for the sake of adding some. A client that wants both
+        # asks for both and says which is which.
+        #
+        # Same short TTL as its sibling and for the same reason: the expensive
+        # half is cached upstream, and the `owned`/`indexed` marking — the only
+        # part that moves — is recomputed per call. Hence also in
+        # LB_LIBRARY_ROUTES.
+        "method": "GET", "path": "/api/artist/related",
+        "params": ("mbid", "name", "limit"), "cache": True,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/deezer/chart"): {
+        # Deezer's global chart, ownership-marked. Free and unauthenticated
+        # upstream, so the only cost is the name→MBID resolution lb-bot does to
+        # mark it — which is why the TTL is six hours and not sixty seconds.
+        #
+        # In LB_LIBRARY_ROUTES anyway: a six-hour cache of a row that says "you
+        # don't own this" outlives the fill that makes it false, and a stale
+        # badge on a Discover row is a tile that offers to fetch a record
+        # already on disk. The chart itself barely moves; the badges do.
+        "method": "GET", "path": "/api/deezer/chart",
+        "params": ("limit",), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/deezer/editorial"): {
+        # Deezer's own editorial selections — the same shape and the same rules
+        # as the chart above.
+        "method": "GET", "path": "/api/deezer/editorial",
+        "params": ("limit",), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/resolve-link"): {
+        # A pasted streaming URL (Spotify/Deezer/Apple/YT-Music/Tidal/Qobuz/
+        # MusicBrainz) → the MBIDs behind it, so "share this to the app" lands on
+        # a real album page. Not cached: it is a one-shot the user initiated, and
+        # the answer carries a `confidence` that a client renders — caching would
+        # only help somebody pasting the same link twice.
+        #
+        # Slow because several providers resolve by SEARCHING MusicBrainz for
+        # artist+title scraped from the URL or its page title, which sits on
+        # lb-bot's global 1 req/sec lock.
+        "method": "POST", "path": "/api/resolve-link",
+        "body": ("url",), "cache": False, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/wishlist"): {
+        # "I still want this" — the persisted home for a `no_source` failure,
+        # which deliberately never auto-retries. In LB_LIBRARY_ROUTES because a
+        # landed album is the one event that removes a row from it.
+        "method": "GET", "path": "/api/wishlist",
+        "params": (), "cache": True,
+    },
+    ("POST", "/lb/wishlist"): {
+        "method": "POST", "path": "/api/wishlist",
+        "body": ("rgid", "artist", "title"), "cache": False,
+    },
+    ("POST", "/lb/wishlist/remove"): {
+        "method": "POST", "path": "/api/wishlist/remove",
+        "body": ("rgid",), "cache": False,
+    },
     ("GET", "/lb/album/sources"): {
         # Ranked slskd folders for a release-group, so a client can show what it is
         # about to download instead of taking lb-bot's top pick on faith. Coverage
@@ -652,6 +748,38 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "method": "POST", "path": "/api/gaps/{group_id}/rescan",
         "path_args": ("group_id",), "body": ("group_id",), "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
+    },
+}
+
+# The preview sidecar's CONTROL plane, and only that. There is no `/preview/stream`
+# entry here and there must never be one — see PreviewProxy for the measurements.
+PREVIEW_ROUTES: dict[tuple[str, str], dict] = {
+    ("GET", "/preview/resolve"): {
+        # artist+title (+album, +durationMs to reject a bad match) → one
+        # queue-track-shaped object, or `{}` for "no preview found". `{}` is a
+        # legitimate 200, never an error: same rule as lb-bot's strict=False
+        # metadata chain, and a client renders it as "no preview", not a failure.
+        #
+        # `sign` is the one place a proxy rewrites a body instead of passing it
+        # through. See PreviewProxy.call.
+        #
+        # Slow: a cold resolve is a search plus an extractor run on a third-party
+        # site. Cached long — an `ext:` id is stable for a given track, and the
+        # signature is minted AFTER the cache, so a cached hit still carries a
+        # fresh `exp`.
+        "method": "GET", "path": "/resolve",
+        "params": ("artist", "title", "album", "durationMs"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+        "sign": True,
+    },
+    ("GET", "/preview/status"): {
+        # The liveness probe, mirroring /lb/status. Carries `previewCastable`,
+        # which is not a health fact but a configuration one: without
+        # PREVIEW_PUBLIC_URL a Chromecast cannot fetch the audio, and a client
+        # has to know that BEFORE it offers the transfer rather than discovering
+        # it as silence at the speaker.
+        "method": "GET", "path": "/status",
+        "params": (), "cache": True, "probe": True,
     },
 }
 
@@ -1042,6 +1170,148 @@ class LbProxy(HttpProxy):
         }).encode(), "application/json"
 
 
+def preview_sign(track_id: str, exp: int) -> str:
+    """The stream-URL capability signature: HMAC-SHA256(PREVIEW_SECRET, id\\nexp).
+
+    Newline-separated rather than concatenated so the two fields cannot be slid
+    past each other — `ext:yt:a` + `1` and `ext:yt:a1` + `` would otherwise sign
+    the same bytes.
+    """
+    return hmac.new(PREVIEW_SECRET.encode(),
+                    f"{track_id}\n{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+def preview_stream_url(track_id: str) -> str:
+    """A capability URL for one `ext:` id, good for PREVIEW_TTL seconds.
+
+    Falls back to PREVIEW_URL when PREVIEW_PUBLIC_URL is unset. That URL is
+    typically an internal Docker hostname, so it works only for a client on the
+    same network and never for a Chromecast — which is exactly the state
+    `previewCastable: false` announces.
+    """
+    exp = int(time.time()) + PREVIEW_TTL
+    base = PREVIEW_PUBLIC_URL or PREVIEW_URL
+    query = urllib.parse.urlencode(
+        {"id": track_id, "exp": exp, "sig": preview_sign(track_id, exp)})
+    return f"{base}/stream?{query}"
+
+
+class PreviewProxy(HttpProxy):
+    """The preview sidecar's control plane (PROTOCOL §16).
+
+    **The hub does not stream, and that is a decision, not an omission.** The
+    obvious design — a third route here that relays the audio — is not
+    implementable on this transport, and the reasons are structural:
+
+      * `HttpProxy.handle` ends in `_http_response`, whose body is a single
+        `bytes`. `process_request`'s return is coerced through `AbortHandshake`
+        into a buffered body with a library-computed `Content-Length`
+        (`websockets/legacy/server.py:233`) — there is no chunk-by-chunk path.
+      * `PROXY_MAX_RESPONSE` is 4 MB. A three-minute preview is larger.
+      * `PROXY_MAX_INFLIGHT` is 4, and those slots are shared with every lb-bot
+        and AudioMuse call. One playing stream would hold a quarter of them for
+        its whole duration.
+      * Serving media here at all would mean writing to `self.transport` by hand
+        and raising `BrokenPipeError` to suppress the library's own write — and
+        even then `open_timeout` (the handshake deadline, ~165 s) truncates the
+        body mid-stream. That is the exact failure this stack was just bitten by
+        on the slow lb-bot routes.
+
+    So the sidecar is the media origin and the hub keeps the control plane,
+    which is ordinary buffered JSON and fits this class perfectly. The sidecar
+    had to be a separate process anyway — a broken extractor must not be able to
+    take the session relay down with it — so serving its own bytes costs nothing.
+    """
+
+    prefix = "/preview"
+    label = "preview"
+    routes = PREVIEW_ROUTES
+
+    @property
+    def upstream(self) -> str:
+        return PREVIEW_URL
+
+    @property
+    def enabled(self) -> bool:
+        # PREVIEW_SECRET is part of "enabled", unlike the other two proxies'
+        # tokens: without it every streamUrl the hub mints signs with an empty
+        # key, the sidecar refuses all of them, and the feature fails at the
+        # point of playback rather than at the point of configuration.
+        return bool(PREVIEW_URL and TOKEN and PREVIEW_SECRET)
+
+    @property
+    def disabled_reason(self) -> str:
+        if not PREVIEW_URL:
+            return "PREVIEW_URL is unset"
+        if not TOKEN:
+            return "HUB_TOKEN is empty (refusing to run as an open relay)"
+        return "PREVIEW_SECRET is unset (stream URLs would be unsignable)"
+
+    def disabled_probe(self, route: tuple[str, str]) -> Optional[tuple]:
+        # Same contract as the base class, plus the castability flag — a client
+        # reads one object whether the feature is on or off.
+        spec = self.routes.get(route)
+        if spec and spec.get("probe"):
+            return _http_json(200, {"configured": False, "upstreamReachable": False,
+                                    "previewCastable": False})
+        return None
+
+    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
+        """`/preview/status` is the liveness probe, mirroring `LbProxy.augment`.
+
+        `previewCastable` is the hub's own answer, not the sidecar's: only this
+        process knows whether it was given a publicly reachable address to sign
+        stream URLs against.
+        """
+        return 200, json.dumps({
+            "configured": True,
+            "upstreamReachable": status == 200,
+            "previewCastable": bool(PREVIEW_PUBLIC_URL),
+        }).encode(), "application/json"
+
+    @staticmethod
+    def _sign_body(data: bytes) -> bytes:
+        """Rewrite a resolve answer's `streamUrl` into a signed capability URL.
+
+        The sidecar returns a bare `ext:` id and no URL at all, so PREVIEW_SECRET
+        never has to be handed to a client and the capability cannot be minted by
+        anything but these two processes.
+
+        Anything unexpected passes through untouched, on the same rule as
+        `_strip`: a transform failing must never fail the request. `{}` — "no
+        preview found" — has no id and is returned unchanged.
+        """
+        try:
+            payload = json.loads(data or b"{}")
+        except Exception:  # noqa: BLE001
+            return data
+        if not isinstance(payload, dict):
+            return data
+        track_id = payload.get("id")
+        if not isinstance(track_id, str) or not track_id.startswith("ext:"):
+            return data
+        payload["streamUrl"] = preview_stream_url(track_id)
+        return json.dumps(payload).encode()
+
+    async def call(self, route: tuple[str, str], spec: dict,
+                   params: list[tuple[str, str]],
+                   body: Optional[dict]) -> tuple[int, bytes, str]:
+        """Pass through, then sign.
+
+        This is the one place a proxy in this file transforms a body rather than
+        relaying it, which is against the house rule, so: it happens here, AFTER
+        `super().call`, precisely because that is after the cache. A resolution is
+        cached for six hours (an `ext:` id is stable) but a signature is only good
+        for PREVIEW_TTL — signing before the cache would store the *signature*
+        too, and every cache hit past the TTL would serve a URL the sidecar
+        rejects. Cache the identity, mint the capability per answer.
+        """
+        status, data, ctype = await super().call(route, spec, params, body)
+        if spec.get("sign") and status == 200:
+            data = self._sign_body(data)
+        return status, data, ctype
+
+
 def _http_response(status: int, body: bytes, ctype: str) -> tuple:
     try:
         code = http.HTTPStatus(status)
@@ -1101,9 +1371,10 @@ async def _drain_body(protocol: Any, headers: Any) -> None:
 
 SONIC = SonicProxy()
 LB = LbProxy()
+PREVIEW = PreviewProxy()
 # Order matters only in that each returns None for paths outside its own prefix;
 # the first one that claims the path answers it.
-PROXIES: tuple[HttpProxy, ...] = (SONIC, LB)
+PROXIES: tuple[HttpProxy, ...] = (SONIC, LB, PREVIEW)
 
 # Set once main() builds the hub, so the inbound notify handler below can reach
 # the connected devices. The proxy protocol class is constructed by `websockets`
@@ -1123,10 +1394,19 @@ _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"
 # `/lb/album/lookup` is a MusicBrainz search and belongs here anyway — the
 # ranking does not move, but the `releaseOwned` badge it now carries does, and
 # a stale badge is a row offering to fetch a record already on disk.
+#
+# The Deezer rows and `/lb/artist/related` join it for that same reason and no
+# other — their *content* is a chart or a similarity list that a fill does not
+# move — and `/lb/wishlist` for the opposite one: a landing is precisely what
+# takes a row OFF it, so the answer the fill falsifies is the whole list.
 LB_LIBRARY_ROUTES = {
     ("GET", "/lb/artist/discography"),
     ("GET", "/lb/album/lookup"),
     ("GET", "/lb/artist/similar"),
+    ("GET", "/lb/artist/related"),
+    ("GET", "/lb/deezer/chart"),
+    ("GET", "/lb/deezer/editorial"),
+    ("GET", "/lb/wishlist"),
     ("GET", "/lb/fresh-releases"),
     ("GET", "/lb/status"),
 }
@@ -1232,6 +1512,16 @@ class Hub:
         # Deletions remembered as {id: deletedAt} so a client that still holds the row
         # locally can't resurrect it via syncSavedQueues. Capped + persisted.
         self.deleted_saved_queues: dict[str, int] = {}
+        # "Mixed for You" — recipes, not results. Keyed by id, capped at MIXES_MAX.
+        #
+        # NO TOMBSTONES, deliberately, and the asymmetry with saved_queues above is
+        # worth stating rather than leaving to be discovered. A saved queue is
+        # published concurrently by several devices — every receiver stamps the one
+        # it is playing — so a delete races a re-publish and needs a tombstone to
+        # win. A mix is only ever written by the user, on one device, through an
+        # explicit act; nothing republishes it, so there is no race to arbitrate and
+        # union-merge has nothing to merge.
+        self.mixes: dict[str, dict] = {}
         self._last_sq_progress_at = 0.0  # throttle the current record's cursor writes
         self._last_position_save_at = 0.0  # throttle position-only state persistence
         self._last_progress_sent = 0.0
@@ -1298,6 +1588,15 @@ class Hub:
                 clean = self._sanitize_saved_queue(rec, SAVED_QUEUE_SONGS_HARD_MAX)
                 if clean is not None:
                     self.saved_queues[clean["id"]] = clean
+            # Additive in exactly the way savedQueues is: there is no schema version
+            # and no migration path in this file, only `data.get(key, default)`. So a
+            # state.json from before mixes existed loads with zero of them, and an
+            # older hub reading a newer file silently drops the key rather than
+            # failing — which is the whole reason the collection can be added at all.
+            for raw_mix in data.get("mixes", []):
+                clean = self._sanitize_mix(raw_mix)
+                if clean is not None:
+                    self.mixes[clean["id"]] = clean
             for rid, at in (data.get("deletedSavedQueues") or {}).items():
                 try:
                     self.deleted_saved_queues[rid] = int(at)
@@ -1369,6 +1668,7 @@ class Hub:
                 "session": self.session.snapshot(),
                 "savedQueues": self._saved_queues_list(),
                 "deletedSavedQueues": self.deleted_saved_queues,
+                "mixes": self._mixes_list(),
                 "devices": [
                     {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
                      "volume": d.volume, "lastSeen": d.last_seen}
@@ -1754,6 +2054,137 @@ class Hub:
         self._save()
         await self._broadcast({"t": "savedQueues", "queues": self._saved_queues_list()})
 
+    # ----- "Mixed for You" (recipes, regenerated client-side) --------------- #
+    #
+    # The hub stores `{kind, seedId, moodCharacter, count}` and broadcasts it. It
+    # never generates a track from one: each client regenerates locally with the
+    # engine it already has (Navic's RadioManager, Feishin's auto-dj/*), which is
+    # what keeps this process audio-free and AudioMuse-free.
+    #
+    # That is also the whole difference from a saved queue, and the gap this closes:
+    # a saved queue stores a RESULT and replays it; a mix stores a RECIPE and
+    # regenerates. Nothing in either client persisted one before — RadioManager took
+    # these values as arguments and dropped them, and `playMix` exited into a frozen
+    # SavedQueueEntity.
+    def _mint_mix_id(self) -> str:
+        return f"mx_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+
+    @staticmethod
+    def _sanitize_mix(raw: Any) -> Optional[dict]:
+        """A client-supplied recipe, coerced into the shape the hub stores.
+
+        Returns None for anything unusable. Same contract as `_sanitize_saved_queue`
+        and for the same reason: these records are persisted and fanned out to
+        devices that never saw the sender, so a bad value would land in state.json
+        and break every later `_save()`.
+        """
+        if not isinstance(raw, dict):
+            return None
+        mid = _as_str(raw.get("id"), 128)
+        if not mid:
+            return None
+        kind = _as_str(raw.get("kind"), 32)
+        if kind not in MIX_KINDS:
+            return None
+        name = (_as_str(raw.get("name")) or "").strip()
+        if not name:
+            return None
+        now = int(time.time() * 1000)
+        rec: dict = {
+            "id": mid,
+            "name": name,
+            "kind": kind,
+            "count": _as_int(raw.get("count"), 50, 1, MIX_COUNT_MAX),
+            "createdAt": _as_int(raw.get("createdAt"), now, 0),
+            "updatedAt": _as_int(raw.get("updatedAt"), now, 0),
+            "lastPlayedAt": _as_int(raw.get("lastPlayedAt"), 0, 0),
+        }
+        # Optional strings: absent rather than null, matching the saved-queue rule.
+        # `moodCharacter` is validated against the three AudioMuse presets rather
+        # than merely length-capped — it names a generator on the client, and an
+        # unknown one is a recipe no client can run.
+        for k in ("seedId", "seedName", "coverArtId"):
+            v = _as_str(raw.get(k))
+            if v:
+                rec[k] = v
+        mood = _as_str(raw.get("moodCharacter"), 32)
+        if mood in MIX_MOODS:
+            rec["moodCharacter"] = mood
+        return rec
+
+    def _mixes_list(self) -> list[dict]:
+        """The recipes, newest-updated first, capped — the payload clients render."""
+        ordered = sorted(self.mixes.values(),
+                         key=lambda r: _as_int(r.get("updatedAt")), reverse=True)
+        return ordered[:MIXES_MAX]
+
+    def _evict_mixes(self) -> None:
+        if len(self.mixes) <= MIXES_MAX:
+            return
+        keep = {r["id"] for r in self._mixes_list()}
+        dropped = [mid for mid in self.mixes if mid not in keep]
+        for mid in dropped:
+            del self.mixes[mid]
+        if dropped:
+            log(f"mix eviction dropped {len(dropped)} recipe(s), {len(self.mixes)} kept")
+
+    def _save_mix(self, msg: dict) -> Optional[str]:
+        """Create or update one recipe from an act. Returns its id, or None if unusable.
+
+        An absent `id` mints one — that is the create path. An `id` naming a recipe
+        the hub does not hold is NOT an error: a client can have minted it offline,
+        and refusing would leave the two permanently disagreeing with nothing to
+        notice it (the failure mode `renameSavedQueue` answers with an error for).
+        """
+        mid = _as_str(msg.get("id"), 128) or self._mint_mix_id()
+        existing = self.mixes.get(mid)
+        now = int(time.time() * 1000)
+        rec = self._sanitize_mix({
+            **msg, "id": mid,
+            # createdAt and lastPlayedAt are the hub's to keep: a client re-saving a
+            # recipe sends the recipe, not its history, and taking its word would
+            # reset the age of a mix every time its count was edited.
+            "createdAt": (existing or {}).get("createdAt", now),
+            "lastPlayedAt": (existing or {}).get("lastPlayedAt", 0),
+            "updatedAt": now,
+        })
+        if rec is None:
+            return None
+        self.mixes[mid] = rec
+        self._evict_mixes()
+        return mid
+
+    def _rename_mix(self, mid: Optional[str], name: Optional[str]) -> bool:
+        rec = self.mixes.get(mid) if mid else None
+        clean = (name or "").strip()
+        if rec is None or not clean:
+            return False
+        rec["name"] = clean
+        rec["updatedAt"] = int(time.time() * 1000)
+        return True
+
+    def _delete_mix(self, mid: Optional[str]) -> bool:
+        if not mid:
+            return False
+        return self.mixes.pop(mid, None) is not None
+
+    def _touch_mix(self, mid: Optional[str]) -> bool:
+        """Record that a recipe was just played. Bumps `lastPlayedAt` ONLY.
+
+        Not `updatedAt`: that is the eviction and sort key, and folding "played"
+        into it would make a mix the user listens to outrank one they just edited,
+        and reorder the list under them every time they pressed play.
+        """
+        rec = self.mixes.get(mid) if mid else None
+        if rec is None:
+            return False
+        rec["lastPlayedAt"] = int(time.time() * 1000)
+        return True
+
+    async def _broadcast_mixes(self) -> None:
+        self._save()
+        await self._broadcast({"t": "mixes", "mixes": self._mixes_list()})
+
     # ----- queue / order maths --------------------------------------------- #
     def _clamp_index(self, i: int) -> int:
         """Keep a client-supplied index inside the queue (0 for an empty queue)."""
@@ -1898,6 +2329,7 @@ class Hub:
                 "deviceId": dev.id,
                 "session": self.session.snapshot(),
                 "savedQueues": self._saved_queues_list(),
+                "mixes": self._mixes_list(),
                 "devices": [d.info(self.session.active_device_id) for d in self.devices.values()],
             })
             await self._broadcast_devices()
@@ -2400,6 +2832,36 @@ class Hub:
                 if changed:
                     await self._broadcast_saved_queues()
 
+        elif action == "saveMix":
+            # Create (no `id`) or update one "Mixed for You" recipe.
+            mid = self._save_mix(msg)
+            if mid is not None:
+                await self._broadcast_mixes()
+            else:
+                # A recipe with no name, or a `kind` this hub has never heard of.
+                # Answered rather than dropped: the client has already shown the
+                # user a mix it believes it saved.
+                await self._send(dev, {"t": "error", "code": "bad_mix",
+                                       "message": "a mix needs a name and a known kind"})
+
+        elif action == "renameMix":
+            if self._rename_mix(_as_str(msg.get("id"), 128), _as_str(msg.get("name"))):
+                await self._broadcast_mixes()
+            else:
+                await self._send(dev, {"t": "error", "code": "unknown_mix",
+                                       "message": f"no mix {msg.get('id')!r}"})
+
+        elif action == "deleteMix":
+            if self._delete_mix(_as_str(msg.get("id"), 128)):
+                await self._broadcast_mixes()
+
+        elif action == "touchMix":
+            # "This recipe was just played." Broadcast like the others so a second
+            # device's list re-sorts, but note it does NOT move `updatedAt` — see
+            # `_touch_mix`.
+            if self._touch_mix(_as_str(msg.get("id"), 128)):
+                await self._broadcast_mixes()
+
         elif action == "syncSavedQueues":
             # A (re)connecting client pushes its local/offline history up; union-merge
             # and rebroadcast the reconciled list to everyone.
@@ -2745,6 +3207,17 @@ async def main() -> None:
         log("WARNING: LBBOT_URL is set but HUB_TOKEN is empty — the lb-bot proxy is "
             "DISABLED. lb-bot's API has no auth of its own, so relaying it without "
             "a hub token would publish every route on the whitelist.")
+    if PREVIEW_URL and TOKEN and not PREVIEW_SECRET:
+        log("WARNING: PREVIEW_URL is set but PREVIEW_SECRET is empty — the preview "
+            "proxy is DISABLED. Every stream URL the hub minted would be signed with "
+            "an empty key and refused by the sidecar, i.e. the feature would fail at "
+            "playback rather than at configuration. Set the SAME value on both, and "
+            "not HUB_TOKEN.")
+    if PREVIEW_URL and PREVIEW_SECRET and not PREVIEW_PUBLIC_URL:
+        log("NOTE: PREVIEW_PUBLIC_URL is unset — previews play for a client that can "
+            "reach PREVIEW_URL itself, but not on a Chromecast. The hub advertises "
+            "previewCastable=false and both clients refuse a cast transfer while an "
+            "ext: track is queued.")
     global HUB_INSTANCE
     hub = Hub()
     HUB_INSTANCE = hub

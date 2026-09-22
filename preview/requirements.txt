@@ -1,0 +1,5 @@
+# The extractor. Deliberately NOT pinned to an exact version, unlike the hub's
+# `websockets<14`: yt-dlp's whole job is to track sites that change without
+# notice, so a pin here guarantees the feature breaks and stays broken. The floor
+# is the release this was written against.
+yt-dlp>=2026.9.1

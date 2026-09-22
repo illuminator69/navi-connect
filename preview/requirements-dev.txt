@@ -1,0 +1,9 @@
+# Test-only. `tools/test_stream_range.py` imports the sibling hub's `preview_sign`
+# rather than reimplementing it — that import IS the test, because the whole
+# point is that the two processes agree on the bytes being signed — and hub.py
+# imports websockets at module scope.
+#
+# Pinned to the hub's own range so this venv cannot prove the contract against a
+# hub that would not itself run.
+-r requirements.txt
+websockets>=12.0,<14

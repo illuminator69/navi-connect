@@ -1,0 +1,49 @@
+# Builds the preview sidecar image and publishes it to GHCR.
+#
+# Lives at the repo root, like hub-docker.yml: GitHub only reads workflows from
+# .github/workflows/ at the top level of a repository. `paths:` keeps it from
+# rebuilding on unrelated doc, hub or client changes — the two images are
+# independent, and the sidecar's whole point is that it can break and be
+# redeployed without touching the session relay.
+name: preview-docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'preview/**'
+      - '.github/workflows/preview-docker.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}-preview
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./preview
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
