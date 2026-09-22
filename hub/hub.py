@@ -109,6 +109,17 @@ PROXY_TIMEOUT = 20          # seconds per upstream socket op (urllib has one kno
                             # connect+read); Tier 2 is in-memory lookups, so fail fast
 PROXY_SLOW_TIMEOUT = 45     # for routes that are known to sit on a rate-limited third
                             # party (lb-bot's MusicBrainz-backed album lookups)
+PROXY_SEARCH_TIMEOUT = 150  # for /lb/album/sources alone: it BLOCKS on a live
+                            # Soulseek search while slskd fans out to peers and
+                            # waits on them. Measured at 45.4s for one release
+                            # group and documented in both clients as 30-90s, so
+                            # PROXY_SLOW_TIMEOUT was not merely tight, it was
+                            # below the median -- and a timeout here reads to the
+                            # user as "lb-bot is busy", sending them to look at a
+                            # service that is healthy and still searching.
+                            # NOT /lb/gap/search: that starts a background task
+                            # and returns at once, and its own long timeout is
+                            # about contending for lb-bot's _review_lock.
 PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the same
                             # question cost one upstream call
 PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers (a
@@ -545,7 +556,8 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # route is involved.
         "method": "GET", "path": "/api/album/sources",
         "params": ("rgid", "release_mbid", "artist", "album", "total"), "cache": True,
-        "timeout": PROXY_SLOW_TIMEOUT,
+        # A live slskd fan-out, not a MusicBrainz hop — see PROXY_SEARCH_TIMEOUT.
+        "timeout": PROXY_SEARCH_TIMEOUT,
     },
     ("POST", "/lb/album/download"): {
         # `release_mbid` + its metadata: the edition the user actually picked,
@@ -2796,7 +2808,8 @@ async def main() -> None:
     # it could never answer at all; cold `/lb/fresh-releases`, `/lb/gap/search`
     # and the MusicBrainz-backed routes were on the same cliff. The deadline has
     # to clear the slowest thing the proxy is allowed to wait for.
-    handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT) + 15
+    handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT,
+                            PROXY_SEARCH_TIMEOUT) + 15
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
                                 open_timeout=handshake_timeout,
