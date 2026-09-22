@@ -2784,8 +2784,22 @@ async def main() -> None:
         serve_kwargs["create_protocol"] = proxy_protocol
 
     sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
+    # `open_timeout` is the WebSocket *handshake* deadline, and it defaults to 10s
+    # -- but the HTTP proxies answer from inside `process_request`, which runs
+    # during that handshake. So a proxied request slower than the handshake
+    # deadline has its connection aborted before any response is written: the
+    # client sees a dropped socket rather than a status, and both clients report
+    # that as "lb-bot is busy or unreachable".
+    #
+    # That silently capped every slow route at 10s and made PROXY_SLOW_TIMEOUT
+    # unreachable. `/lb/album/sources` is a live slskd fan-out measured at 45s, so
+    # it could never answer at all; cold `/lb/fresh-releases`, `/lb/gap/search`
+    # and the MusicBrainz-backed routes were on the same cliff. The deadline has
+    # to clear the slowest thing the proxy is allowed to wait for.
+    handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT) + 15
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
+                                open_timeout=handshake_timeout,
                                 max_size=4 * 1024 * 1024, **serve_kwargs):
         await stop  # run until a stop signal arrives
 
