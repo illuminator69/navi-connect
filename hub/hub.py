@@ -113,7 +113,13 @@ PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the sa
                             # question cost one upstream call
 PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers (a
                             # release's tracklist and editions do not change)
-PROXY_CACHE_MAX = 64
+# Entries, across every route of one proxy — not bytes. 64 was sized for
+# surfaces that ask one question per page open; a Discover screen asks several,
+# and rotates the artist it seeds its similar-artists row from, so each rotation
+# is a fresh key. Eviction drops the soonest-to-expire first, which means the
+# 60s entries absorb the churn and the 6h ones (album/similar, album/releases,
+# meta/*) survive it — but only while there is room for them at all.
+PROXY_CACHE_MAX = 128
 # Query params that mean "do not answer this from a cache". The client is
 # explicitly asking for a re-fetch, and a cache hit is the precise thing it is
 # trying to get past. lb-bot's own `?refresh=1` escape hatch was unreachable
@@ -487,6 +493,23 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # is a search ranking, not an entity.
         "method": "GET", "path": "/api/artist/lookup",
         "params": ("q",), "cache": True, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/artist/similar"): {
+        # "Fans also like", including the artists you do NOT own — the Discover
+        # row's whole point. lb-bot marks ownership on each row rather than
+        # filtering on it, unlike /lb/album/similar, which is deliberately a
+        # shelf of what you already have.
+        #
+        # Short TTL, not PROXY_CACHE_TTL_LONG, and the reason is the opposite of
+        # the usual one. The expensive half — the ListenBrainz Labs + Last.fm
+        # merge — is already cached upstream for 24 hours, so a long TTL here
+        # would buy almost nothing; what it WOULD do is freeze the `owned` and
+        # `indexed` badges, which are recomputed per call and are the only part
+        # of the answer that moves. The hub's job on this route is just to
+        # collapse two clients asking at once.
+        "method": "GET", "path": "/api/artist/similar",
+        "params": ("mbid", "name", "limit"), "cache": True,
+        "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/album/sources"): {
         # Ranked slskd folders for a release-group, so a client can show what it is
@@ -1078,6 +1101,7 @@ _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"
 # MusicBrainz routes (editions, tracklists): a fill changes nothing about those.
 LB_LIBRARY_ROUTES = {
     ("GET", "/lb/artist/discography"),
+    ("GET", "/lb/artist/similar"),
     ("GET", "/lb/fresh-releases"),
     ("GET", "/lb/status"),
 }
