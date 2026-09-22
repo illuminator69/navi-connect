@@ -806,6 +806,7 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
 | `GET /lb/artist/similar` | same | `mbid`, `name`, `limit` | 60 s |
 | `GET /lb/artist/lookup` | same | `q` | 60 s |
+| `GET /lb/album/lookup` | same | `q` | 60 s (cleared by `/lb/notify`) |
 | `GET /lb/meta/artist` | `GET /api/meta/artist` | `mbid`, `name`, `refresh` | 6 h |
 | `GET /lb/meta/album` | `GET /api/meta/album` | `rgid`, `release_mbid`, `refresh` | 6 h |
 | `GET /lb/album/sources` | same | `rgid`, `release_mbid`, `artist`, `album`, `total` | 60 s |
@@ -833,6 +834,17 @@ badges that decide whether a row offers a download. For the same reason
 `/lb/artist/similar` is in the set `/lb/notify` invalidates and
 `/lb/album/similar` is not — a fill changes who you own, and nothing about
 editions or tracklists.
+
+**The two `lookup` routes are not symmetric either.** Both are a live
+MusicBrainz search on lb-bot's global 1 req/sec lock, so both are short-TTL and
+both expect the client to send only a debounced term of three characters or
+more. But `/lb/album/lookup` additionally marks each candidate `releaseOwned`
+with the Navidrome album id behind it (`releaseAlbumId`) — resolved from the
+library index, at no MusicBrainz cost — so it is in the invalidation set and
+`/lb/artist/lookup` is not. A client renders an owned candidate as a library
+row that opens the album, never as a download; a stale badge there is the
+"the tile said the library holds it and the tap opened the download page" bug
+that the Fresh tab and the similar-albums shelf have each paid for once.
 
 **`refresh` is not part of the cache key.** On the two `meta` routes it means
 "do not answer this from a cache", so the hub bypasses its own copy *and* writes

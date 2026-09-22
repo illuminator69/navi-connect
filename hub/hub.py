@@ -486,6 +486,15 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": ("rgid", "release_mbid", "refresh"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
+    ("GET", "/lb/album/lookup"): {
+        # MusicBrainz album search, the other half of the "reach outside the
+        # library" pair. Unlike its artist sibling this answer carries ownership
+        # per candidate (`releaseOwned` + `releaseAlbumId`), which is why it is
+        # also in LB_LIBRARY_ROUTES below: a fill changes who owns what, and a
+        # frozen badge is a row that offers to fetch a record already on disk.
+        "method": "GET", "path": "/api/album/lookup",
+        "params": ("q",), "cache": True, "timeout": PROXY_SLOW_TIMEOUT,
+    },
     ("GET", "/lb/artist/lookup"): {
         # MusicBrainz artist search, so a client's own search can offer a "Not
         # in your library" section that routes to the existing `mb:<mbid>`
@@ -1099,8 +1108,12 @@ _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"
 
 # Cached lb-bot answers a landed album makes wrong. Deliberately NOT the long-TTL
 # MusicBrainz routes (editions, tracklists): a fill changes nothing about those.
+# `/lb/album/lookup` is a MusicBrainz search and belongs here anyway — the
+# ranking does not move, but the `releaseOwned` badge it now carries does, and
+# a stale badge is a row offering to fetch a record already on disk.
 LB_LIBRARY_ROUTES = {
     ("GET", "/lb/artist/discography"),
+    ("GET", "/lb/album/lookup"),
     ("GET", "/lb/artist/similar"),
     ("GET", "/lb/fresh-releases"),
     ("GET", "/lb/status"),

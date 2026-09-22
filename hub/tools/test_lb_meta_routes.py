@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-End-to-end test for the three lb-bot routes wired up with the editorial
-metadata work: `/lb/meta/artist`, `/lb/meta/album` and `/lb/artist/lookup`.
+End-to-end test for the lb-bot routes that reach outside the library:
+`/lb/meta/artist`, `/lb/meta/album`, `/lb/artist/lookup`, `/lb/album/similar`
+and `/lb/album/lookup`.
 
-Two of them (`/lb/album/similar` aside) are new, and the fourth —
-`/lb/album/similar` — had been shipped and whitelisted for months with **zero
-consumers**, so nothing had ever exercised it over the wire either. It is
-covered here for the same reason.
+Three of them were wired up with the editorial-metadata work;
+`/lb/album/similar` had been shipped and whitelisted for months with **zero
+consumers**, so nothing had ever exercised it over the wire either, and it is
+covered here for the same reason. `/lb/album/lookup` is the newest, and the one
+route in this set whose answer a landed album falsifies.
 
 Serves a stub lb-bot and drives the real `LbProxy.handle`, which is what proves
 the things a unit test of the route table cannot:
@@ -16,7 +18,10 @@ the things a unit test of the route table cannot:
     passed through — the whitelist is the security control);
   - the shared result cache answers the second identical request without a
     second upstream hit;
-  - an oversized answer is a clean 502 `tooLarge`, never a truncated 200.
+  - an oversized answer is a clean 502 `tooLarge`, never a truncated 200;
+  - `/lb/album/lookup`'s per-candidate ownership survives the proxy, and a
+    library change evicts it — a frozen `releaseOwned` is a row that offers to
+    fetch a record already on disk.
 
 Exits non-zero on failure.
 """
@@ -59,6 +64,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = {"rgid": "r1", "paragraphs": ["z" * (CAP + 1)]}
         elif path == "/api/artist/lookup":
             body = {"candidates": [{"mbid": "m1", "name": "X"}]}
+        elif path == "/api/album/lookup":
+            body = {"candidates": [
+                {"rgid": "r1", "title": "Owned", "artist": "A",
+                 "primary_type": "album", "year": "1999", "score": 100,
+                 "releaseOwned": True, "releaseAlbumId": "nd-42",
+                 "coverUrl": "https://coverartarchive.org/release-group/r1/front-500"},
+                {"rgid": "r2", "title": "Stranger", "artist": "A",
+                 "primary_type": "album", "year": "2004", "score": 90,
+                 "releaseOwned": False, "releaseAlbumId": "", "coverUrl": ""}]}
         elif path == "/api/album/similar":
             body = {"albums": [{"rgid": "r1", "title": "T", "artist": "A"}],
                     "because": "Radiohead", "sources": ["ListenBrainz"]}
@@ -187,6 +201,48 @@ def main() -> int:
         if not HITS or "q=radio" not in HITS[0]:
             failures.append(f"`q` was not forwarded: {HITS}")
 
+        # --- album lookup: the other half of "reach outside the library" ----
+        HITS.clear()
+        status, _hdrs, body = call("/lb/album/lookup?q=owned&secret=leak")
+        if status != 200:
+            failures.append(f"/lb/album/lookup should answer 200, got {status}")
+        else:
+            cands = json.loads(body).get("candidates") or []
+            if len(cands) != 2:
+                failures.append(
+                    "/lb/album/lookup dropped candidates in transit — the route "
+                    "marks ownership, it does not filter on it")
+            elif not cands[0].get("releaseAlbumId"):
+                failures.append(
+                    "`releaseAlbumId` did not survive the proxy. Without it a "
+                    "row badged in-library has only the virtual album page's "
+                    "redirect, which cannot fire for an album lb-bot filled "
+                    "itself — the tile says owned and the tap opens a download")
+        if not HITS or "q=owned" not in HITS[0]:
+            failures.append(f"`q` was not forwarded: {HITS}")
+        if HITS and "secret" in HITS[0]:
+            failures.append("an un-whitelisted param reached lb-bot")
+
+        # ...cached like its siblings...
+        before = len(HITS)
+        call("/lb/album/lookup?q=owned&secret=leak")
+        if len(HITS) != before:
+            failures.append("/lb/album/lookup is not cached")
+
+        # ...but a landed album must drop it, which is what separates this route
+        # from /lb/artist/lookup. The ranking does not move; the ownership badge
+        # does, and a frozen badge offers to fetch a record already on disk.
+        if ("GET", "/lb/album/lookup") not in hub.LB_LIBRARY_ROUTES:
+            failures.append(
+                "/lb/album/lookup is not in LB_LIBRARY_ROUTES — its "
+                "`releaseOwned` badge would survive the fill that falsifies it")
+        proxy.invalidate(hub.LB_LIBRARY_ROUTES)
+        before = len(HITS)
+        call("/lb/album/lookup?q=owned&secret=leak")
+        if len(HITS) == before:
+            failures.append(
+                "a library-change invalidation did not evict /lb/album/lookup")
+
         # --- similar albums: shipped long ago, never exercised over the wire -
         HITS.clear()
         status, _hdrs, body = call(
@@ -209,7 +265,8 @@ def main() -> int:
             print(f"FAIL - {f}")
         return 1
     print("PASS - lb meta routes: reachable/param-whitelist/cached/refresh-bypasses"
-          "-and-replaces/oversized-is-502")
+          "-and-replaces/oversized-is-502/lookup-ownership-survives-and-is"
+          "-invalidated-by-a-fill")
     return 0
 
 
