@@ -36,6 +36,10 @@ import hub  # noqa: E402
 
 HITS: list[str] = []
 CAP = 4096
+# Bumped by the refresh case so two upstream answers are distinguishable: that
+# is the only way to tell "the refresh reached lb-bot" from "the refresh was
+# answered out of the hub's own six-hour cache".
+ARTIST_REVISION = [1]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -43,7 +47,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         HITS.append(self.path)
         path = self.path.split("?")[0]
         if path == "/api/meta/artist":
-            body = {"mbid": "m1", "summary": "A band.", "paragraphs": ["A band."],
+            summary = f"A band. (rev {ARTIST_REVISION[0]})"
+            body = {"mbid": "m1", "summary": summary, "paragraphs": [summary],
                     "found": True, "links": [], "relations": {}, "credits": [],
                     "source": {"name": "Wikipedia", "license": "CC BY-SA 4.0",
                                "url": "https://en.wikipedia.org/wiki/X"}}
@@ -96,7 +101,7 @@ def main() -> int:
         status, _hdrs, body = call("/lb/meta/artist?mbid=m1&secret=leak")
         if status != 200:
             failures.append(f"/lb/meta/artist should answer 200, got {status}")
-        elif json.loads(body).get("summary") != "A band.":
+        elif not json.loads(body).get("summary", "").startswith("A band."):
             failures.append("/lb/meta/artist did not pass the upstream body through")
         if not HITS or not HITS[0].startswith("/api/meta/artist"):
             failures.append(f"/lb/meta/artist reached the wrong upstream path: {HITS}")
@@ -121,6 +126,47 @@ def main() -> int:
         call("/lb/meta/artist?name=Radiohead")
         if not HITS or "name=Radiohead" not in HITS[0]:
             failures.append(f"`name` was not forwarded: {HITS}")
+
+        # --- `refresh` reaches lb-bot, and replaces the copy everyone reads ---
+        # Two separate bugs live here. `refresh` used to be unlisted, so
+        # `_filtered_params` dropped it and lb-bot never saw it. Whitelisting it
+        # alone is still not enough: if the param were part of the cache key, a
+        # refresh would get its OWN slot, so the stale entry every ordinary
+        # caller reads would survive the refresh for the whole of
+        # PROXY_CACHE_TTL_LONG — six hours of the user pressing refresh and
+        # seeing no change.
+        HITS.clear()
+        ARTIST_REVISION[0] = 1
+        _s, _h, first = call("/lb/meta/artist?mbid=refreshme")
+        if json.loads(first).get("summary") != "A band. (rev 1)":
+            failures.append("the first read did not come from upstream")
+
+        ARTIST_REVISION[0] = 2
+        before = len(HITS)
+        _s, _h, refreshed = call("/lb/meta/artist?mbid=refreshme&refresh=1")
+        if len(HITS) == before:
+            failures.append(
+                "`refresh=1` was answered from the hub cache — the whole point "
+                "of the param is to get past exactly that")
+        elif "refresh=1" not in HITS[-1]:
+            failures.append(
+                f"`refresh` was not forwarded to lb-bot: {HITS[-1]} — an "
+                "unlisted param is dropped, which is how this was unreachable")
+        if json.loads(refreshed).get("summary") != "A band. (rev 2)":
+            failures.append("the refresh did not return the new upstream body")
+
+        # ...and now the ORDINARY call must see the refreshed copy, from cache.
+        before = len(HITS)
+        _s, _h, after = call("/lb/meta/artist?mbid=refreshme")
+        if len(HITS) != before:
+            failures.append(
+                "the plain read after a refresh went upstream — the refresh "
+                "should have repopulated the shared cache entry")
+        if json.loads(after).get("summary") != "A band. (rev 2)":
+            failures.append(
+                "a plain read still sees the pre-refresh body: the refresh "
+                "landed in its own cache slot instead of replacing the shared "
+                "one, so refreshing changes nothing for six hours")
 
         # --- album meta: oversized upstream body is a clean 502 -------------
         status, _hdrs, body = call("/lb/meta/album?rgid=r1")
@@ -162,7 +208,8 @@ def main() -> int:
         for f in failures:
             print(f"FAIL - {f}")
         return 1
-    print("PASS - lb meta routes: reachable/param-whitelist/cached/oversized-is-502")
+    print("PASS - lb meta routes: reachable/param-whitelist/cached/refresh-bypasses"
+          "-and-replaces/oversized-is-502")
     return 0
 
 

@@ -114,6 +114,14 @@ PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the sa
 PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers (a
                             # release's tracklist and editions do not change)
 PROXY_CACHE_MAX = 64
+# Query params that mean "do not answer this from a cache". The client is
+# explicitly asking for a re-fetch, and a cache hit is the precise thing it is
+# trying to get past. lb-bot's own `?refresh=1` escape hatch was unreachable
+# through the proxy twice over: `_filtered_params` drops any param a route does
+# not list, and merely whitelisting it would not have been enough either — see
+# the cache-key note in `HttpProxy.call`.
+PROXY_NO_CACHE_PARAMS = ("refresh",)
+
 PROXY_MAX_BODY = 256 * 1024        # largest client request body accepted
 PROXY_MAX_RESPONSE = 4 * 1024 * 1024
 
@@ -457,7 +465,7 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # effectively immutable upstream answer, and lb-bot caches it for 30
         # days behind this anyway.
         "method": "GET", "path": "/api/meta/artist",
-        "params": ("mbid", "name"), "cache": True,
+        "params": ("mbid", "name", "refresh"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/meta/album"): {
@@ -469,7 +477,7 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # PROXY_MAX_RESPONSE — a long article otherwise would, and an oversize
         # body is answered 502 tooLarge, which is correct but user-visible.
         "method": "GET", "path": "/api/meta/album",
-        "params": ("rgid", "release_mbid"), "cache": True,
+        "params": ("rgid", "release_mbid", "refresh"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/artist/lookup"): {
@@ -832,9 +840,21 @@ class HttpProxy:
         if upstream_path is None:
             return 400, b'{"error":"invalid path parameter"}', "application/json"
 
-        key = json.dumps([route, upstream_path, sorted(params), body],
+        # The cache key deliberately IGNORES PROXY_NO_CACHE_PARAMS. `refresh=1` is
+        # not a different resource; it is the same one with an instruction about
+        # how to fetch it. Keying on it would hand a refresh its own cache slot,
+        # so the stale copy every ordinary caller reads would survive the refresh
+        # completely untouched — on the meta routes, for the six hours of
+        # PROXY_CACHE_TTL_LONG. Sharing the key instead means the fresh answer is
+        # stored where the next ordinary call will find it, which is what a user
+        # pressing refresh actually means.
+        cache_params = sorted((k, v) for k, v in params
+                              if k not in PROXY_NO_CACHE_PARAMS)
+        key = json.dumps([route, upstream_path, cache_params, body],
                          sort_keys=True, default=str)
-        if spec.get("cache"):
+        refresh = any(k in PROXY_NO_CACHE_PARAMS and v not in ("", "0", "false")
+                      for k, v in params)
+        if spec.get("cache") and not refresh:
             hit = self._cache_get(key)
             if hit is not None:
                 return hit
