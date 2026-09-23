@@ -240,6 +240,48 @@ terminated. Cookies expire, so `/status` carries `extractorBlocked` and the hub 
 `/preview/status`: without that, a challenge and a genuine no-match are identical from a client
 (an empty resolve against a process reporting itself healthy).
 
+**STATE 2026-09-23: deployed, wired, and the extractor is blocked by the egress address.** Both
+containers run, `/preview/status` answers `{configured: true, upstreamReachable: true,
+previewCastable: true}`, the capability signing and the Range relay are verified end to end on
+real audio — and `/preview/resolve` answers `{}` for everything, because YouTube serves this
+NAS's IPv4 address **no media formats at all** (only `mhtml` storyboards). Measured from one
+machine in one second, twice, on two videos: IPv6 returns format 18, IPv4 returns nothing. It
+degraded *during* that session — at 00:20 the unauthenticated `android` client still returned
+format 18 from the NAS, by 01:00 it returned nothing — so the address is being progressively
+restricted rather than merely challenged.
+
+**Cookies were tried with a real throwaway account and are not the answer.** They work as
+designed — the jar is picked up without a restart, yt-dlp refreshes it in place, and the error
+moves from `Sign in to confirm you're not a bot` to `Requested format is not available` — but
+they fix *authentication*, not *format availability*. Two things learned doing it, both of which
+matter if anyone retries:
+
+- **yt-dlp refuses the `android` client outright when a cookie file is configured** ("does not
+  support cookies"). So enabling cookies *removes* the only client that ever worked here
+  unauthenticated. The client switch in `_ydl` is forced by that, not a preference.
+- **The image has no JavaScript runtime**, which is a latent bug rather than anything of
+  YouTube's: yt-dlp needs one to solve the signature / `n` challenges for every web-family
+  client, and `python:3.12-slim` ships neither Node nor Deno. It stayed invisible because
+  `android` serves pre-signed URLs and needs no JS. Installing Deno clears both warnings and
+  still yields zero formats, so it is not the blocker — but it is the *next* one, and any
+  cookie-based retry needs it (~92 MB onto a 142 MB image).
+
+**The only path with evidence behind it is IPv6**, and it is blocked on something outside this
+codebase: the router does not filter inbound v6 (verified from a phone on mobile data against
+this workstation's global address), and `docker-proxy` already binds the v6 wildcard for
+`:::8899` (lb-bot, **unauthenticated**, answers 200), `:::5432`, `:::6379`, `:::4533`, `:::8000`.
+Today those are shielded by nothing but the absence of a routable address. The gateway is a
+**Sagemcom** CPE with no local web UI on any port from either machine, so the firewall is not
+locally changeable — it is a Proximus app/portal or support matter. The resting fix, when access
+exists, is IPv6 **plus** a host firewall (`ip6tables` default-DROP on INPUT/FORWARD, established
+and related allowed, persisted in Unraid's `go` script), and then **no cookies and no JS runtime
+are needed at all** — `android` works unauthenticated over v6.
+
+`PREVIEW_COOKIES` is commented out in the NAS project's `.env` and the jar has been deleted. The
+code path stays: it is tested, it costs nothing while unset, and it is the thing to re-enable if
+the egress ever changes. Everything else in this round — `mixes`, the seven lb-bot route
+reservations, signing, Range — is deployed and verified.
+
 Unset `PREVIEW_URL` hides the feature entirely, like `LBBOT_URL`. Unset `PREVIEW_PUBLIC_URL`
 keeps it working locally but sets `previewCastable: false`, which both clients must honour.
 
