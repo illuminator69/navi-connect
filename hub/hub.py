@@ -135,8 +135,20 @@ SQ_STR_MAX = 512  # longest accepted string field inside a client-supplied saved
 POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
 
 # --- proxy tuning (shared by the AudioMuse and lb-bot proxies) ---
-PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls; a hung core must not eat the
+PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls PER PROXY (each of the three
+                            # proxies has its own pool); a hung core must not eat the
                             # default thread pool and stall the 1 Hz progress fan-out
+# A second, small pool for the routes a client POLLS (`/lb/album/status`,
+# `/lb/fills`, `/lb/gap`) and for cancels. The default pool is first-come with
+# no priority, so four `/lb/album/sources` fan-outs — up to 150 s each — held
+# every slot and every status poll behind them queued until the handshake
+# deadline dropped the socket with no answer at all. A poll must never wait on
+# a search.
+PROXY_FAST_INFLIGHT = 2
+# How long a request may wait for a slot before the hub answers 503 `busy`
+# itself. Waiting past the handshake deadline is the one outcome a client can
+# do nothing with; a 503 it can show.
+PROXY_QUEUE_TIMEOUT_FAST = float(os.environ.get("PROXY_QUEUE_TIMEOUT_FAST", "10"))
 PROXY_TIMEOUT = 20          # seconds per upstream socket op (urllib has one knob for
                             # connect+read); Tier 2 is in-memory lookups, so fail fast
 PROXY_SLOW_TIMEOUT = 45     # for routes that are known to sit on a rate-limited third
@@ -677,8 +689,12 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "method": "POST", "path": "/api/album/download",
         # `excludeUsers`: "try another source" — the peers that already failed or
         # crawled for this album, so re-ranking cannot hand the fill straight back.
+        # `allowMp3`: the whole-album counterpart of a gap group's opt-in. A
+        # `format_rejected` fill had `mp3WouldHelp` on the wire and no route
+        # that could act on it, because `/lb/album/allow-mp3` needs a group.
         "body": ("rgid", "release_mbid", "artist", "title", "total_tracks",
-                 "sourceUsername", "sourceFolder", "quality", "excludeUsers"),
+                 "sourceUsername", "sourceFolder", "quality", "excludeUsers",
+                 "allowMp3"),
         "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
@@ -693,6 +709,14 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
     ("GET", "/lb/album/status"): {
         "method": "GET", "path": "/api/album/status",
         "params": ("release_mbid", "rgid"), "cache": False,
+    },
+    ("GET", "/lb/fills"): {
+        # Every fill a client watches, in one read: `albums` keyed by release
+        # mbid and `gaps` keyed by review-group id, plus `serverTime`. A Download
+        # Center with eight rows used to poll eight times per tick; now one, on
+        # the fast pool, so it never queues behind a source search.
+        "method": "GET", "path": "/api/fills",
+        "params": ("release_mbids", "group_ids"), "cache": False,
     },
     ("POST", "/lb/album/allow-mp3"): {
         # lb-bot puts the group id in the URL; the clients send it in the body so
@@ -804,6 +828,17 @@ PREVIEW_ROUTES: dict[tuple[str, str], dict] = {
 # clients fetch directly. Proxying images would also put multi-megabyte bodies
 # into a cache bounded by entry count, not bytes.
 
+# The polled and the cancelling routes take the small fast pool (see
+# PROXY_FAST_INFLIGHT); everything else shares the default one.
+for _fast in (("GET", "/lb/album/status"), ("GET", "/lb/fills"), ("GET", "/lb/gap"),
+              ("POST", "/lb/album/cancel"), ("POST", "/lb/gap/cancel")):
+    LB_ROUTES[_fast]["pool"] = "fast"
+# Writes that make their own cached read stale. `/lb/notify` covers a landing;
+# these cover the user's own action, which no landing announces.
+LB_ROUTES[("POST", "/lb/wishlist")]["invalidates"] = {("GET", "/lb/wishlist")}
+LB_ROUTES[("POST", "/lb/wishlist/remove")]["invalidates"] = {("GET", "/lb/wishlist")}
+LB_ROUTES[("POST", "/lb/artist/release")]["invalidates"] = {("GET", "/lb/artist/discography")}
+
 _PATH_ARG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
@@ -846,8 +881,18 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
             payload = b""
         return e.code, payload, e.headers.get("Content-Type") or "application/json"
     except Exception as e:  # noqa: BLE001 — never raise into the WS loop
+        # "Slow" and "down" used to be the same 502, so a client could only say
+        # "lb-bot is busy or unreachable" — a message that sends the user to
+        # look at a service that is healthy and still searching.
+        reason = getattr(e, "reason", e)
+        if (isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
+                or "timed out" in str(e).lower()):
+            log(f"{label} proxy: upstream timed out after {timeout}s: {url}")
+            return (504, json.dumps({"error": f"{label} timed out", "busy": True}).encode(),
+                    "application/json")
         log(f"{label} proxy: upstream failed:", e)
-        return 502, json.dumps({"error": f"{label} unreachable"}).encode(), "application/json"
+        return (502, json.dumps({"error": f"{label} unreachable", "down": True}).encode(),
+                "application/json")
 
 
 class HttpProxy:
@@ -863,9 +908,14 @@ class HttpProxy:
     routes: dict[tuple[str, str], dict] = {}
 
     def __init__(self) -> None:
-        self._sem = asyncio.Semaphore(PROXY_MAX_INFLIGHT)
+        self._pools = {"default": asyncio.Semaphore(PROXY_MAX_INFLIGHT),
+                       "fast": asyncio.Semaphore(PROXY_FAST_INFLIGHT)}
         self._cache: dict[str, tuple[float, int, bytes, str]] = {}
         self._cache_gen = 0
+        # Identical GETs in flight at once share one upstream call. Two devices
+        # opening the same source sheet used to start two slskd searches; the
+        # cache only ever helped the second caller once the first had returned.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     # ----- per-upstream ---------------------------------------------------- #
     @property
@@ -1046,6 +1096,32 @@ class HttpProxy:
             if hit is not None:
                 return hit
 
+        coalesce = spec["method"] == "GET" and not refresh
+        leader = self._inflight.get(key) if coalesce else None
+        if leader is not None:
+            # Shielded: a follower being cancelled must not cancel the shared call.
+            return await asyncio.shield(leader)
+        fut: Optional[asyncio.Future] = None
+        if coalesce:
+            fut = asyncio.get_running_loop().create_future()
+            self._inflight[key] = fut
+        try:
+            result = await self._call_upstream(route, spec, upstream_path, params,
+                                               body, key)
+            if fut is not None:
+                fut.set_result(result)
+            return result
+        except BaseException as e:
+            if fut is not None and not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            if fut is not None:
+                self._inflight.pop(key, None)
+
+    async def _call_upstream(self, route: tuple[str, str], spec: dict,
+                             upstream_path: str, params: list[tuple[str, str]],
+                             body: Optional[dict], key: str) -> tuple[int, bytes, str]:
         gen = self._cache_gen
         url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
@@ -1053,17 +1129,38 @@ class HttpProxy:
             url += "?" + urllib.parse.urlencode(params)
         payload = json.dumps(body).encode() if body is not None else None
 
-        async with self._sem:
+        pool = spec.get("pool", "default")
+        sem = self._pools[pool]
+        queue_timeout = (PROXY_QUEUE_TIMEOUT_FAST if pool == "fast"
+                         else spec.get("timeout", PROXY_TIMEOUT))
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=queue_timeout)
+        except asyncio.TimeoutError:
+            log(f"{self.label} proxy: no {pool} slot within {queue_timeout}s for {url}")
+            return (503, json.dumps({"error": f"{self.label} proxy busy",
+                                     "busy": True}).encode(), "application/json")
+        try:
             status, data, ctype = await asyncio.to_thread(
                 _proxy_upstream_blocking, spec["method"], url, payload,
                 self.upstream_token, spec.get("timeout", PROXY_TIMEOUT), self.label)
+        finally:
+            sem.release()
 
+        # Captured BEFORE augment: the probe route rewrites any upstream status
+        # into a 200 verdict, and caching that verdict froze "unreachable" for a
+        # minute after lb-bot came back (and "reachable" for a minute after it
+        # went away). Only an upstream success is worth remembering.
+        upstream_status = status
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
         data = self._strip(spec, status, data)
-        if spec.get("cache") and gen == self._cache_gen:
+        if spec.get("cache") and gen == self._cache_gen and upstream_status == 200:
             self._cache_put(key, status, data, ctype,
                             spec.get("ttl", PROXY_CACHE_TTL))
+        # A write that succeeded makes its own read stale: adding to the wishlist
+        # answered the list without the row for up to a minute.
+        if 200 <= status < 300 and spec.get("invalidates"):
+            self.invalidate(set(spec["invalidates"]))
         return status, data, ctype
 
     async def handle(self, protocol: Any, raw_path: str,
@@ -1097,7 +1194,7 @@ class HttpProxy:
         if spec["method"] == "POST":
             raw = await _read_body(protocol, headers)
             if raw is None:
-                return _http_json(413, {"error": "request body too large"})
+                return _http_json(400, {"error": "request body too large or unreadable"})
             body = self._filtered_body(spec, raw)
             if body is None:
                 return _http_json(400, {"error": "malformed JSON body"})
@@ -1223,9 +1320,8 @@ class PreviewProxy(HttpProxy):
         into a buffered body with a library-computed `Content-Length`
         (`websockets/legacy/server.py:233`) — there is no chunk-by-chunk path.
       * `PROXY_MAX_RESPONSE` is 4 MB. A three-minute preview is larger.
-      * `PROXY_MAX_INFLIGHT` is 4, and those slots are shared with every lb-bot
-        and AudioMuse call. One playing stream would hold a quarter of them for
-        its whole duration.
+      * `PROXY_MAX_INFLIGHT` is 4 per proxy, so one playing stream would hold a
+        quarter of the preview proxy's slots for its whole duration.
       * Serving media here at all would mean writing to `self.transport` by hand
         and raising `BrokenPipeError` to suppress the library's own write — and
         even then `open_timeout` (the handshake deadline, ~165 s) truncates the
@@ -1374,7 +1470,10 @@ async def _read_body(protocol: Any, headers: Any) -> Optional[bytes]:
     try:
         raw = await asyncio.wait_for(protocol.reader.readexactly(length), timeout=10)
     except Exception:  # noqa: BLE001
-        raw = b""
+        # Forwarding `{}` here sent a cancel or a download to lb-bot with an
+        # empty body, which it answered with a 400 the client could not explain.
+        protocol.body_consumed = True
+        return None
     protocol.body_consumed = True
     return raw
 
@@ -1417,6 +1516,23 @@ HUB_INSTANCE: Optional["Hub"] = None
 # route — nothing is forwarded — so it lives outside LB_ROUTES, and it answers
 # whether or not LBBOT_URL is configured, because this direction doesn't need it.
 LB_NOTIFY_PATH = "/lb/notify"
+# The second inbound path: a fill moved. Its own frame (`t: "fill"`) because a
+# `library` event makes every client refetch its discographies and flushes the
+# hub's library caches — the right answer to a landing and the wrong one to
+# "3 of 12 downloaded" or "cancelled", where nothing in the library changed.
+LB_FILL_PATH = "/lb/fill"
+_LB_FILL_KINDS = ("album", "gap", "wishlist")
+_LB_FILL_STR = ("kind", "key", "releaseMbid", "rgid", "groupId", "state", "status",
+                "artist", "album", "failureKind", "reason", "source", "taskStatus",
+                "quality")
+_LB_FILL_INT = ("done", "failed", "total", "percent", "bytesDone", "bytesTotal",
+                "speedBps", "activeFiles", "attempts")
+_LB_FILL_FLOAT = ("updatedAt", "serverTime", "retryAt")
+_LB_FILL_BOOL = ("retryable", "mp3WouldHelp", "allowMp3", "cancellable", "verifyGaveUp")
+# A fill that ended makes the ranked source list it was picked from stale: a
+# "try another source" re-read within the 60 s TTL got the same list back,
+# with the peer that had just failed still at the top.
+_LB_FILL_TERMINAL = ("failed", "cancelled")
 _LB_NOTIFY_STR_MAX = 200
 _LB_NOTIFY_IDS_MAX = 16
 _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"}
@@ -1471,6 +1587,77 @@ def _lb_notify_row(raw: Any) -> Optional[dict]:
             row[key] = [v for v in (_as_str(x, 128) for x in values[:cap]) if v]
     # A row with no rgid can't be matched to anything a client holds.
     return row if row.get("rgid") else None
+
+
+def _lb_fill_frame(payload: dict) -> Optional[dict]:
+    """Rebuild a fill push into the `fill` frame, field by field and bounded."""
+    kind = _as_str(payload.get("kind"), 16)
+    if kind not in _LB_FILL_KINDS:
+        return None
+    frame: dict = {"t": "fill"}
+    for key in _LB_FILL_STR:
+        value = _as_str(payload.get(key), _LB_NOTIFY_STR_MAX)
+        if value:
+            frame[key] = value
+    for key in _LB_FILL_INT:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            frame[key] = int(value)
+    for key in _LB_FILL_FLOAT:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            frame[key] = float(value)
+    for key in _LB_FILL_BOOL:
+        if key in payload:
+            frame[key] = bool(payload.get(key))
+    ids = payload.get("ndAlbumIds")
+    if isinstance(ids, list):
+        clean = [v for v in (_as_str(i, 128) for i in ids[:_LB_NOTIFY_IDS_MAX]) if v]
+        if clean:
+            frame["ndAlbumIds"] = clean
+    if not frame.get("key"):
+        return None
+    return frame
+
+
+async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
+                          method: str) -> Optional[tuple]:
+    """Fan a fill's progress or state change out to every connected client.
+
+    Deliberately does NOT touch `LB_LIBRARY_ROUTES`: nothing in the library
+    moved. The one cache it invalidates is the ranked source list, and only
+    when the fill ended.
+    """
+    path, _, _query = raw_path.partition("?")
+    if (path.rstrip("/") or "/") != LB_FILL_PATH:
+        return None
+    if method != "POST":
+        return _http_json(405, {"error": "method not allowed"})
+
+    auth = (headers.get("Authorization") or "") if headers is not None else ""
+    supplied = auth[7:] if auth.startswith("Bearer ") else ""
+    if not TOKEN or not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+        return _http_json(401, {"error": "unauthorized"})
+
+    raw = await _read_body(protocol, headers)
+    if raw is None:
+        return _http_json(400, {"error": "request body too large or unreadable"})
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:  # noqa: BLE001
+        return _http_json(400, {"error": "malformed JSON body"})
+    if not isinstance(payload, dict):
+        return _http_json(400, {"error": "malformed JSON body"})
+    frame = _lb_fill_frame(payload)
+    if frame is None:
+        return _http_json(400, {"error": "fill needs a known kind and a key"})
+
+    if frame.get("kind") == "album" and frame.get("state") in _LB_FILL_TERMINAL:
+        LB.invalidate({("GET", "/lb/album/sources")})
+    if HUB_INSTANCE is not None:
+        await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
+    dlog("LB fill ->", frame)
+    return _http_json(200, {"ok": True})
 
 
 async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
@@ -3158,10 +3345,14 @@ def _build_proxy_protocol() -> Optional[type]:
             return path, headers
 
         async def process_request(self, path, request_headers):  # type: ignore[override]
-            # Checked ahead of the proxies: /lb/notify sits under the lb prefix
-            # but is inbound, so LbProxy would 404 it against its route table.
+            # Checked ahead of the proxies: /lb/notify and /lb/fill sit under
+            # the lb prefix but are inbound, so LbProxy would 404 them against
+            # its route table.
             result = await _handle_lb_notify(self, path, request_headers,
                                              self.http_method)
+            if result is None:
+                result = await _handle_lb_fill(self, path, request_headers,
+                                               self.http_method)
             if result is None:
                 for proxy in PROXIES:
                     result = await proxy.handle(self, path, request_headers,

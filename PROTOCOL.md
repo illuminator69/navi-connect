@@ -279,7 +279,8 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
 | `mixes` | `{ mixes:[<Mix>...] }` | "Mixed for You" recipes changed (§17); also in `welcome` |
-| `library` | `{ event, releaseMbid, rgid, artist, album, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1) |
+| `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
+| `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
@@ -823,19 +824,32 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/meta/artist` | `GET /api/meta/artist` | `mbid`, `name`, `refresh` | 6 h |
 | `GET /lb/meta/album` | `GET /api/meta/album` | `rgid`, `release_mbid`, `refresh` | 6 h |
 | `GET /lb/album/sources` | same | `rgid`, `release_mbid`, `artist`, `album`, `total` | 60 s |
-| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality`, `excludeUsers` | — |
-| `GET /lb/album/status` | same | `release_mbid`, `rgid` | **never** |
-| `POST /lb/album/cancel` | `POST /api/album/cancel` | `release_mbid` | — |
+| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality`, `excludeUsers`, `allowMp3` | — |
+| `GET /lb/album/status` | same | `release_mbid`, `rgid` | **never** (fast pool) |
+| `GET /lb/fills` | `GET /api/fills` | `release_mbids`, `group_ids` (comma-separated, ≤ 32 each) | **never** (fast pool) |
+| `POST /lb/album/cancel` | `POST /api/album/cancel` | `release_mbid` | — (fast pool) |
 | `POST /lb/album/allow-mp3` | `POST /api/gaps/{group_id}/allow-mp3` | `group_id`, `allow` | — |
-| `GET /lb/gap` | `GET /api/gaps/{group_id}` | `group_id`, `sourcePage` | **never** |
+| `GET /lb/gap` | `GET /api/gaps/{group_id}` | `group_id`, `sourcePage` | **never** (fast pool) |
 | `GET /lb/gap/source-files` | `GET /api/groups/{group_id}/sources/{source_index}/files` | `group_id`, `source_index` | 60 s |
 | `POST /lb/gap/search` | `POST /api/groups/{group_id}/sources` | `group_id`, `force` | — (45 s timeout) |
 | `POST /lb/gap/auto` | `POST /api/gaps/{group_id}/auto` | `group_id` | — |
 | `POST /lb/gap/fetch` | `POST /api/gaps/{group_id}/fetch` | `group_id`, `sourceId` | — |
-| `POST /lb/gap/cancel` | `POST /api/gaps/{group_id}/cancel` | `group_id` | — |
+| `POST /lb/gap/cancel` | `POST /api/gaps/{group_id}/cancel` | `group_id` | — (fast pool) |
 | `POST /lb/gap/rescan` | `POST /api/gaps/{group_id}/rescan` | `group_id` | — |
 
 No upstream token is injected — lb-bot has none to inject.
+
+**Two slot pools.** Every route above shares `PROXY_MAX_INFLIGHT` (4) upstream slots
+per proxy, first come first served — except the five marked *fast pool*, which have
+two slots of their own. A status poll used to queue behind four `album/sources`
+fan-outs (150 s each) until the handshake deadline dropped its socket with no
+answer at all. Waiting for a slot times out (`PROXY_QUEUE_TIMEOUT_FAST`, 10 s on the
+fast pool; the route's own timeout on the default one) into `503 {"error": …,
+"busy": true}` rather than a dropped connection; identical `GET`s in flight share
+one upstream call; a timed-out upstream is `504 {"busy": true}` and a refused one
+`502 {"down": true}`, so a client can say which. `POST /lb/wishlist`,
+`/lb/wishlist/remove` and `/lb/artist/release` invalidate their own cached reads on
+success — `/lb/notify` covers a landing, not the user's own action.
 
 **Two TTLs that look wrong and are not.** `/lb/album/similar` is cached for six
 hours and `/lb/artist/similar` for sixty seconds, from the same upstream
@@ -965,11 +979,53 @@ unconditionally. `retryable` means *a plain Retry is worth offering*: it is
 deliberately **false** for a format rejection that MP3 would fix, because
 re-running the identical search against the identical peers under the identical
 format policy is not a retry — Allow-MP3-and-retry is the action, and
-`mp3WouldHelp` is what says so. Only `mb_unavailable` and `transfer_failed`
-auto-retry upstream, once; `no_source` never does, since lb-bot already walked
-its whole ranked source list and the user asking again is the new information.
-`attempts` is cumulative on the ledger row and survives an lb-bot restart, so a
-client can tell one failure from four.
+`mp3WouldHelp` is what says so; `allowMp3` on `album/download` is how a client
+takes it on the whole-album path, which has no review group to set the opt-in on.
+Only `mb_unavailable` and `transfer_failed` auto-retry upstream, once per
+user-initiated fill; `no_source` never does, since lb-bot already walked its whole
+ranked source list and the user asking again is the new information. `attempts`
+counts fills **started** (the user's and lb-bot's own automatic retries) and
+survives an lb-bot restart, so a client can tell one failure from four; `retryAt`
+(epoch seconds, 0 when none) says when the automatic retry fires, so a client
+renders a countdown rather than a dead "failed" that then quietly comes alive.
+
+**`cancelled` is a state, not a failure kind.** `state: "cancelled"` is terminal,
+with `retryable: false` and no `failureKind`; a cancel is the user's verdict and
+neither client offers a Retry on it — a cancelled album is started again from the
+album page. lb-bot marks the row and detaches the transfers before it talks to
+slskd, refuses every later write over a cancelled row, and claims a row for
+placement atomically against the cancel, so nothing cancelled is ever placed. The
+cancel routes answer `cancelled: false` (still `ok: true`) with the current status
+when it is too late — placement has begun — or when nothing was running; a client
+shows lb-bot's status then, never a row claiming a cancel that did not happen.
+(An lb-bot from before 2026-09-23 wrote a cancel as `failed` + `failureKind:
+"cancelled"`; both clients still read that shape as `cancelled`.)
+
+**The rest of the view is honest, and states the Cancel rule.** `done` is files
+**completed**, never completed+failed (`failed` sits beside it); `percent` is
+byte-based when the transfers report sizes and 100 on `placing`/`placed`/
+`verified`; `bytesDone`, `bytesTotal`, `speedBps` and `activeFiles` come off the
+transfer records lb-bot's poller already keeps; `updatedAt` moves on state changes
+*and* transfer progress; `serverTime` is lb-bot's clock, for "last checked Ns ago"
+without trusting the client's; `verifyGaveUp` marks a `placed` row past the
+verifier's deadline (on disk, not in Navidrome); and **`cancellable`** is the one
+Cancel rule, stated by the server — `searching`, `queued` or `downloading`, or a
+`failed` row whose `retryAt` is in the future — so both clients render the button
+from it rather than each keeping a list of states (one of them offered Cancel on a
+row already being placed). `files[]` (title, slskd state, percent; ≤ 40) rides on
+the single-item read only, never on `/lb/fills` or the `fill` frame. lb-bot's
+poller — the only clock any of these counters move on — runs every 5 s while a
+transfer is live and every 60 s idle, one slskd listing per tick whatever the
+number of clients watching; the request path never touches slskd.
+
+**`/lb/fills` is the poll.** `?release_mbids=a,b&group_ids=g1` (≤ 32 each) answers
+`{ albums: { <release_mbid>: <status minus files> }, gaps: { <group_id>: <gap minus
+sources> }, serverTime }` — every fill a client watches, in one read on the fast
+pool. A Download Center with eight rows used to make eight requests per tick.
+Both clients read it every 30 s while the hub socket is up and `fill` frames have
+arrived within the last minute, and at 5 s backing off to 10/20 s on identical
+answers otherwise; the modal or sheet on one album keeps its 5 s single-item
+`album/status` read while open, for the file list.
 
 **`artist/release` is the single-row index refresh.** The only other writers into
 lb-bot's `release_groups` table are a whole-artist delete-and-reinsert (reachable
@@ -1126,12 +1182,26 @@ empty list as "assume supported".
   workspace. `picking` *with* sources is the ordinary "your move" of the picker
   above and must not be worded as a hand-off.
 
-### 15.1 `POST /lb/notify` — the one inbound route
+### 15.1 `POST /lb/notify` and `POST /lb/fill` — the two inbound routes
 
-Everything else under `/lb/*` is the hub calling lb-bot. This is lb-bot calling
-the hub: when a fill is placed into the library, lb-bot POSTs
+Everything else under `/lb/*` is the hub calling lb-bot. These are lb-bot calling
+the hub. **`/lb/notify`**: when a fill is placed into the library, lb-bot POSTs
 `{event, release_mbid, rgid, artist, album}` and the hub rebuilds it, field by
 field, into a `library` broadcast (§5.4) to every connected device.
+**`/lb/fill`**: when a fill's ledger row moves — any state transition, and transfer
+progress throttled to ≥ 5 points or ≥ 10 s — lb-bot POSTs the `album/status` view
+(minus `files[]`) with `kind: "album"` and `key: <rgid>`, or a gap summary with
+`kind: "gap"` and `key: <group_id>`, or `{kind: "wishlist", key: <rgid>, state:
+"landed"}` when a wishlist row's record arrives. The hub rebuilds it, typed and
+bounded (strings ≤ 200, `ndAlbumIds` ≤ 16, unknown keys dropped, unknown kinds
+`400`), into a **`fill` broadcast** — its own frame, deliberately: a `library`
+event makes every client refetch its discographies and flushes the hub's library
+caches, which is right for a landing and wrong for "3 of 12 downloaded". A fill
+push flushes nothing except the cached `album/sources` ranking when the fill ended
+(`failed` or `cancelled`), so "try another source" is not handed the peer that
+just failed. Nothing is replayed on `welcome`: the push accelerates the poll
+(§15, `/lb/fills`) and never replaces it. Both clients hand a `fill` frame and a
+poll answer to the **same** apply function, so push cannot disagree with poll.
 
 - Configured **on lb-bot**: `LB_BOT_HUB_URL` + `LB_BOT_HUB_TOKEN` (the same
   `HUB_TOKEN`). Unset on either side means no ping, never an error — the placement
@@ -1143,7 +1213,7 @@ field, into a `library` broadcast (§5.4) to every connected device.
   fine: the frame carries no authority, it only tells clients to re-read what they
   can already read.
 
-**Two events.** `albumPlaced` is sent at placement, *before* Navidrome's scan — a
+**Three `library` events.** `albumPlaced` is sent at placement, *before* Navidrome's scan — a
 client re-reading the library then mostly sees it as it was. `albumIndexed` is sent
 by lb-bot's verifier once Navidrome's scan has finished and a placed track is found
 in it (it polls every 2 s for the first minute, then every 30 s). Only that event carries:
@@ -1153,8 +1223,10 @@ in it (it polls every 2 s for the first minute, then every 30 s). Only that even
 - `row` — the release's updated discography row, in exactly the snake_case shape
   `GET /lb/artist/discography` returns (rebuilt field by field, bounded).
 
-**The hub clears its cached lb-bot answers before broadcasting** (discography,
-fresh-releases, status; the long-TTL MusicBrainz routes are left alone), and bumps a
+**The hub clears its cached lb-bot answers before broadcasting a `library` frame**
+(the nine routes in `LB_LIBRARY_ROUTES`: discography, fresh-releases, status, the
+two lookups' ownership-marked one, `artist/similar`, `artist/related`, the two
+Deezer rows and the wishlist; the long-TTL MusicBrainz routes are left alone), and bumps a
 cache generation so a read already in flight cannot write its pre-landing answer
 back. Without that, every client's re-read was served the hub's own 60 s old copy.
 
@@ -1186,10 +1258,59 @@ scan ends or its count moves, runs `DbRepository.syncChangedAlbums`: the album l
 only what differs. Id-less `library` frames take the same sweep, which unlike the
 old `newest` walk also sees a gap fill — an album that is not new, only longer.
 
-
 Without the ping nothing breaks. lb-bot marks its own index row `present` at
 placement, so the next discography read on any client is already correct — the
 broadcast only closes the window where a page is *already open* somewhere else.
+
+### 15.2 The acquisition vocabulary — what a fill row says and offers
+
+Both clients render every fill — the Download Center / `/downloads` row, the
+sheet or modal footer, the tile badge — from this table, implemented as a pure
+module in each (`FillVocabulary.kt`, `fill-vocabulary.ts`). There is no shared
+build, so this table is the contract and a side-by-side walk is the check. The
+ledger outcomes are `running`, `done`, `failed`, `needsPick`, `cancelled`,
+`gaveUp` (Navic persists the last two as `needs_pick` / `gave_up`).
+
+| state / outcome | Headline | Sub-line(s) | Progress | Buttons |
+|---|---|---|---|---|
+| running · `searching` (and `unknown` inside the grace) | Looking for a source | lb-bot's switch note, if any | indeterminate | Cancel |
+| running · `queued` | Waiting for the peer | `@peer` | indeterminate | Cancel |
+| running · `downloading` | Downloading {done} of {total} | `{MB} of {MB} · {MB/s} · @peer`, `{n} failed` when > 0 | determinate (`percent`) | Cancel |
+| running · `placing` | Adding to the library | — | 100 | — |
+| running · `placed` | Added — waiting for the library scan | — | 100 | Open album |
+| done (`verified`) | In your library | — | — | Open album · Dismiss |
+| done (`placed` + `verifyGaveUp`) | Added — Navidrome hasn't indexed it yet | — | — | Open album · Dismiss |
+| failed · `needs_match` | Downloaded, but needs sorting out in lb-bot | `reason` | — | Dismiss |
+| failed, by `failureKind` | `no_source` → Nobody is sharing this one · `format_rejected` → No copy in an allowed format · `transfer_failed` → The download itself failed · `placement_failed` → Downloaded, but couldn't be filed into the library · `mb_unavailable` → Downloaded — MusicBrainz wouldn't answer, so it couldn't be tagged · else → Couldn't get this one | `reason` verbatim · "Tried {n} times" when n > 1 · "Retrying automatically in {N}s" while `retryAt` is ahead · one explanatory line (below) | — | per the rules below · Dismiss |
+| cancelled | Cancelled | — | — | Open album · Dismiss |
+| gaveUp | Stopped tracking this one | the reason ("lb-bot no longer knows this download" / "No progress for 20 minutes") | — | Open album · Dismiss |
+| needsPick (gap) | Waiting for you to pick a source | "Open the album to pick a source." | — | Dismiss |
+| any running row, ≥ 2 unanswered polls | (unchanged) | Can't reach lb-bot — last checked {N}s ago | (unchanged) | (unchanged) |
+
+Button rules, identical in both:
+
+- **Cancel** iff not settled and `cancellable` (the server's field), or a failed row
+  whose `retryAt` is ahead. Never on `placing` or `placed`.
+- **Retry** iff outcome is `failed` and (`failureKind` is empty or `retryable`).
+- **Try another source** iff outcome is `failed`, not a gap, and a peer is known to exclude.
+- **Allow MP3 and retry** iff outcome is `failed` and `mp3WouldHelp` — through the
+  review group when the row has one, else through `allowMp3` on the download. The
+  retry runs only if the opt-in took.
+- **Add to wishlist** iff outcome is `failed`, `failureKind` is `no_source` and the row
+  has an `rgid`; on success the row is dismissed — the wishlist is where it lives now.
+- **Open album** → the external album page, where "Download" lives; a cancel is
+  started again from there, never with a Retry on the row.
+- **Dismiss** iff settled.
+
+Explanatory lines: "Asking again would hit the same problem — this one needs fixing
+in lb-bot." when nothing above is offered; "Nobody had it this time. The swarm
+changes — add it to the wishlist and lb-bot will keep looking every few hours."
+above a wishlist button. Three ledger rules go with the table: a **failed poll is
+not an answer** (the row keeps its state and gains the "can't reach" line;
+`unknown` is never inferred from an error), `unknown` from lb-bot is **bounded
+patience on the clock** (a 30 s grace after the tap, then two minutes continuous
+before `gaveUp`), and **expiry is a settle, never a delete**, measured from the
+row's last progress.
 
 ---
 
@@ -1212,7 +1333,8 @@ wonders why the media does not go through it.
   (`websockets/legacy/server.py:233`). There is no chunk-by-chunk path.
 - `PROXY_MAX_RESPONSE` is 4 MB. A three-minute preview is larger — measured at
   11.9 MB for one four-minute track.
-- `PROXY_MAX_INFLIGHT` is 4 slots, shared with every lb-bot and AudioMuse call.
+- `PROXY_MAX_INFLIGHT` is 4 slots per proxy, so one playing stream would hold a
+  quarter of the preview proxy's for its whole duration.
   One playing stream would hold a quarter of them for its whole duration.
 - Serving media on the WebSocket port at all would mean writing to
   `self.transport` by hand and raising `BrokenPipeError` to suppress the
