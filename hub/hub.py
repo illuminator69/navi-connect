@@ -588,15 +588,30 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # don't own this" outlives the fill that makes it false, and a stale
         # badge on a Discover row is a tile that offers to fetch a record
         # already on disk. The chart itself barely moves; the badges do.
+        #
+        # `genre` narrows it to one of Deezer's own genre ids ("0" = global). It
+        # MUST be on this list: a parameter the whitelist does not name is dropped
+        # silently, so every genre would answer with the global chart and nothing
+        # would say why. The cache key is built from the forwarded query, so the
+        # genres do not collide.
         "method": "GET", "path": "/api/deezer/chart",
-        "params": ("limit",), "cache": True,
+        "params": ("limit", "genre"), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("GET", "/lb/deezer/editorial"): {
         # Deezer's own editorial selections — the same shape and the same rules
         # as the chart above.
         "method": "GET", "path": "/api/deezer/editorial",
-        "params": ("limit",), "cache": True,
+        "params": ("limit", "genre"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/deezer/genres"): {
+        # The genre ids the two rows above accept. Deliberately NOT in
+        # LB_LIBRARY_ROUTES, unlike its siblings: it carries no ownership badge, so
+        # a landed fill cannot falsify it and there is nothing for a fill to
+        # invalidate. Long cache — Deezer's genre list barely moves.
+        "method": "GET", "path": "/api/deezer/genres",
+        "params": (), "cache": True,
         "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
     },
     ("POST", "/lb/resolve-link"): {
