@@ -206,7 +206,7 @@ issues directives to the active receiver (§5.2), then broadcasts the new sessio
 | `deleteSavedQueue` | `id` | delete a saved-queue history record (§8.3) |
 | `deleteSavedQueues` | `ids[]` | delete several records in one act — one broadcast (§8.3) |
 | `syncSavedQueues` | `queues[]`, `deleted[]?` | push a client's local/offline history **and its offline deletions** up (§8.3) |
-| `saveMix` | `id?`, `name`, `kind`, `seedId?`, `seedName?`, `moodCharacter?`, `count?` | create (no `id`) or update one "Mixed for You" recipe (§17) |
+| `saveMix` | `id?`, `name`, `kind`, `seedId?`, `seedName?`, `moodCharacter?`, `count?`, `coverArtId?` | create (no `id`) or update one "Mixed for You" recipe (§17) |
 | `renameMix` | `id`, `name` | rename a recipe (§17) |
 | `deleteMix` | `id` | delete a recipe (§17) |
 | `touchMix` | `id` | record that a recipe was just played — bumps `lastPlayedAt` only (§17) |
@@ -811,8 +811,9 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 | `GET /lb/album/similar` | same | `artist_mbid`, `artist_name`, `rgid`, `limit` | 6 h |
 | `GET /lb/artist/similar` | same | `mbid`, `name`, `limit` | 60 s |
 | `GET /lb/artist/related` | same | `mbid`, `name`, `limit` | 60 s (cleared by `/lb/notify`) |
-| `GET /lb/deezer/chart` | same | `limit` | 6 h (cleared by `/lb/notify`) |
-| `GET /lb/deezer/editorial` | same | `limit` | 6 h (cleared by `/lb/notify`) |
+| `GET /lb/deezer/chart` | same | `limit`, `genre` | 6 h (cleared by `/lb/notify`) |
+| `GET /lb/deezer/editorial` | same | `limit`, `genre` | 6 h (cleared by `/lb/notify`) |
+| `GET /lb/deezer/genres` | same | — | 6 h (**not** cleared by `/lb/notify`) |
 | `POST /lb/resolve-link` | same | body `url` | — |
 | `GET /lb/wishlist` | same | — | 60 s (cleared by `/lb/notify`) |
 | `POST /lb/wishlist` | same | `rgid`, `artist`, `title` | — |
@@ -1001,6 +1002,17 @@ gone too: the index add now asks MusicBrainz with the *same* `inc=` string the
 album page sends, so the two share a cache entry and a page that rendered cannot
 fail to index. `GET /lb/album/releases` returns `primaryType` and `year`
 alongside `title`/`artist` so a client has the override to hand.)
+
+**`album/releases` also names the artist's MBID (`artistMbid`).** It always
+fetched the release-group with `inc=artist-credits` to build the display credit
+and dropped the id sitting in the same payload, which mattered because of where
+an album page is reached from: a **Deezer** browse row carries no MBIDs at all,
+so a client arriving from one had the artist's *name* and no way to open their
+page — and the artist page is the only route to "scan this artist's
+discography". It is the **first** credited artist, not a merge: a tap has to land
+on somebody, the display credit still carries the whole thing, and the lead
+credit is the only defensible answer for a collaboration. Additive, and costs no
+MusicBrainz request.
 
 **A discography read backfills the Navidrome album ids of `present` rows.**
 Placement can only flip a row to `present`; nothing on that path knows the album
@@ -1414,6 +1426,14 @@ three presets — they name a *generator on the client*, and an unknown one is a
 recipe no client can run. A client meeting a `kind` it does not know hides the
 row rather than guessing, so the list is additive-only. Optional strings are
 absent rather than null, matching the saved-queue rule.
+
+**`coverArtId` is the SEED's artwork, stamped once at save time** — not the cover
+of whatever the recipe last produced. The seed is a fixed part of the recipe, so
+it is still true on a second play; the tracklist is the one thing about a mix
+guaranteed to change. The hub has always stored and fanned this field out
+(`_sanitize_mix` copies it), and for a while no client wrote it, so every mix
+rendered as bare text. A recipe with no seed — `fingerprint`, `adaptive` — has
+none, and a client draws something from the `kind` instead.
 
 ### 17.2 Acts
 
