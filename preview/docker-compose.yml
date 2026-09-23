@@ -14,7 +14,15 @@ services:
     ports:
       - "4792:4792"
     env_file: .env
-    # No volumes: nothing is persisted (see the Dockerfile).
+    volumes:
+      # ONLY the cookie jar. Nothing else is persisted (see the Dockerfile).
+      # A directory, not the file: replacing a bind-mounted file changes its
+      # inode and the container goes on holding the old one, so refreshing
+      # cookies would silently do nothing.
+      #
+      # Read-WRITE on purpose: yt-dlp refreshes the jar as it goes, and letting
+      # it write back is what keeps a session alive past its first rotation.
+      - ./cookies:/data
 
 networks:
   media:

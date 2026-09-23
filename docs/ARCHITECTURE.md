@@ -227,6 +227,19 @@ Three things about it that are load-bearing:
   without a PO token (measured 2026-09-23: exactly one format, a muxed 360p MP4). A muxed
   container plays; one mislabelled as audio does not.
 
+
+**The extractor needs cookies here, and that is an environment fact rather than a code one.**
+Some egress addresses get *"Sign in to confirm you're not a bot"*. Measured 2026-09-23 from one
+machine in one second: the same code passed over IPv6 and was challenged over IPv4 — and this
+NAS is IPv4-only, so production is on the challenged side while the workstation is not. That
+gap is why the first "a real resolve works" claim did not transfer. `PREVIEW_COOKIES` points the
+sidecar at a `cookies.txt`; use a **throwaway account**, because the file is bearer access to
+whatever exported it and yt-dlp traffic can get an account limited. The player client switches to
+`web`/`mweb` when cookies are set — never `android`, which is the pairing that gets accounts
+terminated. Cookies expire, so `/status` carries `extractorBlocked` and the hub relays it on
+`/preview/status`: without that, a challenge and a genuine no-match are identical from a client
+(an empty resolve against a process reporting itself healthy).
+
 Unset `PREVIEW_URL` hides the feature entirely, like `LBBOT_URL`. Unset `PREVIEW_PUBLIC_URL`
 keeps it working locally but sets `previewCastable: false`, which both clients must honour.
 

@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import hub  # noqa: E402
 
 HITS: list[str] = []
+BLOCKED = [False]
 SECRET = "preview-test-secret"
 PUBLIC = "https://preview.example.test"
 
@@ -71,7 +72,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "mime": "audio/webm", "provider": "yt", "confidence": 0.82,
                 }
         elif path == "/status":
-            body = {"ok": True, "provider": "yt"}
+            body = {"ok": True, "provider": "yt",
+                    "extractorBlocked": BLOCKED[0], "cookies": True,
+                    "consecutiveFailures": 7 if BLOCKED[0] else 0,
+                    # The sidecar reports this; the hub must NOT relay it — it is
+                    # a diagnostic for the operator's log, not for every client.
+                    "lastExtractorError": "Sign in to confirm you're not a bot"}
         else:
             self.send_response(404)
             self.send_header("Content-Length", "2")
@@ -243,6 +249,33 @@ def main() -> int:
                 "castability is a CONFIGURATION fact and reachability a health "
                 "one; losing the public URL must not report the sidecar as down")
 
+        # --- the extractor's own health rides on the probe -------------------
+        # A bot challenge and a genuine no-match are otherwise identical to a
+        # client: both are an empty resolve against a process reporting itself
+        # healthy. Cookies expire, so this is the field that will say so.
+        hub.PREVIEW_PUBLIC_URL = PUBLIC
+        BLOCKED[0] = True
+        proxy._cache.clear()  # noqa: SLF001
+        status, _h, body = call("/preview/status")
+        probe = json.loads(body)
+        if probe.get("extractorBlocked") is not True:
+            failures.append(
+                "`extractorBlocked` did not survive the proxy — without it the "
+                "whole feature can be dead while every probe reports healthy")
+        if probe.get("upstreamReachable") is not True:
+            failures.append(
+                "a blocked extractor is not an unreachable sidecar; the two are "
+                "different faults with different fixes")
+        if "lastExtractorError" in probe:
+            failures.append(
+                "the raw extractor message was relayed to clients — that is an "
+                "operator diagnostic, and the hub whitelists what it passes on")
+        BLOCKED[0] = False
+        proxy._cache.clear()  # noqa: SLF001
+        probe = json.loads(call("/preview/status")[2])
+        if probe.get("extractorBlocked") is not False:
+            failures.append("`extractorBlocked` stayed true after recovery")
+
         # --- disabled: the probe still answers, everything else is a 503 -----
         hub.PREVIEW_SECRET = ""
         off = hub.PreviewProxy()
@@ -276,7 +309,8 @@ def main() -> int:
         return 1
     print("PASS - preview routes: reachable/param-whitelist/signed-stream-url/"
           "sig-verifies-against-the-sidecar/exp-in-the-future/cached-but-re-signed/"
-          "queue-track-shaped/empty-is-a-200/castable-flag/disabled-probe-answers")
+          "queue-track-shaped/empty-is-a-200/castable-flag/extractor-blocked-"
+          "passes-through/raw-error-does-not/disabled-probe-answers")
     return 0
 
 

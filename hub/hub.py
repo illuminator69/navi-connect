@@ -1262,12 +1262,29 @@ class PreviewProxy(HttpProxy):
         `previewCastable` is the hub's own answer, not the sidecar's: only this
         process knows whether it was given a publicly reachable address to sign
         stream URLs against.
+
+        `extractorBlocked` is the sidecar's, passed through. It exists because
+        "the extractor is being refused" and "nothing matched" are otherwise the
+        same thing to a client — both are an empty resolve against a process that
+        reports itself healthy — so the whole feature can be dead while every
+        probe says fine. It is additive: a client that does not read it behaves
+        exactly as before.
         """
-        return 200, json.dumps({
+        out = {
             "configured": True,
             "upstreamReachable": status == 200,
             "previewCastable": bool(PREVIEW_PUBLIC_URL),
-        }).encode(), "application/json"
+        }
+        if status == 200:
+            try:
+                parsed = json.loads(data or b"{}")
+                if isinstance(parsed, dict):
+                    for key in ("extractorBlocked", "cookies"):
+                        if key in parsed:
+                            out[key] = bool(parsed[key])
+            except Exception:  # noqa: BLE001 — a probe must not fail on a body
+                pass
+        return 200, json.dumps(out).encode(), "application/json"
 
     @staticmethod
     def _sign_body(data: bytes) -> bytes:

@@ -86,6 +86,21 @@ CHUNK = 64 * 1024
 STREAM_TIMEOUT = float(os.environ.get("PREVIEW_STREAM_TIMEOUT", "30"))
 REQUEST_HEADER_MAX = 16 * 1024
 
+# A Netscape-format cookies.txt for the extractor, which is how yt-dlp answers
+# "Sign in to confirm you're not a bot". Unset = no cookies, which is correct
+# wherever the egress address is not being challenged.
+#
+# Measured here 2026-09-23: this host's IPv4 is challenged and its IPv6 is not,
+# so the same code passed on the workstation (which has ISP IPv6) and failed in
+# the container (which does not). Cookies are the fix that does not depend on
+# the network.
+#
+# It is a CREDENTIAL. Never logged, never in a response body, and the file is
+# bind-mounted rather than baked into the image. Use a throwaway account: yt-dlp
+# traffic can get an account rate-limited or terminated, and these cookies are
+# bearer access to whatever account exported them.
+COOKIES = os.environ.get("PREVIEW_COOKIES", "")
+
 PROVIDER = "yt"  # the only provider today; `ext:<provider>:<id>` is the format
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -162,6 +177,36 @@ MEDIA_CACHE = TTLCache(MEDIA_TTL)
 
 _extract_sem: Optional[asyncio.Semaphore] = None
 _stream_sem: Optional[asyncio.Semaphore] = None
+
+# Extractor health, so a blocked extractor is VISIBLE rather than silent.
+#
+# Without this a bot challenge and a genuine no-match are the same thing to a
+# client — both `{}`, with /status still reporting a healthy process — so the
+# deployment looks perfectly fine while every preview answers "not found". That
+# is the same trap as a silently truncated 200. It matters more with cookies
+# than without: cookies expire, and when they do this is the only thing that
+# will say so.
+_health = {"consecutive_failures": 0, "last_error": "", "blocked": False}
+# Substrings that mean "the extractor was refused", not "this video is gone".
+# Matched case-insensitively against the extractor's own message.
+_BLOCKED_MARKERS = ("confirm you\u2019re not a bot", "confirm you're not a bot",
+                    "sign in to confirm", "cookies", "age-restricted",
+                    "this content isn\u2019t available", "429")
+
+
+def _note_extract_ok() -> None:
+    _health.update(consecutive_failures=0, last_error="", blocked=False)
+
+
+def _note_extract_failed(err: BaseException) -> None:
+    msg = str(err)
+    _health["consecutive_failures"] += 1
+    # Truncated, and it is the EXTRACTOR's message — it never contains cookie
+    # material. Kept so /status can say why rather than only that.
+    _health["last_error"] = msg[:300]
+    low = msg.lower()
+    if any(m in low for m in _BLOCKED_MARKERS):
+        _health["blocked"] = True
 
 
 # --------------------------------------------------------------------------- #
@@ -252,11 +297,29 @@ def _ydl(opts: dict) -> Any:
     # Imported lazily and per call so a broken/absent yt-dlp is a 503 on one
     # route rather than a process that will not start.
     from yt_dlp import YoutubeDL
+    # The player client depends on whether we are authenticated, and the two
+    # cases genuinely want different ones.
+    #
+    #   no cookies -> `android` first. It is the client that still answers
+    #                 unauthenticated on a challenged address; `web` needs a
+    #                 challenge this process deliberately does not solve
+    #                 ("The page needs to be reloaded", measured 2026-09-23).
+    #   cookies    -> `web`/`mweb`. yt-dlp's own guidance is NOT to send account
+    #                 cookies with the `android` client: it is the combination
+    #                 most associated with accounts being rate-limited or
+    #                 terminated, which is also why the account here should be a
+    #                 throwaway.
+    clients = ["web", "mweb"] if COOKIES else ["android", "web"]
     base = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "skip_download": True, "socket_timeout": SEARCH_TIMEOUT,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": {"player_client": clients}},
     }
+    if COOKIES and os.path.exists(COOKIES):
+        # Deliberately not read-only in the container: yt-dlp refreshes the jar
+        # as it goes, and letting it write back is what keeps a session alive
+        # past its first rotation.
+        base["cookiefile"] = COOKIES
     return YoutubeDL({**base, **opts})
 
 
@@ -371,6 +434,7 @@ async def handle_resolve(params: dict[str, str]) -> tuple[int, bytes, str]:
         log(f"resolve timed out: {artist!r} - {title!r}")
         return 504, json.dumps({"error": "resolver timed out"}).encode(), "application/json"
     except Exception as e:  # noqa: BLE001 — an extractor fault is not a crash
+        _note_extract_failed(e)
         log(f"resolve failed for {artist!r} - {title!r}: {e}")
         return 502, json.dumps({"error": "resolver failed"}).encode(), "application/json"
 
@@ -406,9 +470,11 @@ async def handle_resolve(params: dict[str, str]) -> tuple[int, bytes, str]:
                     asyncio.to_thread(media_url_blocking, best["id"]),
                     timeout=SEARCH_TIMEOUT + 5)
         except Exception as e:  # noqa: BLE001
+            _note_extract_failed(e)
             log(f"resolve matched {best['id']} but could not extract it: {e}")
             media = None
         if media is not None:
+            _note_extract_ok()
             MEDIA_CACHE.put(best["id"], media)
     if media is None:
         # Matched, but nothing playable. `{}` rather than a track with a dead
@@ -501,6 +567,7 @@ async def handle_stream(params: dict[str, str], request_headers: dict[str, str],
                     asyncio.to_thread(media_url_blocking, video_id),
                     timeout=SEARCH_TIMEOUT + 5)
         except Exception as e:  # noqa: BLE001
+            _note_extract_failed(e)
             log(f"stream extraction failed for {video_id}: {e}")
             await write_response(writer, 502, b'{"error":"extraction failed"}',
                                  "application/json")
@@ -509,6 +576,7 @@ async def handle_stream(params: dict[str, str], request_headers: dict[str, str],
             await write_response(writer, 404, b'{"error":"no audio stream"}',
                                  "application/json")
             return True
+        _note_extract_ok()
         MEDIA_CACHE.put(video_id, cached)
 
     url, mime = cached
@@ -643,8 +711,17 @@ async def serve_client(reader: asyncio.StreamReader,
             # reachability fact the hub is probing for.
             status, ctype = 200, "application/json"
             body = json.dumps({
-                "ok": True, "provider": PROVIDER,
-                "resolveCached": True, "signed": bool(SECRET),
+                "ok": True, "provider": PROVIDER, "signed": bool(SECRET),
+                # Whether a cookie file is CONFIGURED and present. Never its
+                # contents, never its path — this is a health field on an
+                # endpoint the hub proxies to clients.
+                "cookies": bool(COOKIES and os.path.exists(COOKIES)),
+                # The extractor's own state, so a blocked extractor is visible
+                # instead of looking like "nothing matched". Cookies expire;
+                # this is what will say so.
+                "extractorBlocked": _health["blocked"],
+                "consecutiveFailures": _health["consecutive_failures"],
+                "lastExtractorError": _health["last_error"],
             }).encode()
         else:
             status, body, ctype = 404, b'{"error":"unknown route"}', "application/json"
@@ -679,6 +756,19 @@ async def main() -> None:
     global _extract_sem, _stream_sem
     _extract_sem = asyncio.Semaphore(MAX_EXTRACTIONS)
     _stream_sem = asyncio.Semaphore(MAX_STREAMS)
+
+    if COOKIES and not os.path.exists(COOKIES):
+        # A configured-but-missing cookie file is the shape a bind mount takes
+        # when it is wrong, and the symptom without this is indistinguishable
+        # from cookies that simply are not working.
+        log(f"WARNING: PREVIEW_COOKIES points at {COOKIES!r}, which does not "
+            f"exist. Running WITHOUT cookies -- check the bind mount.")
+    elif COOKIES:
+        log(f"cookies: {COOKIES} (player_client=web; account cookies are not "
+            f"sent with the android client)")
+    else:
+        log("cookies: none -- fine unless this host's egress address is being "
+            "challenged (see PREVIEW_COOKIES)")
 
     server = await asyncio.start_server(serve_client, HOST, PORT)
     log(f"navi-connect preview sidecar on http://{HOST}:{PORT}  "

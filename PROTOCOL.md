@@ -1270,9 +1270,43 @@ mislabelled as audio does not.
 ### 16.4 `GET /preview/status`
 
 The liveness probe, mirroring `/lb/status`:
-`{configured, upstreamReachable, previewCastable}`. `previewCastable` is the
-**hub's** answer, not the sidecar's — only the hub knows whether it was given a
-publicly reachable address to sign stream URLs against.
+`{configured, upstreamReachable, previewCastable, extractorBlocked, cookies}`.
+
+`previewCastable` is the **hub's** answer, not the sidecar's — only the hub knows
+whether it was given a publicly reachable address to sign stream URLs against.
+
+`extractorBlocked` and `cookies` are the **sidecar's**, passed through. They
+exist because "the extractor is being refused" and "nothing matched" are
+otherwise the same thing to a client — both an empty resolve against a process
+that reports itself healthy — so the whole feature can be dead while every probe
+says fine. The sidecar additionally reports `consecutiveFailures` and
+`lastExtractorError` on its own `/status`; the hub does **not** relay those, as
+they are operator diagnostics rather than anything a client renders.
+
+Both fields are additive: a client that does not read them behaves exactly as
+before.
+
+### 16.4.1 Cookies
+
+Some egress addresses get *"Sign in to confirm you're not a bot"* from the
+extractor. Measured 2026-09-23 on one host, in one second: the same code passed
+over IPv6 and was challenged over IPv4. Where the address is challenged and the
+network cannot be changed, `PREVIEW_COOKIES` points the sidecar at a
+Netscape-format `cookies.txt` and yt-dlp authenticates with it.
+
+Three things about it are load-bearing:
+
+- **Use a throwaway account.** The file is bearer access to the account that
+  exported it, it is stored unencrypted, and yt-dlp traffic can get an account
+  rate-limited or terminated.
+- **The player client changes when cookies are configured** — `web`/`mweb`
+  instead of `android`. yt-dlp's guidance is not to send account cookies with the
+  `android` client, and that pairing is the one most associated with accounts
+  being limited. Without cookies `android` is still right, because `web`
+  unauthenticated needs a challenge the sidecar deliberately does not solve.
+- **Cookies expire**, which is the whole reason `extractorBlocked` exists. A
+  missing file (a wrong bind mount) degrades to running without cookies and is
+  logged and reported, rather than raising.
 
 ### 16.5 The stream URL is a capability, and the hub mints it
 
@@ -1334,6 +1368,8 @@ it, which is the failure this stack has paid for twice.
 | `PREVIEW_PUBLIC_URL` | how a **client or speaker** reaches it. Unset = `previewCastable: false`, **and** the hub falls back to signing `PREVIEW_URL` — which is normally a Docker-internal name no client can resolve, so in practice this is required unless `PREVIEW_URL` is itself a LAN address |
 | `PREVIEW_SECRET` | the capability secret. Unset = proxy disabled, because an unsignable stream URL fails at *playback* rather than at configuration |
 | `PREVIEW_TTL` | capability lifetime, seconds (default 21600) |
+
+and on the **sidecar**, `PREVIEW_COOKIES` — see §16.4.1.
 
 The sidecar takes `PREVIEW_SECRET` (the same value; it refuses to start without
 one, since an unsigned `/stream` is an open media relay pointed at a third-party
