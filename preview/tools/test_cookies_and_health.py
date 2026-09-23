@@ -114,6 +114,12 @@ def main() -> int:
         failures.append(
             "a missing cookie file was still passed to yt-dlp, which raises on "
             "one — a wrong bind mount would take the whole extractor down")
+    if clients_of(p) != ["android", "web"]:
+        failures.append(
+            f"a missing cookie file left player_client at {clients_of(p)} — the "
+            "client and the jar must follow ONE predicate, or a wrong bind mount "
+            "sends us to `web` with nothing to authenticate it, which is strictly "
+            "worse than the unauthenticated android path")
     preview.COOKIES = missing
     if status_body().get("cookies") is not False:
         failures.append(

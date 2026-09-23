@@ -309,13 +309,20 @@ def _ydl(opts: dict) -> Any:
     #                 most associated with accounts being rate-limited or
     #                 terminated, which is also why the account here should be a
     #                 throwaway.
-    clients = ["web", "mweb"] if COOKIES else ["android", "web"]
+    # ONE predicate for both decisions. Keying the client off "configured" and
+    # the jar off "present" is a real divergence, not a nicety: a wrong bind
+    # mount would then send us to `web` with no cookies to authenticate it,
+    # which is strictly worse than the unauthenticated `android` path. Checked
+    # per call rather than at import, so dropping the file in is picked up
+    # without a restart.
+    authed = bool(COOKIES) and os.path.exists(COOKIES)
     base = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "skip_download": True, "socket_timeout": SEARCH_TIMEOUT,
-        "extractor_args": {"youtube": {"player_client": clients}},
+        "extractor_args": {"youtube": {
+            "player_client": ["web", "mweb"] if authed else ["android", "web"]}},
     }
-    if COOKIES and os.path.exists(COOKIES):
+    if authed:
         # Deliberately not read-only in the container: yt-dlp refreshes the jar
         # as it goes, and letting it write back is what keeps a session alive
         # past its first rotation.
