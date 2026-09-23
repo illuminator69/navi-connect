@@ -1,5 +1,10 @@
 # The extractor. Deliberately NOT pinned to an exact version, unlike the hub's
 # `websockets<14`: yt-dlp's whole job is to track sites that change without
-# notice, so a pin here guarantees the feature breaks and stays broken. The floor
-# is the release this was written against.
-yt-dlp>=2026.9.1
+# notice, so a pin here guarantees the feature breaks and stays broken.
+#
+# The floor must be a STABLE release. Everything yt-dlp publishes between
+# releases is a `.dev0` nightly, and pip only considers those when NO final
+# version satisfies the spec — so a floor above the newest stable installs a
+# nightly locally (where the index was warm) and fails outright in the
+# container, which is exactly what `>=2026.9.1` did on 2026-09-23.
+yt-dlp>=2026.8.19
