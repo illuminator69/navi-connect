@@ -1331,7 +1331,7 @@ it, which is the failure this stack has paid for twice.
 | Env (on the hub) | Meaning |
 |---|---|
 | `PREVIEW_URL` | how the **hub** reaches the sidecar (an internal Docker name is normal). Unset = proxy disabled, clients hide previews |
-| `PREVIEW_PUBLIC_URL` | how a **client or speaker** reaches it. Unset = `previewCastable: false` |
+| `PREVIEW_PUBLIC_URL` | how a **client or speaker** reaches it. Unset = `previewCastable: false`, **and** the hub falls back to signing `PREVIEW_URL` — which is normally a Docker-internal name no client can resolve, so in practice this is required unless `PREVIEW_URL` is itself a LAN address |
 | `PREVIEW_SECRET` | the capability secret. Unset = proxy disabled, because an unsignable stream URL fails at *playback* rather than at configuration |
 | `PREVIEW_TTL` | capability lifetime, seconds (default 21600) |
 

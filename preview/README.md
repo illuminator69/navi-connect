@@ -36,9 +36,11 @@ and it must **not** be `HUB_TOKEN` — that is the hub's whole administrative
 surface and must never appear in a URL.
 
 Set `PREVIEW_PUBLIC_URL` **on the hub** to the address a client (or a speaker)
-can reach this process on. Without it the hub advertises `previewCastable:
-false` and both clients refuse a cast transfer while a preview is queued, rather
-than letting it fail as silence.
+can reach this process on. Treat it as required: with it unset the hub signs
+`PREVIEW_URL` instead, and that is normally a Docker-internal hostname that no
+client can resolve. It also advertises `previewCastable: false`, so both clients
+refuse a cast transfer while a preview is queued rather than letting it fail as
+silence.
 
 ## Nothing is written to disk
 
