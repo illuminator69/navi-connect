@@ -344,6 +344,17 @@ after the fact said so. The per-album `quality` is a *ranking* term upstream, no
 seeing the real format in the source row is the only thing that actually answers "what am I
 getting".
 
+**A star on an unowned row is the client-side entry point for the same review**, not a bare
+download button. Tapping it re-runs the check above — `/lb/album/sources`, then fire only if the
+top-ranked folder is `recommended`, `albumMatchOk` and complete against the canonical tracklist —
+and opens the source picker instead when it is not, with a sentence naming which question is open.
+Mounted on Feishin's `missing-album-tile` and `discover-tile`'s action slot, and Navic's Discover
+album tile and `DiscographyShelf`'s genuinely-absent tiles (an owned tile opens the album; a gap
+row — partly owned — is excluded, since that goes through Fill-gaps instead, a different
+pipeline). The gesture is not instant: the source fan-out is a live slskd search taking 30–90s, and
+nothing appears in the ledger until a download is actually posted, so the control carries its own
+spinner rather than looking inert for a minute.
+
 **The client sends the release it resolved** (`release_mbid` + artist/title/track count) with both
 the source search and the download, and lb-bot prefers it over re-resolving the release-group. Two
 reasons: its resolver picks "official, earliest" on its own, so the edition picker was otherwise
