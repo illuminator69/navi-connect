@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,9 +23,16 @@ import time
 
 import websockets
 
-PORT = 4798
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
 TOKEN = "test-token"
-URL = f"ws://localhost:{PORT}"
+URL = f"ws://127.0.0.1:{PORT}"
 
 
 class Client:
@@ -109,7 +117,8 @@ def expected_after_remove(order, at):
 async def main():
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
-           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1"}
+           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
+           "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
                            cwd=os.path.join(os.path.dirname(__file__), ".."))
     failures = []
@@ -190,8 +199,8 @@ async def main():
 
 async def test_prune():
     """A device not seen within HUB_DEVICE_TTL_DAYS is dropped on load; a fresh one is kept."""
-    port = 4799
-    url = f"ws://localhost:{port}"
+    port = _free_port()
+    url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     now = int(time.time() * 1000)
     with open(state, "w", encoding="utf-8") as f:
@@ -204,7 +213,7 @@ async def test_prune():
         }, f)
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
-           "HUB_DEVICE_TTL_DAYS": "1", "HUB_HEALTH_PORT": str(port + 1)}
+           "HUB_DEVICE_TTL_DAYS": "1", "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
                            cwd=os.path.join(os.path.dirname(__file__), ".."))
     failures = []
@@ -237,12 +246,12 @@ async def test_saved_queues():
     """Hub-owned saved-queue history: setQueue records a queue, enqueue grows the SAME
     record (no fork), a new setQueue adds a second record + flips 'current', a client's
     offline history union-merges, and delete removes."""
-    port = 4800
-    url = f"ws://localhost:{port}"
+    port = _free_port()
+    url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
-           "HUB_HEALTH_PORT": str(port + 1)}
+           "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
                            cwd=os.path.join(os.path.dirname(__file__), ".."))
     failures = []
@@ -354,12 +363,12 @@ async def test_audit_fixes():
     later publish · the current record survives eviction · `clear` detaches the
     session from its record · a deleted record stays deleted across a client re-sync.
     """
-    port = 4801
-    url = f"ws://localhost:{port}"
+    port = _free_port()
+    url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
-           "HUB_HEALTH_PORT": str(port + 1)}
+           "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
                            cwd=os.path.join(os.path.dirname(__file__), ".."))
     failures = []

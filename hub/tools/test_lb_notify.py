@@ -72,7 +72,7 @@ async def run() -> list[str]:
     hub.LB._cache_put(key_for(disco, "/api/artist/discography?nd_id=a1"), 200, b"{}", "application/json")
     hub.LB._cache_put(key_for(releases, "/api/album/releases?rgid=r"), 200, b"{}", "application/json",
                       hub.PROXY_CACHE_TTL_LONG)
-    gen_before = hub.LB._cache_gen
+    gen_before = dict(hub.LB._cache_gen)   # per-route generations (final-review I1)
 
     status, _headers, _body = await notify({
         "event": "albumIndexed", "release_mbid": "rel-1", "rgid": "rg-1",
@@ -90,8 +90,10 @@ async def run() -> list[str]:
         failures.append("discography cache survived the notify — clients re-read the stale answer")
     if hub.LB._cache_get(key_for(releases, "/api/album/releases?rgid=r")) is None:
         failures.append("long-TTL MusicBrainz route was purged — a fill changes nothing there")
-    if hub.LB._cache_gen == gen_before:
+    if hub.LB._cache_gen.get(disco, 0) == gen_before.get(disco, 0):
         failures.append("cache generation not bumped — an in-flight read would re-cache stale data")
+    if hub.LB._cache_gen.get(releases, 0) != gen_before.get(releases, 0):
+        failures.append("a notify bumped the generation of a route it does not invalidate")
 
     if len(fake.frames) != 1:
         failures.append(f"expected one broadcast, got {len(fake.frames)}")

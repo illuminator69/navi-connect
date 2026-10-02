@@ -110,14 +110,111 @@ async def run() -> list[str]:
     return failures
 
 
+async def run_failure_propagation() -> list[str]:
+    """B-005: `/lb/status` used to answer `upstreamReachable: true` for up to
+    PROXY_CACHE_TTL (60 s) after lb-bot died, because nothing told its cache
+    entry lb-bot had gone away in the meantime — only the probe route's OWN
+    next call (or the 60 s probe_loop tick) ever moved the verdict. A refused
+    connection (`down`) on any OTHER lb-bot route must invalidate that cache
+    entry and flip the verdict immediately; a timeout (`busy`) only invalidates
+    the cache entry — a slow lb-bot is not a dead one (ruling R18).
+    """
+    failures: list[str] = []
+    probe = ("GET", "/lb/status")
+    probe_spec = hub.LB_ROUTES[probe]
+    fresh_get = ("GET", "/lb/fresh-releases")
+    fresh_spec = hub.LB_ROUTES[fresh_get]
+    key = json.dumps([probe, probe_spec["path"], [], None], sort_keys=True, default=str)
+
+    original = hub._proxy_upstream_blocking
+    original_upstream = type(hub.LB).upstream
+    type(hub.LB).upstream = property(lambda self: "http://lb.invalid")
+    hub.LB._cache.clear()
+    try:
+        # --- a refused connection on an unrelated route ------------------------ #
+        hub.LB._set_available(False)
+        hub._proxy_upstream_blocking = lambda *a, **k: (200, b'{"summary":1}', "application/json")
+        _s, body, _c = await hub.LB.call(probe, probe_spec, [], None)
+        if json.loads(body).get("upstreamReachable") is not True:
+            failures.append("setup: priming /lb/status didn't report reachable")
+        if hub.LB.available is not True:
+            failures.append("setup: priming /lb/status didn't set the verdict True")
+
+        hub._proxy_upstream_blocking = lambda *a, **k: (
+            502, b'{"error":"lbbot unreachable","down":true}', "application/json")
+        await hub.LB.call(fresh_get, fresh_spec, [], None)
+
+        if hub.LB.available is not False:
+            failures.append("a refused connection on another route didn't flip the verdict")
+        if hub.LB._cache_get(key) is not None:
+            failures.append("the stale /lb/status cache entry survived a failure on another route")
+
+        hub._proxy_upstream_blocking = lambda *a, **k: (
+            502, b'{"error":"lbbot unreachable","down":true}', "application/json")
+        _s, body, _c = await hub.LB.call(probe, probe_spec, [], None)
+        if json.loads(body).get("upstreamReachable") is not False:
+            failures.append("the next /lb/status call still answered reachable after invalidation")
+
+        # --- a timeout on an unrelated route is BUSY, not down (ruling R18) ---- #
+        # A 504 `busy` is a healthy lb-bot that is still working (a rate-limited
+        # MusicBrainz hop, a 150 s source search). Flipping the hub-wide verdict
+        # on it blanked every client's lb-bot layer until the next probe tick.
+        # It only drops /lb/status's cached answer, so the next call re-asks.
+        hub.LB._cache.clear()
+        hub.LB._set_available(False)
+        hub._proxy_upstream_blocking = lambda *a, **k: (200, b'{"summary":1}', "application/json")
+        await hub.LB.call(probe, probe_spec, [], None)
+        hub._proxy_upstream_blocking = lambda *a, **k: (
+            504, b'{"error":"lbbot timed out","busy":true}', "application/json")
+        await hub.LB.call(fresh_get, fresh_spec, [], None)
+        if hub.LB.available is not True:
+            failures.append("a timeout (busy) on another route flipped the verdict to unavailable")
+        if hub.LB._cache_get(key) is not None:
+            failures.append("the /lb/status cache entry survived a timeout on another route")
+        busy_calls: list[str] = []
+
+        def healthy(method, url, *a, **k):
+            busy_calls.append(url)
+            return (200, b'{"summary":1}', "application/json")
+
+        hub._proxy_upstream_blocking = healthy
+        _s, body, _c = await hub.LB.call(probe, probe_spec, [], None)
+        if len(busy_calls) != 1:
+            failures.append("the /lb/status call after a busy route didn't re-probe upstream")
+        if json.loads(body).get("upstreamReachable") is not True:
+            failures.append("/lb/status after a busy route didn't answer upstreamReachable: true")
+
+        # --- a 502 tooLarge is NOT a reachability failure ----------------------- #
+        hub.LB._cache.clear()
+        hub.LB._set_available(False)
+        hub._proxy_upstream_blocking = lambda *a, **k: (200, b'{"summary":1}', "application/json")
+        await hub.LB.call(probe, probe_spec, [], None)
+        hub._proxy_upstream_blocking = lambda *a, **k: (
+            502, b'{"error":"lbbot response exceeded the proxy limit","tooLarge":true}',
+            "application/json")
+        await hub.LB.call(fresh_get, fresh_spec, [], None)
+        if hub.LB.available is not True:
+            failures.append("an oversized (tooLarge) response wrongly flipped the verdict")
+        if hub.LB._cache_get(key) is None:
+            failures.append("an oversized (tooLarge) response wrongly dropped /lb/status's cache")
+    finally:
+        hub._proxy_upstream_blocking = original
+        type(hub.LB).upstream = original_upstream
+        hub.LB._cache.clear()
+    return failures
+
+
 def main() -> int:
     failures = asyncio.run(run())
+    failures += asyncio.run(run_failure_propagation())
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
         return 1
     print("PASS - lb status probe: failure-not-cached/success-cached/refused-is-502-down/"
-          "timeout-is-504-busy/write-invalidates-its-read")
+          "timeout-is-504-busy/write-invalidates-its-read/"
+          "other-route-down-flips-verdict/other-route-busy-only-drops-status-cache/"
+          "tooLarge-is-not-a-failure")
     return 0
 
 

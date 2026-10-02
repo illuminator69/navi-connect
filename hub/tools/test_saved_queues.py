@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 
-from test_edits import TOKEN, Client
+from test_edits import TOKEN, Client, _free_port
 
 HUB_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -41,7 +41,7 @@ def rec(client, rid):
 def spawn(port, state, extra_env=None):
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
-           "HUB_HEALTH_PORT": str(port + 1), **(extra_env or {})}
+           "HUB_HEALTH_PORT": str(_free_port()), **(extra_env or {})}
     return subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR)
 
 
@@ -55,9 +55,9 @@ def stop(hub):
 
 async def test_resurrection_and_batch():
     """Cases 1, 2, 6, 7, 8."""
-    port, failures = 4802, []
+    port, failures = _free_port(), []
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    url = f"ws://localhost:{port}"
+    url = f"ws://127.0.0.1:{port}"
     hub = spawn(port, state)
     try:
         await asyncio.sleep(1.2)
@@ -137,8 +137,8 @@ async def test_resurrection_and_batch():
 
 async def test_live_record_reconciliation():
     """Cases 3, 4."""
-    port, failures = 4804, []
-    url = f"ws://localhost:{port}"
+    port, failures = _free_port(), []
+    url = f"ws://127.0.0.1:{port}"
 
     # --- 3. offline rename of the currently-playing queue --------------------- #
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
@@ -175,8 +175,8 @@ async def test_live_record_reconciliation():
         os.unlink(state)
 
     # --- 4. restart with a savedQueueId whose record is gone ------------------- #
-    port2 = 4806
-    url2 = f"ws://localhost:{port2}"
+    port2 = _free_port()
+    url2 = f"ws://127.0.0.1:{port2}"
     state2 = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     tracks = [{"id": f"t{i}", "title": f"T{i}"} for i in range(4)]
     with open(state2, "w", encoding="utf-8") as f:
@@ -211,8 +211,8 @@ async def test_live_record_reconciliation():
 
 async def test_malformed_input():
     """Case 5: garbage in a client record must not break persistence."""
-    port, failures = 4808, []
-    url = f"ws://localhost:{port}"
+    port, failures = _free_port(), []
+    url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     hub = spawn(port, state)
     try:
@@ -266,11 +266,269 @@ async def test_malformed_input():
     return failures
 
 
+async def test_history_scrubs_credentials():
+    """B-003: PERSISTED saved-queue history carries no credentialed Subsonic
+    `streamUrl`. The LIVE queue (what a Chromecast bridge reads) is untouched, and
+    a preview (`ext:`) track's signed `streamUrl` survives in history — it's the
+    only thing that makes a preview replayable, and it's a short-lived capability,
+    not a standing Subsonic credential.
+    """
+    port, failures = _free_port(), []
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    url = f"ws://127.0.0.1:{port}"
+    hub = spawn(port, state)
+    try:
+        await asyncio.sleep(1.2)
+        r = Client("Recv", device_id="recv")
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await r.connect(url); await c.connect(url)
+        credentialed = ("https://music.example.com/rest/stream.view"
+                        "?id=t0&v=1.13.0&c=Feishin&u=alice&t=abc123deadbeef&s=saltsalt")
+        preview_url = "https://hub.example.com/preview/stream/ext:yt:xyz?sig=abcd&exp=9999999999"
+        tracks = [
+            {"id": "t0", "title": "T0", "streamUrl": credentialed, "mime": "audio/flac"},
+            {"id": "ext:yt:xyz", "title": "Preview", "streamUrl": preview_url, "mime": "audio/webm"},
+        ]
+        await r.act(action="setQueue", tracks=tracks, index=0, play=True,
+                    savedQueueId="hist1", sourceKind="album", sourceName="Album One")
+        await asyncio.sleep(0.4)
+
+        # The record broadcast to clients (and about to be persisted) is scrubbed.
+        live_rec = rec(c, "hist1")
+        if live_rec is None:
+            failures.append("setQueue minted no history record")
+        else:
+            by_id = {s["id"]: s for s in live_rec["songs"]}
+            if "streamUrl" in by_id.get("t0", {}):
+                failures.append(f"ordinary track kept a credentialed streamUrl in history: "
+                                f"{by_id['t0'].get('streamUrl')!r}")
+            if by_id.get("ext:yt:xyz", {}).get("streamUrl") != preview_url:
+                failures.append("a preview track's streamUrl was stripped from history, "
+                                "breaking its restore")
+
+        # state.json on disk: same story for the persisted `savedQueues`, but the
+        # LIVE `session.queue` (what a cast bridge reads right now) keeps both URLs.
+        with open(state, encoding="utf-8") as f:
+            parsed = json.load(f)
+        disk_hist = next((q for q in parsed.get("savedQueues", []) if q["id"] == "hist1"), None)
+        if disk_hist is None:
+            failures.append("state.json has no persisted record for hist1")
+        else:
+            disk_by_id = {s["id"]: s for s in disk_hist["songs"]}
+            if "streamUrl" in disk_by_id.get("t0", {}):
+                failures.append("state.json's history still carries the ordinary track's "
+                                "credentialed streamUrl")
+        live_by_id = {s["id"]: s for s in parsed.get("session", {}).get("queue", [])}
+        if live_by_id.get("t0", {}).get("streamUrl") != credentialed:
+            failures.append("the LIVE queue lost its streamUrl — this would break the "
+                            "Chromecast bridge, which fetches it directly")
+        if live_by_id.get("ext:yt:xyz", {}).get("streamUrl") != preview_url:
+            failures.append("the LIVE queue's preview streamUrl was altered")
+    finally:
+        stop(hub)
+        os.unlink(state)
+    return failures
+
+
+async def test_history_scrub_on_load():
+    """B-003 migration: a state.json an older build wrote (credentials still in
+    history) is scrubbed the moment the hub loads it — `_load()` re-sanitises every
+    persisted record through `_sanitize_saved_queue`, which is now where the scrub
+    lives, so an old file self-heals on the next start with no separate migration."""
+    port, failures = _free_port(), []
+    url = f"ws://127.0.0.1:{port}"
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    credentialed = ("https://music.example.com/rest/stream.view"
+                    "?id=old0&u=alice&t=deadbeef&s=salt")
+    with open(state, "w", encoding="utf-8") as f:
+        json.dump({
+            "session": {"queue": [], "index": 0, "positionMs": 0},
+            "savedQueues": [{
+                "id": "legacy1", "songs": [{"id": "old0", "title": "Old",
+                                           "streamUrl": credentialed}],
+                "songCount": 1, "currentIndex": 0, "positionMs": 0,
+                "sourceKind": "album", "updatedAt": int(time.time() * 1000),
+            }],
+            "devices": [],
+        }, f)
+    hub = spawn(port, state)
+    try:
+        await asyncio.sleep(1.2)
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await c.connect(url)
+        legacy = rec(c, "legacy1")
+        if legacy is None:
+            failures.append("the pre-existing record was dropped on load instead of scrubbed")
+        else:
+            song = next((s for s in legacy["songs"] if s["id"] == "old0"), None)
+            if song is None:
+                failures.append("the legacy track was dropped on load")
+            elif "streamUrl" in song:
+                failures.append(f"a state.json written by an older build still had its "
+                                f"credentialed streamUrl after load: {song['streamUrl']!r}")
+    finally:
+        stop(hub)
+        os.unlink(state)
+    return failures
+
+
+def _has_credential_param(url):
+    """True if `url`'s query string carries a Subsonic (or plain-password) login
+    param. Used to assert the ABSENCE of credentials, not any particular scrub
+    strategy — a test written this way doesn't care whether the fix drops the
+    whole field or just the offending params."""
+    if not url:
+        return False
+    from urllib.parse import urlsplit, parse_qsl
+    keys = {k.lower() for k, _ in parse_qsl(urlsplit(url).query)}
+    return bool(keys & {"u", "t", "s", "p", "apikey"})
+
+
+async def test_history_scrubs_cover_credentials():
+    """B-003 second half: PERSISTED saved-queue history carries no Subsonic login
+    in cover-art URLs either — a song's `imageUrl` (`getCoverArt?...&u=&t=&s=`) and
+    a record's `coverImageUrl`, same as `streamUrl`. An `ext:` preview's `imageUrl`
+    is a public Cover Art Archive URL and survives untouched (same exception as its
+    `streamUrl`). Covers the upsert path (`setQueue`) and the sync path (`enqueue`
+    growing the current record); the load path is `test_history_scrub_on_load`.
+    """
+    port, failures = _free_port(), []
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    url = f"ws://127.0.0.1:{port}"
+    hub = spawn(port, state)
+    try:
+        await asyncio.sleep(1.2)
+        r = Client("Recv", device_id="recv")
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await r.connect(url); await c.connect(url)
+        cover_art = ("https://music.example.com/rest/getCoverArt.view"
+                     "?id=al0&v=1.13.0&c=Feishin&u=alice&t=abc123deadbeef&s=saltsalt")
+        record_cover = ("https://music.example.com/rest/getCoverArt.view"
+                        "?id=al0&u=alice&t=deadbeef00&s=pepper")
+        caa_cover = "https://coverartarchive.org/release/abc-123/front-500"
+        tracks = [
+            {"id": "t0", "title": "T0", "imageUrl": cover_art, "mime": "audio/flac"},
+            {"id": "ext:yt:xyz", "title": "Preview", "imageUrl": caa_cover,
+             "mime": "audio/webm"},
+        ]
+        await r.act(action="setQueue", tracks=tracks, index=0, play=True,
+                    savedQueueId="hist2", sourceKind="album", sourceName="Album Two",
+                    coverImageUrl=record_cover)
+        await asyncio.sleep(0.4)
+
+        live_rec = rec(c, "hist2")
+        if live_rec is None:
+            failures.append("setQueue minted no history record")
+        else:
+            by_id = {s["id"]: s for s in live_rec["songs"]}
+            if _has_credential_param(by_id.get("t0", {}).get("imageUrl")):
+                failures.append(f"ordinary track kept a credentialed imageUrl in "
+                                f"history: {by_id['t0'].get('imageUrl')!r}")
+            if by_id.get("ext:yt:xyz", {}).get("imageUrl") != caa_cover:
+                failures.append("a preview track's public imageUrl was stripped "
+                                "from history")
+            if _has_credential_param(live_rec.get("coverImageUrl")):
+                failures.append(f"the record's coverImageUrl kept its credentials: "
+                                f"{live_rec.get('coverImageUrl')!r}")
+
+        # Sync path: enqueue grows the SAME record via _sync_current_saved_queue,
+        # not _upsert_saved_queue — its own scrub point.
+        more_cover = ("https://music.example.com/rest/getCoverArt.view"
+                      "?id=al1&u=alice&t=beefdead11&s=thyme")
+        await r.act(action="enqueue", at="end",
+                    tracks=[{"id": "t1", "title": "T1", "imageUrl": more_cover,
+                             "mime": "audio/flac"}])
+        await asyncio.sleep(0.4)
+        live_rec = rec(c, "hist2")
+        by_id = {s["id"]: s for s in (live_rec or {}).get("songs", [])}
+        if _has_credential_param(by_id.get("t1", {}).get("imageUrl")):
+            failures.append(f"a track added via enqueue kept a credentialed "
+                            f"imageUrl in history: {by_id.get('t1', {}).get('imageUrl')!r}")
+
+        # state.json: same story for the persisted copy.
+        with open(state, encoding="utf-8") as f:
+            parsed = json.load(f)
+        disk_hist = next((q for q in parsed.get("savedQueues", []) if q["id"] == "hist2"), None)
+        if disk_hist is None:
+            failures.append("state.json has no persisted record for hist2")
+        else:
+            disk_by_id = {s["id"]: s for s in disk_hist["songs"]}
+            if _has_credential_param(disk_by_id.get("t0", {}).get("imageUrl")):
+                failures.append("state.json's history still carries a credentialed "
+                                "imageUrl")
+            if _has_credential_param(disk_hist.get("coverImageUrl")):
+                failures.append("state.json's history still carries a credentialed "
+                                "coverImageUrl")
+
+        # The LIVE session queue (what a cast bridge/receiver reads right now) is
+        # untouched — only the persisted/broadcast history copy is scrubbed.
+        live_by_id = {s["id"]: s for s in parsed.get("session", {}).get("queue", [])}
+        if live_by_id.get("t0", {}).get("imageUrl") != cover_art:
+            failures.append("the LIVE queue lost/altered its imageUrl")
+    finally:
+        stop(hub)
+        os.unlink(state)
+    return failures
+
+
+async def test_history_cover_scrub_on_load():
+    """B-003 migration, second half: a state.json an older build wrote (cover-art
+    credentials still in history) is scrubbed the moment the hub loads it, same as
+    `streamUrl` in `test_history_scrub_on_load` — `_sanitize_saved_queue` covers
+    both."""
+    port, failures = _free_port(), []
+    url = f"ws://127.0.0.1:{port}"
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    cover_art = ("https://music.example.com/rest/getCoverArt.view"
+                "?id=old0&u=alice&t=deadbeef&s=salt")
+    record_cover = ("https://music.example.com/rest/getCoverArt.view"
+                    "?id=old0&u=alice&t=cafebabe&s=pepper")
+    with open(state, "w", encoding="utf-8") as f:
+        json.dump({
+            "session": {"queue": [], "index": 0, "positionMs": 0},
+            "savedQueues": [{
+                "id": "legacy2", "songs": [{"id": "old0", "title": "Old",
+                                           "imageUrl": cover_art}],
+                "songCount": 1, "currentIndex": 0, "positionMs": 0,
+                "sourceKind": "album", "coverImageUrl": record_cover,
+                "updatedAt": int(time.time() * 1000),
+            }],
+            "devices": [],
+        }, f)
+    hub = spawn(port, state)
+    try:
+        await asyncio.sleep(1.2)
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await c.connect(url)
+        legacy = rec(c, "legacy2")
+        if legacy is None:
+            failures.append("the pre-existing record was dropped on load instead of scrubbed")
+        else:
+            song = next((s for s in legacy["songs"] if s["id"] == "old0"), None)
+            if song is None:
+                failures.append("the legacy track was dropped on load")
+            elif _has_credential_param(song.get("imageUrl")):
+                failures.append(f"a state.json written by an older build still had "
+                                f"its credentialed imageUrl after load: {song.get('imageUrl')!r}")
+            if _has_credential_param(legacy.get("coverImageUrl")):
+                failures.append(f"a state.json written by an older build still had "
+                                f"its credentialed coverImageUrl after load: "
+                                f"{legacy.get('coverImageUrl')!r}")
+    finally:
+        stop(hub)
+        os.unlink(state)
+    return failures
+
+
 async def main():
     failures = []
     failures += await test_resurrection_and_batch()
     failures += await test_live_record_reconciliation()
     failures += await test_malformed_input()
+    failures += await test_history_scrubs_credentials()
+    failures += await test_history_scrub_on_load()
+    failures += await test_history_scrubs_cover_credentials()
+    failures += await test_history_cover_scrub_on_load()
     if failures:
         print("FAIL (saved-queue audit 2026-08-07):")
         for f in failures:
@@ -278,7 +536,9 @@ async def main():
         sys.exit(1)
     print("PASS - saved-queue audit: tombstone-resurrection/unknown-id-tombstone/"
           "live-rename-reconcile/live-record-rebuild/malformed-input/batch-delete/"
-          "unknown-rename-error/deleted-before-merge")
+          "unknown-rename-error/deleted-before-merge/history-scrubs-credentials/"
+          "history-scrub-on-load/history-scrubs-cover-credentials/"
+          "history-cover-scrub-on-load")
 
 
 if __name__ == "__main__":

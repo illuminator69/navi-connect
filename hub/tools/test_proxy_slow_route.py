@@ -49,8 +49,16 @@ def _free_port() -> int:
 
 class SlowHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        time.sleep(UPSTREAM_DELAY)
-        raw = json.dumps({"sources": [], "artist": "A", "album": "B"}).encode()
+        # The hub probes lb-bot's health itself (at startup, then every 60 s)
+        # with its own 4 s `LB_PROBE_TIMEOUT`. Slow here too, the probe hung up
+        # first and the stub printed a BrokenPipeError traceback into this
+        # test's output — noise about a route the test is not about. Answer it
+        # at once; only the route under test is slow.
+        if self.path.split("?", 1)[0] == "/api/health":
+            raw = json.dumps({"ok": True, "epoch": "1-test", "headSeq": 0}).encode()
+        else:
+            time.sleep(UPSTREAM_DELAY)
+            raw = json.dumps({"sources": [], "artist": "A", "album": "B"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -62,7 +70,10 @@ class SlowHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    upstream = http.server.HTTPServer(("127.0.0.1", 0), SlowHandler)
+    # Threaded, so a health probe arriving mid-sleep is answered rather than
+    # queued behind the slow request.
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    upstream.daemon_threads = True
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
     port = _free_port()

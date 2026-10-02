@@ -71,6 +71,14 @@ AUDIOMUSE_TOKEN = os.environ.get("AUDIOMUSE_TOKEN", "")
 # its Flask API has no authentication at all and binds 0.0.0.0:8899, so it can
 # never be exposed directly. Unset URL = proxy disabled, clients hide the feature.
 LBBOT_URL = os.environ.get("LBBOT_URL", "").rstrip("/")
+# Where a PERSON opens lb-bot's own web UI — advertised to clients as `webUrl`
+# (in `welcome.lb`, the `lb` frame and /lb/status) so a screen that has to hand
+# the user over to lb-bot's workspace can link straight to it. Defaults to
+# LBBOT_URL, which on a LAN setup is the same address; set it when people reach
+# lb-bot through something else (a reverse proxy, a hostname). It is only a
+# link: nothing is proxied through it and it grants nothing the hub token does
+# not already reach on the same network.
+LBBOT_WEB_URL = os.environ.get("LBBOT_WEB_URL", "").rstrip("/")
 
 # yt-dlp preview sidecar — turns "what does this album I don't own sound like"
 # into a playable track. The hub proxies its CONTROL plane only (/preview/resolve,
@@ -145,9 +153,18 @@ PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls PER PROXY (each of the t
 # deadline dropped the socket with no answer at all. A poll must never wait on
 # a search.
 PROXY_FAST_INFLIGHT = 2
+# A third pool, ONE slot, for the index mirror's sync pulls (`/lb/index/*`).
+# Not the default pool, where a pull would queue behind 150 s source searches;
+# not `fast`, where a client pulling its mirror from zero — dozens of 2 MB pages
+# back to back — would starve the status polls that pool exists to protect.
+# One slot because the pulls are sequential per client anyway and lb-bot reads
+# every page under one lock; a second device pulling at the same moment waits
+# (or is told `busy` and backs off with its cursor untouched), which is cheaper
+# than two page reads contending for that lock.
+PROXY_SYNC_INFLIGHT = 1
 # How long a request may wait for a slot before the hub answers 503 `busy`
 # itself. Waiting past the handshake deadline is the one outcome a client can
-# do nothing with; a 503 it can show.
+# do nothing with; a 503 it can show. Applies to the `fast` and `sync` pools.
 PROXY_QUEUE_TIMEOUT_FAST = float(os.environ.get("PROXY_QUEUE_TIMEOUT_FAST", "10"))
 PROXY_TIMEOUT = 20          # seconds per upstream socket op (urllib has one knob for
                             # connect+read); Tier 2 is in-memory lookups, so fail fast
@@ -185,6 +202,29 @@ PROXY_NO_CACHE_PARAMS = ("refresh",)
 
 PROXY_MAX_BODY = 256 * 1024        # largest client request body accepted
 PROXY_MAX_RESPONSE = 4 * 1024 * 1024
+
+# The hub's own view of whether lb-bot is up, carried in `welcome` so a client
+# can gate its lb-bot surfaces without first awaiting a `/lb/status` round trip.
+LB_PROBE_INTERVAL = 60.0
+# The hub's own probe asks `/api/health`, which answers in milliseconds, so it
+# gets a short deadline of its own rather than PROXY_TIMEOUT: an lb-bot that
+# HANGS must read as down within seconds, not after 20. Only the health call is
+# bounded this tightly — the `/api/summary` fallback for an older lb-bot is a
+# genuinely heavy read and keeps the route's own timeout.
+LB_PROBE_TIMEOUT = 4.0
+# Until the first probe has answered, a `welcome` waits up to this long for it.
+# Without it, a client reconnecting the instant a restarted hub is listening
+# reads `available: false` from a probe that simply has not answered yet — and
+# hides every lb-bot feature on a healthy lb-bot. The WELCOME waits, not the
+# listener: the proxies and the health port answer from the first moment, and
+# once the first verdict is in the wait costs nothing. Bounded, so an lb-bot
+# that hangs delays a first handshake by seconds rather than holding it.
+LB_PROBE_STARTUP_WAIT = 3.0
+# `lbIndex` is only a hint — clients pull on every `welcome` regardless — and a
+# bulk build pushes every 2 s, so persisting each one would rewrite state.json
+# (every saved queue in it) at that rate. Leading edge, like the position saves;
+# a new epoch is always written at once, and a graceful stop flushes the rest.
+LB_INDEX_SAVE_THROTTLE = 10.0
 
 
 def log(*a: Any) -> None:
@@ -398,6 +438,11 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
 #     nd:        inject HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them)
 #     cache:     cacheable; `ttl` overrides PROXY_CACHE_TTL
 #     timeout:   overrides PROXY_TIMEOUT for a known-slow upstream
+#     pool:      "default" (absent), "fast" or "sync" — see PROXY_*_INFLIGHT
+#     coalesce:  False opts a GET out of sharing an identical in-flight call;
+#                absent means it shares one (see HttpProxy.call)
+#     fallback:  an upstream path retried once when `path` answers 404 — an
+#                upstream older than the route it is asked for
 SONIC_ROUTES: dict[tuple[str, str], dict] = {
     ("GET", "/sonic/fingerprint"): {
         "method": "GET", "path": "/api/sonic_fingerprint/generate",
@@ -445,10 +490,45 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
 # purpose: `/api/gaps` with no id (the whole-library list, unbounded, and no
 # client needs it — the id always arrives via the discography row), and
 # `/api/gaps/<id>/duplicate-files`.
+# Q-017c/Q-018: the gap view's projection. The GET poll carries it at the top level;
+# every POST that answers with lb-bot's gap view nests it under `gap`, so those
+# routes share the same rules behind a `gap.` prefix.
+GAP_STRIP_RULES: tuple[tuple[str, str], ...] = (
+    ("sources", "files"), ("sources", "filesTruncated"),
+    ("tracks", "placeFolder"), ("tracks", "placeFile"),
+)
+GAP_REPLY_STRIP_RULES: tuple[tuple[str, str], ...] = tuple(
+    (f"gap.{k}", f) for k, f in GAP_STRIP_RULES)
+
 LB_ROUTES: dict[tuple[str, str], dict] = {
     ("GET", "/lb/status"): {
-        "method": "GET", "path": "/api/summary",
+        # The liveness probe. `/api/health` is lb-bot's cheap dedicated route;
+        # `/api/summary`, which this used to ride on, builds the whole Fill-gaps
+        # workspace view to answer "are you there". The fallback is for an lb-bot
+        # deployed before `/api/health` existed: it answers that path 404, and
+        # without the retry a hub deployed first would call a healthy lb-bot down.
+        "method": "GET", "path": "/api/health", "fallback": "/api/summary",
         "params": (), "cache": True, "probe": True,
+    },
+    ("GET", "/lb/index/changes"): {
+        # The index mirror's pull: every artist and tombstone with a seq above
+        # `since`, a page at a time (contract: PLAN-lbbot-index-mirror §1).
+        #
+        # Never cached and never coalesced, for one reason: a client pulls
+        # because it was just told the head moved. A cached page, or a read it
+        # joined that set off before the write, answers with the OLD head, and
+        # the client then sits one push behind until the next trigger — the
+        # precise staleness the mirror exists to remove. Each pull is ~100 B
+        # when there is nothing new, so sharing buys nothing worth that.
+        "method": "GET", "path": "/api/index/changes",
+        "params": ("since", "epoch"), "cache": False, "coalesce": False,
+    },
+    ("GET", "/lb/index/keys"): {
+        # Every `{key, seq}` lb-bot holds — the drift check's ground truth, read
+        # when a pull's count or seq sum disagrees with the client's mirror.
+        # Uncached and uncoalesced for the same reason as the pull.
+        "method": "GET", "path": "/api/index/keys",
+        "params": (), "cache": False, "coalesce": False,
     },
     ("GET", "/lb/artist/discography"): {
         "method": "GET", "path": "/api/artist/discography",
@@ -723,6 +803,7 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # the hub route table can stay a table of exact paths.
         "method": "POST", "path": "/api/gaps/{group_id}/allow-mp3",
         "path_args": ("group_id",), "body": ("group_id", "allow"), "cache": False,
+        "strip": GAP_REPLY_STRIP_RULES,
     },
     ("GET", "/lb/gap"): {
         # The gap progress poll — never cached, same reasoning as album/status.
@@ -736,7 +817,11 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "method": "GET", "path": "/api/gaps/{group_id}",
         "path_args": ("group_id",), "params": ("group_id", "sourcePage"),
         "cache": False, "timeout": PROXY_SLOW_TIMEOUT,
-        "strip": (("sources", "files"), ("sources", "filesTruncated")),
+        # `tracks[].placeFolder`/`placeFile` are lb-bot HOST paths (an absolute
+        # `/downloads/<folder>` path and a peer's raw filename) — its own SPA
+        # reads them directly, not through the hub, and no client code needs
+        # them (Q-017c).
+        "strip": GAP_STRIP_RULES,
     },
     ("GET", "/lb/gap/source-files"): {
         # One source's real folder listing, each file tagged with the track it
@@ -772,20 +857,24 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # nobody needs /api/tasks, which is not whitelisted and must stay that way.
         "method": "POST", "path": "/api/gaps/{group_id}/auto",
         "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+        "strip": GAP_REPLY_STRIP_RULES,
     },
     ("POST", "/lb/gap/fetch"): {
         "method": "POST", "path": "/api/gaps/{group_id}/fetch",
         "path_args": ("group_id",), "body": ("group_id", "sourceId"), "cache": False,
+        "strip": GAP_REPLY_STRIP_RULES,
     },
     ("POST", "/lb/gap/cancel"): {
         "method": "POST", "path": "/api/gaps/{group_id}/cancel",
         "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+        "strip": GAP_REPLY_STRIP_RULES,
     },
     ("POST", "/lb/gap/rescan"): {
         # Re-reads the album from Navidrome and walks its folder for files
         # Navidrome hasn't indexed — slow enough to need the long timeout.
         "method": "POST", "path": "/api/gaps/{group_id}/rescan",
         "path_args": ("group_id",), "body": ("group_id",), "cache": False,
+        "strip": GAP_REPLY_STRIP_RULES,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
 }
@@ -833,6 +922,9 @@ PREVIEW_ROUTES: dict[tuple[str, str], dict] = {
 for _fast in (("GET", "/lb/album/status"), ("GET", "/lb/fills"), ("GET", "/lb/gap"),
               ("POST", "/lb/album/cancel"), ("POST", "/lb/gap/cancel")):
     LB_ROUTES[_fast]["pool"] = "fast"
+# The index mirror's pulls take their own one-slot pool (PROXY_SYNC_INFLIGHT).
+for _sync in (("GET", "/lb/index/changes"), ("GET", "/lb/index/keys")):
+    LB_ROUTES[_sync]["pool"] = "sync"
 # Writes that make their own cached read stale. `/lb/notify` covers a landing;
 # these cover the user's own action, which no landing announces.
 LB_ROUTES[("POST", "/lb/wishlist")]["invalidates"] = {("GET", "/lb/wishlist")}
@@ -909,9 +1001,18 @@ class HttpProxy:
 
     def __init__(self) -> None:
         self._pools = {"default": asyncio.Semaphore(PROXY_MAX_INFLIGHT),
-                       "fast": asyncio.Semaphore(PROXY_FAST_INFLIGHT)}
+                       "fast": asyncio.Semaphore(PROXY_FAST_INFLIGHT),
+                       "sync": asyncio.Semaphore(PROXY_SYNC_INFLIGHT)}
         self._cache: dict[str, tuple[float, int, bytes, str]] = {}
-        self._cache_gen = 0
+        # One invalidation generation PER ROUTE, not one for the proxy. A read
+        # caches its answer only if its own route's generation did not move
+        # while it was upstream. A single proxy-wide counter meant any
+        # invalidation voided every read in flight: during a bulk index build
+        # lb-bot pushes `/lb/index` every 2 s, and that push (which drops only
+        # the discography cache) stopped every cacheable answer slower than
+        # 2 s from ever being cached — `/lb/album/sources` (45-150 s) and the
+        # six-hour MusicBrainz routes above all.
+        self._cache_gen: dict[tuple[str, str], int] = {}
         # Identical GETs in flight at once share one upstream call. Two devices
         # opening the same source sheet used to start two slskd searches; the
         # cache only ever helped the second caller once the first had returned.
@@ -948,14 +1049,24 @@ class HttpProxy:
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         return status, data, "application/json"
 
+    def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
+        """Hook for a subclass to react to a proxied call's raw outcome, on EVERY
+        route — not just the probe's own. No-op here; `LbProxy` overrides it for
+        B-005 (a failed call on any lb-bot route should be reflected by the next
+        `/lb/status`, not just the probe route's own next call)."""
+        return
+
     @staticmethod
     def _strip(spec: dict, status: int, data: bytes) -> bytes:
         """Drop fields the clients never render from a successful response.
 
-        Not a security control — the whitelist is that — but a bandwidth one, for
-        the case where an upstream view is shaped for a local web UI and carries a
+        Not a security control — the whitelist is that. It is a projection:
+        bandwidth (`sources.files`) and host-path hygiene (`placeFolder`/
+        `placeFile`), for an upstream view shaped for a local web UI that carries a
         payload nobody on a phone wants. Each rule is (list_key, field): the field
-        is removed from every object in that top-level list. Anything unexpected
+        is removed from every object in that list. `list_key` is a top-level key or
+        a dotted path (`"gap.tracks"`) for views nested in a POST reply; a missing
+        or non-dict intermediate leaves the rule a no-op. Anything unexpected
         (a non-200, a non-JSON body, a shape that doesn't match) passes through
         untouched, because a projection failing must never fail the request.
         """
@@ -967,7 +1078,10 @@ class HttpProxy:
             if not isinstance(payload, dict):
                 return data
             for list_key, field in rules:
-                for row in payload.get(list_key) or []:
+                node: object = payload
+                for part in list_key.split("."):
+                    node = node.get(part) if isinstance(node, dict) else None
+                for row in node if isinstance(node, list) else []:
                     if isinstance(row, dict):
                         row.pop(field, None)
             return json.dumps(payload).encode()
@@ -1001,8 +1115,12 @@ class HttpProxy:
         The generation bump is the half that matters under load: a read that went
         upstream a moment BEFORE the invalidation returns the old answer a moment
         AFTER it, and caching that would re-arm the very staleness this clears.
+        Bumped for exactly these routes: a read of any other route in flight
+        across this call has nothing stale about it and still caches.
         """
-        self._cache_gen += 1
+        for r in routes:
+            r = tuple(r)
+            self._cache_gen[r] = self._cache_gen.get(r, 0) + 1
         wanted = [list(r) for r in routes]
         dropped = 0
         for key in list(self._cache):
@@ -1096,7 +1214,10 @@ class HttpProxy:
             if hit is not None:
                 return hit
 
-        coalesce = spec["method"] == "GET" and not refresh
+        # `coalesce: False` is the index mirror's sync routes: a caller that
+        # joins a read which set off before a write gets the pre-write answer.
+        coalesce = (spec["method"] == "GET" and not refresh
+                    and spec.get("coalesce", True))
         leader = self._inflight.get(key) if coalesce else None
         if leader is not None:
             # Shielded: a follower being cancelled must not cancel the shared call.
@@ -1122,7 +1243,7 @@ class HttpProxy:
     async def _call_upstream(self, route: tuple[str, str], spec: dict,
                              upstream_path: str, params: list[tuple[str, str]],
                              body: Optional[dict], key: str) -> tuple[int, bytes, str]:
-        gen = self._cache_gen
+        gen = self._cache_gen.get(route, 0)
         url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
         if params:
@@ -1131,7 +1252,7 @@ class HttpProxy:
 
         pool = spec.get("pool", "default")
         sem = self._pools[pool]
-        queue_timeout = (PROXY_QUEUE_TIMEOUT_FAST if pool == "fast"
+        queue_timeout = (PROXY_QUEUE_TIMEOUT_FAST if pool in ("fast", "sync")
                          else spec.get("timeout", PROXY_TIMEOUT))
         try:
             await asyncio.wait_for(sem.acquire(), timeout=queue_timeout)
@@ -1140,9 +1261,7 @@ class HttpProxy:
             return (503, json.dumps({"error": f"{self.label} proxy busy",
                                      "busy": True}).encode(), "application/json")
         try:
-            status, data, ctype = await asyncio.to_thread(
-                _proxy_upstream_blocking, spec["method"], url, payload,
-                self.upstream_token, spec.get("timeout", PROXY_TIMEOUT), self.label)
+            status, data, ctype = await self._fetch(spec, upstream_path, params, payload)
         finally:
             sem.release()
 
@@ -1151,10 +1270,12 @@ class HttpProxy:
         # minute after lb-bot came back (and "reachable" for a minute after it
         # went away). Only an upstream success is worth remembering.
         upstream_status = status
+        self._note_upstream_result(upstream_status, data)
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
         data = self._strip(spec, status, data)
-        if spec.get("cache") and gen == self._cache_gen and upstream_status == 200:
+        if (spec.get("cache") and gen == self._cache_gen.get(route, 0)
+                and upstream_status == 200):
             self._cache_put(key, status, data, ctype,
                             spec.get("ttl", PROXY_CACHE_TTL))
         # A write that succeeded makes its own read stale: adding to the wishlist
@@ -1162,6 +1283,31 @@ class HttpProxy:
         if 200 <= status < 300 and spec.get("invalidates"):
             self.invalidate(set(spec["invalidates"]))
         return status, data, ctype
+
+    async def _fetch(self, spec: dict, upstream_path: str,
+                     params: list[tuple[str, str]],
+                     payload: Optional[bytes],
+                     timeout: Optional[float] = None) -> tuple[int, bytes, str]:
+        """The upstream call itself, off the event loop, plus the route's 404
+        fallback. Takes no slot: the caller holds one, or — the hub's own
+        liveness probe — deliberately does not need one. `timeout` overrides the
+        route's for the first call only; the fallback keeps the route's own."""
+        query = ("?" + urllib.parse.urlencode(params)) if params else ""
+        timeout_route = spec.get("timeout", PROXY_TIMEOUT)
+        result = await asyncio.to_thread(
+            _proxy_upstream_blocking, spec["method"], self.upstream + upstream_path + query,
+            payload, self.upstream_token,
+            timeout if timeout is not None else timeout_route, self.label)
+        if result[0] == 404 and spec.get("fallback"):
+            # The upstream is older than the route: ask the one it has. Once,
+            # and only on a 404 — a 5xx or a timeout is an answer about the
+            # service, not about the route, and retrying it would only double
+            # the wait before the client hears it.
+            result = await asyncio.to_thread(
+                _proxy_upstream_blocking, spec["method"],
+                self.upstream + spec["fallback"] + query,
+                payload, self.upstream_token, timeout_route, self.label)
+        return result
 
     async def handle(self, protocol: Any, raw_path: str,
                      headers: Any, method: str) -> Optional[tuple]:
@@ -1253,6 +1399,16 @@ class LbProxy(HttpProxy):
     label = "lbbot"
     routes = LB_ROUTES
 
+    def __init__(self) -> None:
+        super().__init__()
+        # The hub's own verdict on lb-bot, for `welcome.lb` and the `lb` frame.
+        # Moved by the 60 s probe, by every `/lb/status` answer that reached
+        # lb-bot, and to True by any authenticated inbound push — lb-bot talking
+        # to us is proof enough. Only ever through `_set_available`.
+        self.available = False
+        self._probed = asyncio.Event()
+        self._announcing: set[asyncio.Task] = set()
+
     @property
     def upstream(self) -> str:
         return LBBOT_URL
@@ -1262,24 +1418,179 @@ class LbProxy(HttpProxy):
         return ("LBBOT_URL is unset" if not LBBOT_URL
                 else "HUB_TOKEN is empty (refusing to run as an open relay)")
 
-    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
-        """`/lb/status` is the liveness probe. lb-bot has no cheap dedicated health
-        route, so it rides on `/api/summary`, and only the reachability verdict is
-        passed on — the summary itself is a large object about the Fill-gaps
-        workspace that no client renders.
+    def advertised_routes(self) -> list[str]:
+        """What this hub can actually proxy — one list, served by `/lb/status` and
+        by `welcome.lb`, so the two can never disagree about a route.
 
-        `routes` is what this hub can actually proxy. A client ships independently
-        of the hub and the hub is a long-running process, so "my client is newer
-        than the hub it is talking to" is a permanent condition, not an edge case —
-        and without this it surfaces as a button that does nothing, because a 404
-        from an unknown route is a perfectly ordinary HTTP response. Advertising
-        the list lets a client say which feature its hub is too old for.
+        A client ships independently of the hub and the hub is a long-running
+        process, so "my client is newer than the hub it is talking to" is a
+        permanent condition, not an edge case — and without this it surfaces as a
+        button that does nothing, because a 404 from an unknown route is a
+        perfectly ordinary HTTP response. Advertising the list lets a client say
+        which feature its hub is too old for.
+
+        Empty while the proxy is off: it can proxy nothing then, and that is also
+        what `/lb/status` says in `disabled_probe`, so `welcome.lb` and the probe
+        agree in that state too.
         """
+        if not self.enabled:
+            return []
+        return sorted(f"{method} {path}" for method, path in self.routes)
+
+    def disabled_probe(self, route: tuple[str, str]) -> Optional[tuple]:
+        # The base class's answer plus `routes`, so a client reads the same
+        # object from `/lb/status` and `welcome.lb` whether lb-bot is on or off.
+        spec = self.routes.get(route)
+        if spec and spec.get("probe"):
+            return _http_json(200, {"configured": False, "upstreamReachable": False,
+                                    "routes": self.advertised_routes(),
+                                    "webUrl": self.web_url()})
+        return None
+
+    def welcome_info(self) -> dict:
+        """`welcome.lb` and the `lb` frame: the probe's answer, without a client
+        having to ask for it."""
+        return {"available": bool(self.enabled and self.available),
+                "routes": self.advertised_routes(),
+                "webUrl": self.web_url()}
+
+    def web_url(self) -> str:
+        """lb-bot's web UI for a person to open, or "" while the proxy is off.
+
+        LBBOT_WEB_URL when set, else the upstream the hub itself reaches — the
+        same address on a LAN install. Only ever an http(s) URL: a client opens
+        it in a browser, so anything else is not passed on."""
+        if not self.enabled:
+            return ""
+        url = LBBOT_WEB_URL or self.upstream
+        return url if url.startswith(("http://", "https://")) else ""
+
+    def _set_available(self, value: bool) -> None:
+        """The one way the verdict moves. A CHANGE is broadcast as `t: "lb"`
+        (ruling R18): `welcome.lb` is a connect-time snapshot, and a client that
+        trusts it and stops probing would otherwise never hear lb-bot come up or
+        go away while it stays connected. An unchanged verdict sends nothing —
+        the probe runs every 60 s and most of its answers are "same as before".
+
+        Scheduled rather than awaited because `augment` and the inbound handlers
+        call this synchronously; the frame is built NOW, so two quick flips
+        still reach clients in the order they happened.
+        """
+        value = bool(value)
+        if value == self.available:
+            return
+        self.available = value
+        log(f"lbbot {'available' if value else 'UNAVAILABLE'} (hub verdict changed)")
+        hub = HUB_INSTANCE
+        if hub is None:
+            return
+        frame = {"t": "lb", **self.welcome_info()}
+        try:
+            task = asyncio.get_running_loop().create_task(hub._broadcast(frame))  # noqa: SLF001
+        except RuntimeError:  # no loop (an import-time caller): nobody to tell
+            return
+        self._announcing.add(task)
+        task.add_done_callback(self._announcing.discard)
+
+    def mark_alive(self) -> None:
+        """An authenticated inbound push from lb-bot: it is up, whatever the last
+        probe said. Only ever moves the verdict to True — the probe is what
+        notices lb-bot going away."""
+        if self.enabled:
+            self._set_available(True)
+
+    def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
+        """B-005: a proxied call that reached the hub but not lb-bot says
+        something about `/lb/status`'s cached answer. Without this, `/lb/status`
+        kept answering `upstreamReachable: true` for up to PROXY_CACHE_TTL (60 s)
+        after lb-bot died: its own cached answer from before the crash was still
+        fresh, and nothing invalidated it just because some OTHER route failed
+        meanwhile.
+
+        Only `_proxy_upstream_blocking`'s 502 `down` (connection refused /
+        unreachable) flips the hub's cross-cutting verdict at once, broadcasting
+        `t:"lb"` to every connected client, same as a probe tick. A 504 `busy`
+        (a socket op timed out) is a healthy lb-bot still working — a
+        rate-limited MusicBrainz hop, a 150 s source search — and flipping the
+        verdict on it blanked every client's lb-bot layer until the next probe
+        tick (ruling R18; the busy-vs-down split of `_proxy_upstream_blocking`
+        and `probe()`). Both drop `/lb/status`'s own cache entry, so its very
+        next call is forced upstream and answers from lb-bot, not from memory.
+
+        Checks the `down`/`busy` flag, not just the status code: a 502 also covers
+        `tooLarge` (lb-bot answered fine, its body was just oversize) — not a
+        reachability signal, and must not flip the verdict or drop the cache.
+        """
+        if upstream_status not in (502, 504):
+            return
+        try:
+            payload = json.loads(data or b"{}")
+        except Exception:  # noqa: BLE001
+            payload = {}
+        if not isinstance(payload, dict):
+            return
+        if payload.get("down"):
+            self._set_available(False)
+        elif not payload.get("busy"):
+            return
+        self.invalidate({("GET", "/lb/status")})
+
+    def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
+        """`/lb/status` is the liveness probe, and only the reachability verdict is
+        passed on — neither `/api/health`'s body nor (on an older lb-bot) the
+        summary's, a large object about the Fill-gaps workspace no client renders.
+        `routes` is `advertised_routes()`.
+        """
+        self._set_available(status == 200)
         return 200, json.dumps({
             "configured": True,
             "upstreamReachable": status == 200,
-            "routes": sorted(f"{method} {path}" for method, path in self.routes),
+            "routes": self.advertised_routes(),
+            "webUrl": self.web_url(),
         }).encode(), "application/json"
+
+    async def probe(self) -> bool:
+        """The hub's own liveness check: the `/lb/status` upstream and its 404
+        fallback, but no cache and NO pool slot. Through the default pool it would
+        queue behind four source searches and time out into a 503 — and a probe
+        that cannot tell "busy" from "down" would mark a healthy lb-bot
+        unavailable to every client that connects meanwhile."""
+        if not self.enabled:
+            self._set_available(False)
+            return False
+        spec = self.routes[("GET", "/lb/status")]
+        try:
+            status, _data, _ctype = await self._fetch(spec, spec["path"], [], None,
+                                                      timeout=LB_PROBE_TIMEOUT)
+            self._set_available(status == 200)
+        except Exception as e:  # noqa: BLE001 — a probe must never kill its loop
+            log("lbbot probe failed:", e)
+            self._set_available(False)
+        finally:
+            self._probed.set()
+        return self.available
+
+    async def probe_loop(self) -> None:
+        while True:
+            await self.probe()
+            await asyncio.sleep(LB_PROBE_INTERVAL)
+
+    async def wait_first_probe(self, timeout: float) -> None:
+        """Return once the first probe has a verdict, or after `timeout`.
+
+        A wait that expires ENDS the waiting for everyone: `_probed` is set, so
+        the next welcome goes straight out. Otherwise every handshake during a
+        hanging first probe would pay the full `timeout` again. Whatever the
+        late probe decides then reaches those clients as an `lb` frame.
+        """
+        if not self.enabled or self._probed.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._probed.wait(), timeout)
+        except asyncio.TimeoutError:
+            self._probed.set()
+            log(f"lbbot probe: no verdict within {timeout}s; welcomes say "
+                "unavailable until it answers")
 
 
 def preview_sign(track_id: str, exp: int) -> str:
@@ -1533,6 +1844,16 @@ _LB_FILL_BOOL = ("retryable", "mp3WouldHelp", "allowMp3", "cancellable", "verify
 # "try another source" re-read within the 60 s TTL got the same list back,
 # with the peer that had just failed still at the top.
 _LB_FILL_TERMINAL = ("failed", "cancelled")
+# The third inbound path: lb-bot's library index moved (the mirror's live
+# trigger). `t: "index"` rather than `library` for the same reason as `fill`, and
+# more so — during a bulk build it arrives every 2 s, and a `library` frame at
+# that rate would have every client refetch its whole library continuously.
+LB_INDEX_PATH = "/lb/index"
+# The one cache an index push drops: the discography read, the clients' fallback
+# when they have no mirror. Named so the proxy-cache test invalidates exactly
+# what the handler does.
+LB_INDEX_INVALIDATES = frozenset({("GET", "/lb/artist/discography")})
+_LB_INDEX_EPOCH_MAX = 64
 _LB_NOTIFY_STR_MAX = 200
 _LB_NOTIFY_IDS_MAX = 16
 _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"}
@@ -1620,6 +1941,60 @@ def _lb_fill_frame(payload: dict) -> Optional[dict]:
     return frame
 
 
+def _lb_index_hint(raw: Any) -> Optional[dict]:
+    """`{seq, epoch}` or None. Used on the inbound body AND on state.json's copy,
+    so a hand-edited or older file cannot put a malformed hint into `welcome`."""
+    if not isinstance(raw, dict):
+        return None
+    seq, epoch = raw.get("seq"), raw.get("epoch")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        return None
+    if not isinstance(epoch, str) or not epoch or len(epoch) > _LB_INDEX_EPOCH_MAX:
+        return None
+    return {"seq": seq, "epoch": epoch}
+
+
+async def _handle_lb_index(protocol: Any, raw_path: str, headers: Any,
+                           method: str) -> Optional[tuple]:
+    """lb-bot's index head moved: remember it and tell every client to pull.
+
+    The frame carries no rows — a client pulls `/lb/index/changes` from its own
+    cursor, so a push it missed costs nothing but latency. Deliberately does NOT
+    touch `LB_LIBRARY_ROUTES`: the one cache it drops is the discography read,
+    which is the clients' fallback path when they have no mirror.
+    """
+    path, _, _query = raw_path.partition("?")
+    if (path.rstrip("/") or "/") != LB_INDEX_PATH:
+        return None
+    if method != "POST":
+        return _http_json(405, {"error": "method not allowed"})
+
+    auth = (headers.get("Authorization") or "") if headers is not None else ""
+    supplied = auth[7:] if auth.startswith("Bearer ") else ""
+    if not TOKEN or not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+        return _http_json(401, {"error": "unauthorized"})
+    LB.mark_alive()
+
+    raw = await _read_body(protocol, headers)
+    if raw is None:
+        return _http_json(400, {"error": "request body too large or unreadable"})
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:  # noqa: BLE001
+        return _http_json(400, {"error": "malformed JSON body"})
+    hint = _lb_index_hint(payload)
+    if hint is None:
+        return _http_json(400, {"error": "index push needs an integer seq >= 0 and a "
+                                         f"non-empty epoch of at most {_LB_INDEX_EPOCH_MAX} chars"})
+
+    LB.invalidate(LB_INDEX_INVALIDATES)
+    if HUB_INSTANCE is not None:
+        HUB_INSTANCE.set_lb_index(hint)
+        await HUB_INSTANCE._broadcast({"t": "index", **hint})  # noqa: SLF001 — same module
+    dlog("LB index ->", hint)
+    return _http_json(200, {"ok": True})
+
+
 async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
                           method: str) -> Optional[tuple]:
     """Fan a fill's progress or state change out to every connected client.
@@ -1638,6 +2013,7 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
     supplied = auth[7:] if auth.startswith("Bearer ") else ""
     if not TOKEN or not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
         return _http_json(401, {"error": "unauthorized"})
+    LB.mark_alive()
 
     raw = await _read_body(protocol, headers)
     if raw is None:
@@ -1679,6 +2055,7 @@ async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
     supplied = auth[7:] if auth.startswith("Bearer ") else ""
     if not TOKEN or not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
         return _http_json(401, {"error": "unauthorized"})
+    LB.mark_alive()
 
     raw = await _read_body(protocol, headers)
     if raw is None:
@@ -1741,6 +2118,11 @@ class Hub:
         # explicit act; nothing republishes it, so there is no race to arbitrate and
         # union-merge has nothing to merge.
         self.mixes: dict[str, dict] = {}
+        # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
+        # A HINT only: a client pulls on every welcome whatever it says, because
+        # a push missed while the hub was down would leave this stale.
+        self.lb_index: Optional[dict] = None
+        self._last_lb_index_save_at = 0.0
         self._last_sq_progress_at = 0.0  # throttle the current record's cursor writes
         self._last_position_save_at = 0.0  # throttle position-only state persistence
         self._last_progress_sent = 0.0
@@ -1816,6 +2198,9 @@ class Hub:
                 clean = self._sanitize_mix(raw_mix)
                 if clean is not None:
                     self.mixes[clean["id"]] = clean
+            # Additive like `mixes`: a state.json from before the index mirror
+            # simply has no hint, and welcome omits the field until lb-bot pushes.
+            self.lb_index = _lb_index_hint(data.get("lbIndex"))
             for rid, at in (data.get("deletedSavedQueues") or {}).items():
                 try:
                     self.deleted_saved_queues[rid] = int(at)
@@ -1888,6 +2273,7 @@ class Hub:
                 "savedQueues": self._saved_queues_list(),
                 "deletedSavedQueues": self.deleted_saved_queues,
                 "mixes": self._mixes_list(),
+                "lbIndex": self.lb_index,
                 "devices": [
                     {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
                      "volume": d.volume, "lastSeen": d.last_seen}
@@ -1901,6 +2287,17 @@ class Hub:
             os.replace(tmp, STATE_PATH)
         except Exception as e:  # noqa: BLE001
             log("failed to save state:", e)
+
+    def set_lb_index(self, hint: dict) -> None:
+        """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE).
+        A new epoch is written at once: that is the change a restarted hub must
+        not forget, since it is what tells a client its whole mirror is void."""
+        new_epoch = self.lb_index is None or self.lb_index.get("epoch") != hint["epoch"]
+        self.lb_index = dict(hint)
+        now = time.monotonic()
+        if new_epoch or now - self._last_lb_index_save_at >= LB_INDEX_SAVE_THROTTLE:
+            self._last_lb_index_save_at = now
+            self._save()
 
     # ----- send helpers ---------------------------------------------------- #
     async def _send(self, dev: Optional[Device], obj: dict) -> None:
@@ -2068,6 +2465,64 @@ class Hub:
             self.session.saved_queue_id = None
         return (existed or detached or first_time, detached)
 
+    # Query params that mark a URL as carrying Subsonic (or plain-password) login,
+    # rather than a public asset address — checked by param, not host, so a
+    # self-hosted Navidrome under any domain is caught and a public cover (Cover
+    # Art Archive, etc.) is never mistaken for one just because of where it lives.
+    _CREDENTIAL_PARAMS = frozenset({"u", "t", "s", "p", "apikey"})
+
+    @classmethod
+    def _has_credential_params(cls, url: Any) -> bool:
+        if not isinstance(url, str) or not url:
+            return False
+        try:
+            keys = {k.lower() for k, _ in urllib.parse.parse_qsl(
+                urllib.parse.urlsplit(url).query)}
+        except ValueError:
+            return True  # unparsable: don't trust it either
+        return bool(keys & cls._CREDENTIAL_PARAMS)
+
+    @classmethod
+    def _strip_credentialed_cover(cls, url: Optional[str]) -> Optional[str]:
+        """Drop a record-level `coverImageUrl` if it carries Subsonic login (B-003,
+        second half). Unlike a song's `imageUrl` this has no `ext:` id to key an
+        exception on — the queue's cover is stamped from whichever track was first
+        at birth, ordinary or preview — so the public/credentialed split is made by
+        inspecting the URL itself instead.
+        """
+        return None if cls._has_credential_params(url) else url
+
+    @classmethod
+    def _scrub_history_song(cls, song: dict) -> dict:
+        """Drop a track's credentialed Subsonic `streamUrl` AND `imageUrl` before it
+        enters PERSISTED history (state.json / the `savedQueues` broadcast). The live
+        queue keeps both — a cast bridge fetches `streamUrl` verbatim, and nothing
+        needs `imageUrl` scrubbed there either (B-003) — this only touches the copy
+        that lands in `self.saved_queues`.
+
+        A preview (`ext:`) track keeps both fields: `streamUrl` is a short-lived
+        signed capability minted by `preview_sign`, not a standing Subsonic
+        credential, and is the ONLY thing that makes a preview replayable — there's
+        no Navidrome id to re-derive it from; `imageUrl` is a public Cover Art
+        Archive URL, not a Subsonic address, and is likewise the only source for a
+        preview's art (HubManager.remoteTrackToDomainSong's documented exception to
+        "never adopt a RemoteTrack.imageUrl"). Both clients re-resolve an ordinary
+        track's stream URL AND cover from its id on restore anyway — Feishin never
+        renders a saved-queue song's `imageUrl`/a record's `coverImageUrl` as `src`,
+        always rebuilding art from the resume track's id with its own credentials
+        (`saved-queue-format.ts` `savedQueueCoverSongId`, `saved-queues-route.tsx`);
+        Navic does the same and says so explicitly (`HubManager.applySavedQueues`:
+        "the record's own coverImageUrl stays ignored: it's the other client's
+        authed URL"). So nothing the restore path needs is lost by dropping either
+        field for an ordinary track.
+        """
+        if "streamUrl" not in song and "imageUrl" not in song:
+            return song
+        sid = song.get("id")
+        if isinstance(sid, str) and sid.startswith("ext:"):
+            return song
+        return {k: v for k, v in song.items() if k not in ("streamUrl", "imageUrl")}
+
     def _upsert_saved_queue(self, rid: str, kind: str, name: Optional[str],
                             server_id: Optional[str] = None,
                             cover_image_url: Optional[str] = None) -> None:
@@ -2092,12 +2547,15 @@ class Hub:
         kind_final = (prev or {}).get("sourceKind") or kind or "manual"
         name_final = (prev or {}).get("sourceName") or name
         # Same rule for the card art: frozen at the queue's origin, so it doesn't
-        # change as playback moves through the queue.
-        cover_final = (prev or {}).get("coverImageUrl") or cover_image_url
+        # change as playback moves through the queue. Scrubbed for the same reason
+        # as a song's imageUrl (B-003) — `prev`'s copy was already scrubbed when it
+        # was first stored, so only a freshly-supplied cover needs checking here.
+        cover_final = (prev or {}).get("coverImageUrl") or \
+            self._strip_credentialed_cover(cover_image_url)
         self.saved_queues[rid] = {
             "id": rid,
             "serverId": server_id if server_id is not None else (prev or {}).get("serverId"),
-            "songs": list(s.queue),
+            "songs": [self._scrub_history_song(t) for t in s.queue],
             "songCount": len(s.queue),
             "currentIndex": s.index,
             "positionMs": s.position_ms,
@@ -2126,7 +2584,7 @@ class Hub:
         if rec is None:
             self._upsert_saved_queue(rid, s.source_kind, s.source_name)
             return
-        rec["songs"] = list(s.queue)
+        rec["songs"] = [self._scrub_history_song(t) for t in s.queue]
         rec["songCount"] = len(s.queue)
         rec["currentIndex"] = s.index
         rec["positionMs"] = s.position_ms
@@ -2169,8 +2627,12 @@ class Hub:
         songs_raw = raw.get("songs")
         if not rid or not isinstance(songs_raw, list) or not songs_raw:
             return None
+        # Scrubbed here too: this path also re-sanitises `_load()`'s state.json read, so
+        # a file an older build wrote with credentials in history gets cleaned on load
+        # (B-003's migration — cheap because every persisted record already flows
+        # through here).
         songs = [
-            {k: t[k] for k in cls.SQ_TRACK_FIELDS if k in t}
+            cls._scrub_history_song({k: t[k] for k in cls.SQ_TRACK_FIELDS if k in t})
             for t in songs_raw[:songs_max] if isinstance(t, dict)
         ]
         if not songs:
@@ -2192,6 +2654,8 @@ class Hub:
         # filled, an established value can't be blanked" rule reads naturally.
         for k in ("serverId", "sourceName", "coverImageUrl", "name", "shuffleMode"):
             v = _as_str(raw.get(k))
+            if k == "coverImageUrl":
+                v = cls._strip_credentialed_cover(v)
             if v is not None:
                 rec[k] = v
         return rec
@@ -2542,15 +3006,24 @@ class Hub:
                 await self._close(ws, 4001, "auth")
                 return
 
+            # Before registering, so a device is never half-announced while its
+            # welcome waits. A no-op once the hub's first lb-bot probe is in.
+            await LB.wait_first_probe(LB_PROBE_STARTUP_WAIT)
             dev = await self._register(msg.get("device", {}), ws)
-            await self._send(dev, {
+            welcome = {
                 "t": "welcome",
                 "deviceId": dev.id,
                 "session": self.session.snapshot(),
                 "savedQueues": self._saved_queues_list(),
                 "mixes": self._mixes_list(),
                 "devices": [d.info(self.session.active_device_id) for d in self.devices.values()],
-            })
+                # lb-bot's availability and the routes this hub proxies — the
+                # `/lb/status` answer, delivered without a client awaiting it.
+                "lb": LB.welcome_info(),
+            }
+            if self.lb_index is not None:
+                welcome["lbIndex"] = dict(self.lb_index)
+            await self._send(dev, welcome)
             await self._broadcast_devices()
             log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}")
 
@@ -3345,14 +3818,18 @@ def _build_proxy_protocol() -> Optional[type]:
             return path, headers
 
         async def process_request(self, path, request_headers):  # type: ignore[override]
-            # Checked ahead of the proxies: /lb/notify and /lb/fill sit under
-            # the lb prefix but are inbound, so LbProxy would 404 them against
-            # its route table.
+            # Checked ahead of the proxies: /lb/notify, /lb/fill and /lb/index
+            # sit under the lb prefix but are inbound, so LbProxy would 404 them
+            # against its route table. (/lb/index matches only exactly, so the
+            # proxied /lb/index/changes and /lb/index/keys fall through.)
             result = await _handle_lb_notify(self, path, request_headers,
                                              self.http_method)
             if result is None:
                 result = await _handle_lb_fill(self, path, request_headers,
                                                self.http_method)
+            if result is None:
+                result = await _handle_lb_index(self, path, request_headers,
+                                                self.http_method)
             if result is None:
                 for proxy in PROXIES:
                     result = await proxy.handle(self, path, request_headers,
@@ -3492,6 +3969,8 @@ async def main() -> None:
         serve_kwargs["create_protocol"] = proxy_protocol
 
     sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
+    # The hub's own lb-bot probe, for `welcome.lb` (see LB_PROBE_STARTUP_WAIT).
+    lb_probe = asyncio.create_task(LB.probe_loop()) if LB.enabled else None
     # `open_timeout` is the WebSocket *handshake* deadline, and it defaults to 10s
     # -- but the HTTP proxies answer from inside `process_request`, which runs
     # during that handshake. So a proxied request slower than the handshake
@@ -3513,6 +3992,8 @@ async def main() -> None:
         await stop  # run until a stop signal arrives
 
     sweep.cancel()
+    if lb_probe is not None:
+        lb_probe.cancel()
 
     health_server.close()
     await health_server.wait_closed()

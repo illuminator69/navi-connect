@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 
-from test_edits import TOKEN, Client
+from test_edits import TOKEN, Client, _free_port
 
 HUB_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -48,7 +48,7 @@ def mix(client, mid):
 def spawn(port, state):
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state,
-           "HUB_HOST": "127.0.0.1", "HUB_HEALTH_PORT": str(port + 1)}
+           "HUB_HOST": "127.0.0.1", "HUB_HEALTH_PORT": str(_free_port())}
     return subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR)
 
 
@@ -62,9 +62,9 @@ def stop(hub):
 
 async def test_crud_and_touch():
     """Cases 1-5."""
-    port, failures = 4812, []
+    port, failures = _free_port(), []
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    url = f"ws://localhost:{port}"
+    url = f"ws://127.0.0.1:{port}"
     hub = spawn(port, state)
     try:
         await asyncio.sleep(1.2)
@@ -166,9 +166,9 @@ async def test_crud_and_touch():
 async def test_cap_and_persistence():
     """Cases 6-7."""
     import hub as hubmod  # for MIXES_MAX, rather than hard-coding 30 here
-    port, failures = 4814, []
+    port, failures = _free_port(), []
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    url = f"ws://localhost:{port}"
+    url = f"ws://127.0.0.1:{port}"
     cap = hubmod.MIXES_MAX
     hub = spawn(port, state)
     try:

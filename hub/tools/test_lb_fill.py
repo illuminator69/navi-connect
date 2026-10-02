@@ -73,7 +73,7 @@ async def run() -> list[str]:
     hub.LB._cache.clear()
     hub.LB._cache_put(key_for(disco, "/api/artist/discography?nd_id=a1"), 200, b"{}", "application/json")
     hub.LB._cache_put(key_for(sources, "/api/album/sources?rgid=r"), 200, b"{}", "application/json")
-    gen_before = hub.LB._cache_gen
+    gen_before = dict(hub.LB._cache_gen)   # per-route generations (final-review I1)
 
     # 1. progress: nothing invalidated, frame typed and bounded
     status, _h, _b = await push({

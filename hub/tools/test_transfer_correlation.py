@@ -27,15 +27,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 
 import websockets
 
-PORT = 4795
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
 TOKEN = "test-token"
-URL = f"ws://localhost:{PORT}"
+URL = f"ws://127.0.0.1:{PORT}"
 
 V2 = ["receiver", "controller", "loadAck", "transferAckV2"]
 
@@ -118,7 +126,8 @@ TRACKS = [{"id": f"t{i}", "title": f"T{i}", "streamUrl": f"http://x/{i}"} for i 
 async def main():
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
-           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1"}
+           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
+           "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
                            cwd=os.path.join(os.path.dirname(__file__), ".."))
     failures = []
