@@ -79,7 +79,9 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                  "session": <Session>, "devices": [<DeviceInfo>...],
-                 "savedQueues": [<SavedQueue>...] }   // §8.3
+                 "savedQueues": [<SavedQueue>...],    // §8.3
+                 "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
+                 "lbIndex": { "seq":42, "epoch":"1-…" } }              // §15.3, once heard
 ```
 
 - Bad/missing `token` → hub sends `{ "t":"error", "code":"auth", ... }` and closes.
@@ -281,6 +283,8 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `mixes` | `{ mixes:[<Mix>...] }` | "Mixed for You" recipes changed (§17); also in `welcome` |
 | `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
 | `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
+| `index` | `{ seq, epoch }` | lb-bot's library-index head moved (§15.3). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
+| `lb` | `{ available, routes, webUrl }` — the same object as `welcome.lb` | the hub's verdict on lb-bot's availability **changed** (§15.3). Clients apply it exactly like `welcome.lb` |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
@@ -534,8 +538,30 @@ so every client shows the *same* list and the *same* current-vs-previous distinc
   rebroadcast, so a bad value would outlive the frame that carried it. `syncSavedQueues`
   accepts at most 20 records per frame (accepting more let one reconnecting device evict a
   history another device was looking at); each record is capped at 1000 tracks; each track is
-  whitelisted to the §4.1 fields; and `currentIndex`/`positionMs`/`createdAt`/`updatedAt` are
-  coerced to integers with `currentIndex` clamped into the track list.
+  whitelisted to the §4.1 fields plus `imageUrl`, `streamUrl` and `mime` (the hub's
+  `SQ_TRACK_FIELDS`), with `streamUrl` then dropped as below; and
+  `currentIndex`/`positionMs`/`createdAt`/`updatedAt` are coerced to integers with
+  `currentIndex` clamped into the track list.
+- **History carries no credentialed `streamUrl` or cover-art URL.** An ordinary
+  track's `streamUrl` and `imageUrl`, and a record's `coverImageUrl`, are Subsonic URLs with
+  the publishing client's salted-token (or plain-password) credentials in their query, and
+  history is persisted and broadcast to every device. So every track that enters a saved
+  queue, from `setQueue`/`enqueue`/edits and from `syncSavedQueues` alike, **loses its
+  `streamUrl` and `imageUrl`**, and a record's `coverImageUrl` is dropped the same way (by
+  detecting Subsonic-style credential params — `u`/`t`/`s`/`p`/`apiKey` — in the query string,
+  not by host, so a self-hosted Navidrome under any domain is caught and a public cover
+  survives). The one exception is an `ext:` preview track (§16.2): both its `streamUrl` (a
+  short-lived signed capability, not a credential, and the only way to play it) and its
+  `imageUrl` (a public Cover Art Archive URL, not a Subsonic address, and the only source for
+  its art) survive untouched. **Clients must rebuild an ordinary track's stream URL and cover
+  art from its `id`** on restore (`getSongDetail`/their own stream-URL and cover-art
+  builders), never expect either in a `SavedQueue.songs` entry or a record's `coverImageUrl`
+  — both clients already do this unconditionally for every saved-queue card, own or peer's,
+  since a peer's authed URL points at *its* server with *its* credentials and cannot be
+  rendered here regardless. The live session queue is untouched: `do:load` is built from
+  `s.queue`, which still carries each track's `streamUrl`/`imageUrl` for a cast bridge
+  (§12.2). A state file written by an older hub is scrubbed in memory when it loads; the copy
+  on disk keeps the old URLs until the hub's next state save rewrites it.
 - **Deletions are tombstoned:** `deleteSavedQueue`/`deleteSavedQueues` remember the id
   (capped, persisted) **whether or not the hub currently holds the record** — a client can
   delete a row it captured offline before the hub ever merged it. A tombstoned id is then
@@ -549,11 +575,17 @@ so every client shows the *same* list and the *same* current-vs-previous distinc
   born and are not clobbered by later re-publishes — but a **null is not an established
   value**: a later publish carrying a real value backfills it (clients often publish the
   queue before the collection metadata resolves). Nothing about a record's identity tracks
-  playback, so a card never renames or re-skins itself as the queue advances. A client that
-  renders card art **by song id** rather than from `coverImageUrl` (Navic does, because a
-  peer's cover URL carries that peer's server and auth) must therefore use the record's
-  **birth** track — its first — not its resume track, or one shared record shows different
-  art on each client.
+  playback, so a card's origin name never changes as the queue advances. **Its art does:
+  a card shows the resume track** — `songs[currentIndex]`, rendered **by song id** with the
+  client's own credentials (a peer's `coverImageUrl` carries that peer's server and auth),
+  and its title is that track's unless the user named the queue. Every client derives both
+  from the record's own cursor, so one shared record still looks the same everywhere;
+  `coverImageUrl` is only a fallback. (Until 2026-09-30 the art was the **birth** track,
+  which read as a thumbnail always a track behind the song playing.)
+  Records are broadcast only when a queue is edited, and the hub touches the live record's
+  cursor at most every `SQ_PROGRESS_THROTTLE` (5 s), so a client keeps **the live session's
+  record** on the session's own `index` from `session`/`progress` frames, checked against
+  the session queue by track id, and re-applies it after each `savedQueues` merge.
 - **Identity is a session, not a track list.** A client mints a new `savedQueueId` only
   when the user starts playing something new (an album/playlist/radio/journey/Mood Flow
   play, a `Play.NOW`, or a restore — which reuses the restored record's id). Every edit to
@@ -800,10 +832,24 @@ delete-file, trash and prefs routes.
 Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 `/lb/*` answers `503` — except `/lb/status`, which answers `{"configured": false}`.
 
+`/lb/status`, `welcome.lb` and the `lb` frame all carry **`webUrl`**: where a
+*person* opens lb-bot's own web UI, so a client screen that has to hand the user
+over to lb-bot's workspace (Fill gaps with nothing left to pick) can link straight
+to it, e.g. `webUrl + "/#/gaps/" + groupId`. It is `LBBOT_WEB_URL` when set, else
+`LBBOT_URL` (the same address on a LAN install); `""` while the proxy is disabled,
+and never anything but an `http(s)` URL. It is only a link. Nothing is proxied
+through it, and it grants nothing: lb-bot has no auth, so whoever can reach that
+address can already use it. With the default, the link works only on the LAN;
+set `LBBOT_WEB_URL` to a reachable hostname for away-from-home use. Clients
+validate it again (http(s) only) and hide the link when it is empty. Added
+2026-09-24; an older hub omits it and clients treat that as `""`.
+
 | Hub route | Upstream | Forwarded | Cache |
 |---|---|---|---|
-| `GET /lb/status` | `GET /api/summary` | — | 60 s |
-| `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s (cleared by `/lb/notify`) |
+| `GET /lb/status` | `GET /api/health` (on a 404, once more on `GET /api/summary`) | — | 60 s |
+| `GET /lb/index/changes` | `GET /api/index/changes` | `since`, `epoch` | **never**, and never coalesced (sync pool, §15.3) |
+| `GET /lb/index/keys` | `GET /api/index/keys` | — | **never**, and never coalesced (sync pool, §15.3) |
+| `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s (cleared by `/lb/notify` and by `/lb/index`) |
 | `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
 | `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external`, `title`, `artist`, `type`, `year` | — |
 | `GET /lb/fresh-releases` | same | `days`, `limit` | 60 s |
@@ -839,14 +885,15 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 
 No upstream token is injected — lb-bot has none to inject.
 
-**Two slot pools.** Every route above shares `PROXY_MAX_INFLIGHT` (4) upstream slots
+**Three slot pools.** Every route above shares `PROXY_MAX_INFLIGHT` (4) upstream slots
 per proxy, first come first served — except the five marked *fast pool*, which have
-two slots of their own. A status poll used to queue behind four `album/sources`
+two slots of their own (`PROXY_FAST_INFLIGHT`), and the two marked *sync pool*, which
+have one (`PROXY_SYNC_INFLIGHT`, §15.3). A status poll used to queue behind four `album/sources`
 fan-outs (150 s each) until the handshake deadline dropped its socket with no
 answer at all. Waiting for a slot times out (`PROXY_QUEUE_TIMEOUT_FAST`, 10 s on the
-fast pool; the route's own timeout on the default one) into `503 {"error": …,
+fast and sync pools; the route's own timeout on the default one) into `503 {"error": …,
 "busy": true}` rather than a dropped connection; identical `GET`s in flight share
-one upstream call; a timed-out upstream is `504 {"busy": true}` and a refused one
+one upstream call (except the two sync routes, whose spec says `coalesce: False`); a timed-out upstream is `504 {"busy": true}` and a refused one
 `502 {"down": true}`, so a client can say which. `POST /lb/wishlist`,
 `/lb/wishlist/remove` and `/lb/artist/release` invalidate their own cached reads on
 success — `/lb/notify` covers a landing, not the user's own action.
@@ -873,12 +920,15 @@ row that opens the album, never as a download; a stale badge there is the
 "the tile said the library holds it and the tap opened the download page" bug
 that the Fresh tab and the similar-albums shelf have each paid for once.
 
-**The Deezer rows and `/lb/artist/related` are cached long and invalidated
-anyway**, which looks contradictory and is not. Their *content* — a chart, an
-editorial selection, a similarity list — barely moves, so six hours is right.
-What moves is the ownership marking on each row, and a six-hour-old "you don't
-own this" badge outlives the fill that makes it false; a stale badge is a tile
-that offers to fetch a record already on disk. `/lb/wishlist` is in the
+**The Deezer rows are cached long and invalidated anyway**, which looks
+contradictory and is not. Their *content* — a chart, an editorial selection —
+barely moves, so six hours is right. What moves is the ownership marking on each
+row, and a six-hour-old "you don't own this" badge outlives the fill that makes it
+false; a stale badge is a tile that offers to fetch a record already on disk.
+`/lb/artist/related` is in the same invalidation set but is **not** cached long:
+it keeps the 60 s default, like its sibling `/lb/artist/similar` and for the same
+reason (the expensive half is cached upstream, the marking is recomputed per call).
+`/lb/wishlist` is in the
 invalidation set for the opposite reason: a landing is precisely what takes a row
 *off* it, so the whole list is what the fill falsifies.
 
@@ -914,7 +964,10 @@ every other caller reads untouched, for the full six hours.
 a different pipeline from `album/download`, which acquires a release it lacks
 entirely. Every route is scoped to one review group, and the client always has
 that id already: lb-bot's discography scan *builds* the review group as it
-classifies a release `incomplete`, and emits its `group_id` on the row. `auto`
+classifies a release `incomplete`, and emits its `group_id` on the row. That holds
+for every scan — manual build, per-artist scan and lb-bot's background auto-index
+worker alike — so a `group_id` on a row from the index feed (§15.3) resolves here
+too. `auto`
 searches, ranks and enqueues in one shot; `fetch` queues a hand-picked source by
 its index in the `sources` list; `rescan` re-reads the album from Navidrome and
 walks its folder, so it gets the 45 s timeout.
@@ -962,12 +1015,35 @@ folder, which clients must say rather than imply otherwise.
 **`GET /lb/gap` is projected.** Its upstream embeds every ranked source's entire
 peer file listing, ten sources to a page: hundreds of KB on a path a phone polls
 every 5 s, into a cache bounded by entry count rather than bytes. The hub strips
-`sources[].files` and `sources[].filesTruncated` (`spec["strip"]`), keeping the
-per-source summaries the pickers actually render — peer, format, bitrate,
-coverage, risk flags, score. This is a bandwidth control, not a security one (the
-whitelist is that), but it also keeps other people's file paths off the device. A
-non-200, a non-JSON body or an unexpected shape passes through untouched: a
-projection must never fail a request.
+`sources[].files`, `sources[].filesTruncated`, `tracks[].placeFolder` and
+`tracks[].placeFile` (`spec["strip"]`), keeping the per-source summaries the
+pickers actually render — peer, format, bitrate, coverage, risk flags, score.
+`placeFolder`/`placeFile` are lb-bot HOST paths (an absolute `/downloads/<folder>`
+path and a peer's raw filename) that only lb-bot's own SPA needs, reading them
+directly rather than through the hub. It is a projection with two reasons —
+bandwidth (`sources[].files`) and host-path hygiene (`placeFolder`/`placeFile`)
+— not an access control (the whitelist is that). A non-200, a non-JSON body or an
+unexpected shape passes through untouched: a projection must never fail a request.
+
+**The same two fields are stripped a second time, lb-bot-side, on the poll.**
+`GET /lb/gap` is one read of one group; both clients also poll `GET /lb/fills`
+(`?release_mbids=&group_ids=`) every 30 s for everything they are watching, and
+until 2026-09-28 lb-bot's own `_fills_view` answered each gap with
+`frame.pop("summary")` — the full `_gap_detail_view` minus `sources`, with
+`placeFolder`/`placeFile` still on every track — so the two fields reached
+devices unstripped on the most-polled route even though the hub was already
+scrubbing the far less-polled single-group read. `_fills_view` now drops them
+from every track of a gap summary before answering (a copy, not the same dicts
+`GET /api/gaps/<id>` — lb-bot's own SPA's route — hands back with them intact).
+**The POST replies that echo a gap are projected too** (since 2026-10-02).
+`/lb/gap/fetch` (both its success and `alreadyActive` replies),
+`/lb/gap/auto`, `/lb/gap/cancel`, `/lb/gap/rescan` and `/lb/album/allow-mp3`
+nest the gap view under `gap`; their `strip` rules are the `GET /lb/gap` rules
+with a `gap.` prefix (`_strip` walks a dotted key), derived from the same tuple so
+the two cannot drift. No client reads `gap` from these replies — they read `ok`,
+`error`, `alreadyActive` — so the projection removes nothing anyone renders. Still
+unstripped, as for every route: an error body (a failed fetch is a 400 whose
+`nextSource` carries a peer's filenames) — the projection only touches a 200.
 
 **`album/status` says what kind of failure it was.** Alongside the free-text
 `reason` — which stays verbatim, because "103 peers offered 2,047 files, but none
@@ -1059,6 +1135,15 @@ album page sends, so the two share a cache entry and a page that rendered cannot
 fail to index. `GET /lb/album/releases` returns `primaryType` and `year`
 alongside `title`/`artist` so a client has the override to hand.)
 
+**It can refuse with `409 {"error", "code": "artist_conflict", "artistKey"}`.**
+Navidrome keys artists by name, so an `mbid` plus a same-name library
+artist's `nd_id` used to file the release under the *wrong* artist's discography.
+lb-bot now answers 409 when the artist MBID the caller named (`mbid`, or the MBID
+inside an `mb:` `nd_id`) disagrees with the MBID already on record for the artist
+row it would file under; `artistKey` is that row's key. A row with no MBID on
+record is not a conflict. The hub passes the 409 through unchanged. It is a
+refusal, not a transient failure: retrying the same body gets the same answer.
+
 **`album/releases` also names the artist's MBID (`artistMbid`).** It always
 fetched the release-group with `inc=artist-credits` to build the display credit
 and dropped the id sitting in the same payload, which mattered because of where
@@ -1070,14 +1155,17 @@ on somebody, the display credit still carries the whole thing, and the lead
 credit is the only defensible answer for a collaboration. Additive, and costs no
 MusicBrainz request.
 
-**A discography read backfills the Navidrome album ids of `present` rows.**
+**lb-bot backfills the Navidrome album ids of `present` rows.**
 Placement can only flip a row to `present`; nothing on that path knows the album
 ids, and only a full rescan otherwise filled them in. But a `present` row counts
 as owned, so a filled album badged "in library" carried `navidrome_album_ids:
 []` — and every "open the real album" path in both clients reads exactly that.
-`GET /lb/artist/discography` now resolves those rows against the cached Navidrome
-album index by normalized title within the artist (no MusicBrainz) and persists
-what it finds. A row that matches nothing keeps its ids empty and stays
+lb-bot resolves those rows against the cached Navidrome album index by normalized
+title within the artist (no MusicBrainz) and persists what it finds. Until
+2026-09-24 it did so on every `GET /lb/artist/discography`; it now runs right after
+`albumIndexed` for that artist and from a 300 s sweep, so the read is pure SQLite
+and the ids reach the §15.3 mirrors through the feed like any other write. A row
+that matches nothing keeps its ids empty and stays
 `present`: Navidrome may genuinely not have scanned yet, which is what Navic's
 `pendingSync` state is for.
 
@@ -1143,12 +1231,41 @@ asked for, and the per-file `matchedTo` rows are the evidence being judged;
 `_source_files_view` already caps the list upstream. Different cost profile from a
 5-second poll, deliberately different rule.
 
-**Probe.** `GET /lb/status` always returns `200` with just the verdict — lb-bot has
-no cheap health route, so this rides on `/api/summary`, whose body (a large object
-about the Fill-gaps workspace) is deliberately **not** passed through:
+**`artistVerified` on source rows.** Every source row, on
+`album/sources` and in `/lb/gap`'s `sources`, may carry `artistVerified`:
+whether lb-bot found evidence in the folder that it is the right *artist*, not
+just a matching title. **A missing field means verified** (an lb-bot older than
+the field, and every row that has the evidence). Both clients read it the same
+way:
+
+- A row with `artistVerified: false` is labelled **"Artist unverified"**.
+- The picker **never preselects** an unverified row. When every row is
+  unverified, nothing is preselected and the user must choose.
+- **One-tap acquire never takes an unverified source** (Feishin
+  `useAcquireAlbum`, Navic `LbBotManager.acquire`): it answers "needs review" and
+  the user picks, whatever else the top row says. lb-bot's own `recommended` is
+  already only true on a verified rank 1, and `album/sources` adds `verifiedCount`.
+- A user's explicit pick of an unverified row is consent, for that source only.
+  lb-bot's unattended paths (gap Auto, failover to another source) never pick one
+  themselves.
+
+**Probe.** `GET /lb/status` always returns `200` with just the verdict. Its upstream
+is lb-bot's `GET /api/health` (`{ok, epoch, headSeq}`, no Navidrome and no
+MusicBrainz behind it). Its `headSeq` is the head lb-bot has already **recorded** in
+its high-water mark for that epoch (0 before one is), never a higher live one, and
+it answers `200` even when that record cannot be written: a disk fault that only
+affects the index mirror must not read as lb-bot down (the feed routes keep their
+`503`, §15.3). An lb-bot older than that route answers it `404`, and the
+hub then asks `/api/summary` once instead (the route spec's `fallback`) — a hub
+deployed before its lb-bot must not report a healthy lb-bot down. Neither body is
+passed through; the summary in particular is a large object about the Fill-gaps
+workspace. Every `/lb/status` read that went upstream (a cache hit does not) also
+sets the hub's own availability verdict, which `welcome.lb` and the `lb` frame
+carry (§15.3):
 
 ```json
-{ "configured": true, "upstreamReachable": true, "routes": ["GET /lb/gap", "…"] }
+{ "configured": true, "upstreamReachable": true, "routes": ["GET /lb/gap", "…"],
+  "webUrl": "http://…:8899" }
 ```
 
 `routes` is every route this hub can proxy. Clients ship independently of the hub
@@ -1176,16 +1293,24 @@ empty list as "assume supported".
   needed by nobody: a client only ever acts on a group whose id arrived on a
   discography row. The per-group routes above are whitelisted; the list is not.
 - **The placement / match workspace**, `/api/gaps/<id>/duplicate-files`, prefs,
-  delete-file, trash and the beets import paths. When a gap fill ends in
-  `picking` *with no sources*, lb-bot wants a human decision in its own web UI —
-  the clients say so and stop, rather than growing a second copy of that
-  workspace. `picking` *with* sources is the ordinary "your move" of the picker
-  above and must not be worded as a hand-off.
+  delete-file, trash and the beets import paths. `picking` *with no sources* is
+  three different cases, and only the first is a hand-off: **a pending match**
+  (lb-bot's `needs_match` bucket — some track reads `downloaded`) is a decision
+  only lb-bot's own match workspace can take, so the clients say so, point there
+  and stop, rather than growing a second copy of that workspace; **a search that
+  found nothing** (`noSourceReason` set) shows lb-bot's reason and offers a search
+  again; **sources that aged out** (neither — the tracks were picked by a search
+  whose results lb-bot no longer holds) say so and offer a search again.
+  `picking` *with* sources is the ordinary "your move" of the picker above and
+  must not be worded as a hand-off.
 
 ### 15.1 `POST /lb/notify` and `POST /lb/fill` — the two inbound routes
 
 Everything else under `/lb/*` is the hub calling lb-bot. These are lb-bot calling
-the hub. **`/lb/notify`**: when a fill is placed into the library, lb-bot POSTs
+the hub. (A third inbound route, `POST /lb/index`, carries the index head rather
+than a library or ledger event; it is specified with the mirror in §15.3, and the
+auth and "answered whether or not `LBBOT_URL` is set" rules below apply to it
+too.) **`/lb/notify`**: when a fill is placed into the library, lb-bot POSTs
 `{event, release_mbid, rgid, artist, album}` and the hub rebuilds it, field by
 field, into a `library` broadcast (§5.4) to every connected device.
 **`/lb/fill`**: when a fill's ledger row moves — any state transition, and transfer
@@ -1211,7 +1336,11 @@ poll answer to the **same** apply function, so push cannot disagree with poll.
   404 it against its outbound route table.
 - Bearer-authed like every other route, so any device token can send one. That is
   fine: the frame carries no authority, it only tells clients to re-read what they
-  can already read.
+  can already read. One side effect to know: since 2026-09-24 an authenticated
+  call to any of the three inbound routes also marks lb-bot **available** in the
+  hub's verdict (only ever towards true — a push is proof lb-bot is up), so a
+  device posting here can flip `welcome.lb.available` to true, and broadcast one
+  `lb` frame, until the next 60 s probe says otherwise (§15.3).
 
 **Three `library` events.** `albumPlaced` is sent at placement, *before* Navidrome's scan — a
 client re-reading the library then mostly sees it as it was. `albumIndexed` is sent
@@ -1226,9 +1355,10 @@ in it (it polls every 2 s for the first minute, then every 30 s). Only that even
 **The hub clears its cached lb-bot answers before broadcasting a `library` frame**
 (the nine routes in `LB_LIBRARY_ROUTES`: discography, fresh-releases, status, the
 two lookups' ownership-marked one, `artist/similar`, `artist/related`, the two
-Deezer rows and the wishlist; the long-TTL MusicBrainz routes are left alone), and bumps a
-cache generation so a read already in flight cannot write its pre-landing answer
-back. Without that, every client's re-read was served the hub's own 60 s old copy.
+Deezer rows and the wishlist; the long-TTL MusicBrainz routes are left alone), and bumps
+those routes' cache generations so a read already in flight cannot write its
+pre-landing answer back. Generations are **per route**: an invalidation voids only
+in-flight reads of the routes it names, and a read of any other route still caches. Without that, every client's re-read was served the hub's own 60 s old copy.
 
 Clients: Feishin re-reads the discography on either event, re-reads its Navidrome
 album/album-artist queries on `albumIndexed` (on `albumPlaced` only after a 20 s
@@ -1312,6 +1442,281 @@ patience on the clock** (a 30 s grace after the tap, then two minutes continuous
 before `gaveUp`), and **expiry is a settle, never a delete**, measured from the
 row's last progress.
 
+**A stalled placement is the `needs_match` row.** lb-bot
+marks a gap whose tracks downloaded but were never filed into the album (no track
+has entered `downloaded` for 30 min) as `status: "failed"` with
+**`stalledPlacement: true`**, `failReason: "stalled_placement"` and a `failDetail`
+sentence saying what to do; the flat fill summary carries them as `failureKind` and
+`reason`, and the `/lb/gap` view as they are. Both clients map such a gap onto the
+"failed · `needs_match`" row of the table above, whatever the `failureKind` rules
+would otherwise say: `failDetail` is the sub-line (never the raw
+`stalled_placement` token), Dismiss, **no Retry**. In the gap sheet or modal it
+offers **no search, fetch, fill or auto action** (no "Search again", no "Fill
+{n} tracks", no Auto / "Pick the best source for me"): the files are already here,
+so a fresh source search would only fetch them again. The remedies are **Recheck**
+(`POST /lb/gap/rescan`, for files that are in fact already in place) and **Open in
+lb-bot** (`webUrl`), where the Reconcile and Pick-the-release actions live.
+`stalledPlacement` absent means false.
+
+**So is a pending match.** A gap at `status: "picking"`
+with some track `downloaded` is lb-bot's `needs_match` bucket, not a picker waiting on
+the user: once no search and no transfer is in flight, it settles into the same
+"failed · `needs_match`" ledger row (never needsPick; Dismiss, no Retry). The gap sheet or
+modal makes **Open in lb-bot** the prominent action, but — unlike a stalled placement —
+still offers search, fetch and Auto for the tracks that are still missing. A `picking`
+gap with no `downloaded` track is still needsPick. lb-bot ranks a failed or needs_match
+bucket above in-flight transfers, so a gap can read `failed` or `picking` while tracks are
+still `queued`/`downloading`: both clients hold the settle until the transfer ends.
+**Announcing it:** a row that settles into needs_match —
+stalled placement, pending match, or an album fill's own `needs_match` — is announced
+"Downloaded {album} — needs sorting out in lb-bot", never "Couldn't get {album}"; the
+link goes to lb-bot's `#/gaps/<groupId>` for a gap and to `#/downloads` for an album
+fill (whose key at `needs_match` is an import-record id, not a review group).
+
+**Gap track states.** A gap view's `tracks[].state` (lb-bot `_TRACK_STATE_BY_DECISION`)
+is one of: `present` (in the library, not part of the gap), `missing` (not yet
+picked), `picked` (approved, or picked and waiting on a source), `queued`,
+`downloading`, `downloaded` (fetched, not yet filed — this is also lb-bot's
+`needs_match`), `failed`, `cancelled`, `skipped`, `done` (placed or verified).
+`cancelled` is the user's verdict, not a failure (it used to arrive as `failed`):
+clients label it "Cancelled" and count it as finished for progress, but as neither
+a success nor a failure.
+
+**Progress counts** (one rule in both clients' gap sheet and Download Center row):
+"{done} of {total}" and the percent count `downloaded`, `done`, `skipped` and `cancelled`
+as finished; `total` is every track that isn't `present`; `failed` is counted apart; the
+percent rounds half up.
+
+### 15.3 The index mirror — `/lb/index/*`, `POST /lb/index`, and the `index` and `lb` frames
+
+Every client keeps a **local copy of lb-bot's library index** (its `artists` and
+`release_groups` tables: ~2.3k artists and ~68k rows on the library this was built
+against) and keeps it current by pulling deltas. It exists so an artist page paints
+its missing albums in the same frame as the owned ones, offline too, instead of
+~10 s later behind a status probe and a discography read. lb-bot's side of the feed
+(triggers, epoch, high-water mark) is documented in the
+[lb-bot](https://github.com/illuminator69/lb-bot) repository's `CLAUDE.md`,
+§ "The index change feed".
+
+**Only lb-bot writes the index.** A client never writes a mirror row from a user
+action: index, rescan and acquire go to lb-bot, and the mirror changes only when
+the result comes back through the feed. Anything optimistic (a fill in flight)
+stays in the fill ledgers of §15.1–15.2.
+
+**The version is a sequence, not a clock.** lb-bot's SQLite triggers bump one
+counter on every row written and stamp the new value on the one artist the row
+belongs to (`seq`); a deleted artist leaves a tombstone with its own seq. Every
+seq value belongs to exactly one key. The **epoch** is `"<WIRE_VERSION>-<16 hex>"`
+and changes when seqs stop meaning what a cursor assumes — a new index DB, a
+`WIRE_VERSION` bump (the shape or meaning of a wire row changed, including the
+code-derived `effective_type`), or an index DB that went backwards (restored, or
+lost commits to a power cut; lb-bot detects that with a high-water mark it writes
+before any seq leaves the process). A client whose epoch differs throws its mirror
+away.
+
+#### `GET /lb/index/changes?since=<int>&epoch=<str>` → `GET /api/index/changes`
+
+`since` defaults to 0; a non-integer or negative one is `400`. `epoch` is the
+client's, or empty for "no check".
+
+```jsonc
+{ "epoch": "1-a1b2c3d4e5f6a7b8", "headSeq": 42, "scanVersion": 2, "ttlDays": 30.0,
+  "items": [
+    { "type": "artist", "key": "<artist mbid | nd:<navidrome id>>", "ndArtistId": "",
+      "mbid": "", "name": "", "scannedAt": 0.0, "scanVersion": 0, "seq": 41,
+      "rows": [ /* every release_groups row, in GET /lb/artist/discography's
+                   snake_case row shape, ordered year, title -- unless
+                   rowsTruncated, see below */ ] },
+    { "type": "tombstone", "key": "nd:7", "seq": 42 } ],
+  "nextSince": 42, "more": false, "artistCount": 2, "seqSum": 83 }
+```
+
+- `items` is every artist and tombstone with `seq > since`, in one stream
+  **ordered by seq**, so a tombstone and the artist that supersedes it never arrive
+  out of the order they happened in.
+- A page is capped by **bytes**, not artists (lb-bot's `INDEX_CHANGES_MAX_BYTES`,
+  2 MB, under the hub's 4 MB `PROXY_MAX_RESPONSE`), and always carries at least one
+  item when any exist. `more` says items with a higher seq remain; `nextSince` is
+  the last item's seq when `more`, else `headSeq`.
+- **A single artist can itself be over the cap.** The "always at least one
+  item" rule above otherwise had nothing to stop one prolific artist's own `rows`
+  from exceeding `INDEX_CHANGES_MAX_BYTES`, and past that the hub's
+  `PROXY_MAX_RESPONSE`, which no retry could ever clear. When that happens, `rows`
+  is cut to fit the same page budget and the item additionally carries
+  **`rowsTruncated: true`** and **`rowsTotal: <n>`** (the full, untruncated count).
+  Both are absent on every normal-sized item. lb-bot logs a warning server-side
+  when this fires; **neither client stores or renders these fields yet** — a
+  truncated artist's mirror entry is silently incomplete there (missing its
+  newest release-groups, since rows are cut in `ORDER BY year, title` order) until
+  something re-fetches its full discography. That is a known, accepted gap on the
+  client side, not something the feed hides.
+- `artistCount` and `seqSum` (`COUNT(*)` and `SUM(seq)` over `artists`) are for the
+  drift check below. Head, items, count and sum are one snapshot.
+- **Nothing computed at read time is on the wire as a fact.** There is no `stale`:
+  the envelope carries `scanVersion` and `ttlDays`, each artist its `scannedAt` and
+  `scanVersion`, and a client computes
+  `now − scannedAt > ttlDays·86400 || scanVersion ≠ envelope.scanVersion` itself,
+  so it cannot drift while nothing is written. lb-bot's own background worker
+  rescans an aged row somewhere between 1× and 1.25× the TTL (a stable per-key
+  jitter, so one bulk build does not age out on one day), so a client may show a
+  row stale for up to a quarter-TTL before its rescan arrives. That is expected,
+  not drift.
+- **Resync.** When `epoch` is non-empty and not the server's, or `since > headSeq`,
+  the answer is `{ "resync": true, "epoch", "headSeq", "scanVersion", "ttlDays" }`
+  with no items. The client clears its whole mirror, adopts the new epoch, sets its
+  cursor to 0 and pulls again from `since=0`. This is the **only** answer that wipes
+  a mirror.
+- **`503 {"error": …}` from lb-bot** means it could not record its high-water mark
+  (a read-only `/config`). Treat it like the hub's `503 busy`: back off, cursor
+  untouched.
+
+An artist with no scan behind it is still an artist on the feed: lb-bot gives any
+release row it holds without a parent (a fill landing for an artist it never
+scanned) a stub parent with `scannedAt: 0, scanVersion: 0`, which reads as stale
+and is what its background worker rescans next.
+
+#### `GET /lb/index/keys` → `GET /api/index/keys`
+
+`{ "epoch", "headSeq", "keys": [ {"key", "seq"}, … ] }` — every artist, no
+tombstones (a tombstoned key is simply absent). ~120 KB. Read only when the drift
+check fails.
+
+#### How the hub proxies them
+
+Both routes are `cache: False` **and** `coalesce: False` (a spec key these two
+introduced; absent means the usual sharing of identical in-flight `GET`s). A client
+pulls because it was just told the head moved; a cached page, or an in-flight read
+it joined that started before the write, answers with the *old* head and leaves
+the client one push behind until the next trigger. An up-to-date pull is ~100 B, so
+sharing buys nothing worth that. They run in their own one-slot **sync pool**
+(`PROXY_SYNC_INFLIGHT = 1`): not the default pool, where a pull would queue behind
+150 s source searches, and not the fast pool, where a client pulling its mirror
+from zero — dozens of 2 MB pages back to back — would starve the status polls that
+pool protects. A second device pulling at the same moment waits
+`PROXY_QUEUE_TIMEOUT_FAST` for the slot and is then told `503 {"busy": true}`, and
+backs off with its cursor untouched.
+
+#### `POST /lb/index` — lb-bot's head moved (inbound)
+
+lb-bot POSTs `{ "seq": <int ≥ 0>, "epoch": <non-empty string ≤ 64 chars> }` from one
+dedicated sender thread: it polls its head every second, sends on the leading
+edge at most once per 2 s (a trailing debounce would never fire during a steady
+bulk build), retries until a 2xx, and sends once at boot even if nothing changed.
+It is deliberately **not** `/lb/notify`: that clears every library cache on the
+hub and makes both clients refetch their whole library, which during a bulk index
+build would happen every 2 s — and its field whitelist would drop these fields
+anyway.
+
+- Same bearer check as `/lb/fill` (`401` on a bad token), exact-path match (so the
+  proxied `/lb/index/changes` and `/keys` fall through), `405` on anything but
+  POST, `400` on a malformed body (a `bool` is not a seq).
+- The hub invalidates **only** `GET /lb/artist/discography` — the clients' network
+  fallback when an artist is not mirrored — and never `LB_LIBRARY_ROUTES`. `index`
+  is not a library event, any more than `fill` is. Because cache generations are
+  per route (§15.1), a push voids only a discography read in flight: a 45–150 s
+  `/lb/album/sources` or a six-hour MusicBrainz read that is upstream across a push
+  still caches. (With the original proxy-wide generation, a build's push every 2 s
+  stopped every read slower than 2 s from ever being cached.)
+- It stores the hint (`lbIndex`, persisted in `state.json`; a new epoch is saved at
+  once, same-epoch pushes at most every `LB_INDEX_SAVE_THROTTLE` = 10 s, and a
+  graceful stop flushes the rest) and broadcasts
+  `{ "t": "index", "seq", "epoch" }`, rebuilt from the validated hint.
+- Like the other two inbound routes, the bearer check alone marks lb-bot available
+  (below) — before the body is validated.
+
+#### What `welcome` carries: `lb` and `lbIndex`
+
+- **`lb: { available, routes, webUrl }`** is always present on a hub that has the
+  mirror: the hub's own verdict on lb-bot, exactly the `routes` list `/lb/status`
+  returns, and the `webUrl` link (§15), so a client can gate its lb-bot surfaces
+  without first awaiting a `/lb/status` round trip. With `LBBOT_URL` unset it is
+  `{ available: false, routes: [], webUrl: "" }` — and `/lb/status`'s
+  `{configured: false}` answer carries the same `routes: []`, so the two never
+  disagree.
+- **`lbIndex: { seq, epoch }`** appears once the hub has heard a push, and survives
+  a hub restart. It is **only a hint**: a client pulls on **every** `welcome`
+  regardless, because an up-to-date pull costs ~100 B and a push missed while the
+  hub was down would leave the hint stale. This is the "client closed for days"
+  path.
+- An **older hub** sends neither. A client then keeps probing `/lb/status` as
+  before, and a `404` from `/lb/index/changes` means "this hub has no feed" —
+  skip quietly until the next `welcome`, and serve every page from the network
+  path.
+
+Right after a hub restart, the first `welcome`s wait up to
+`LB_PROBE_STARTUP_WAIT` (3 s) for the hub's first probe, so a client reconnecting
+the instant the hub listens is not told a healthy lb-bot is down. A wait that
+expires ends the waiting for everyone; the late verdict then arrives as an `lb`
+frame.
+
+#### The `lb` frame — the verdict changed
+
+`{ "t": "lb", "available": bool, "routes": [...], "webUrl": "..." }`, the same
+object as `welcome.lb`, broadcast **only when the hub's verdict changes**; an unchanged
+verdict sends nothing. Without it `welcome.lb` would be a connect-time snapshot,
+and a client that trusts it (and so stops probing `/lb/status`) would never notice
+lb-bot coming up or going away while it stays connected. Clients apply it exactly
+like `welcome.lb`. The verdict moves from **three** sources, all through one
+function (`LbProxy._set_available`):
+
+1. **The hub's own probe**, at start and every `LB_PROBE_INTERVAL` (60 s): the
+   `/lb/status` upstream with its 404 fallback, but with no pool slot and no cache
+   (through the default pool it would queue behind four source searches and a
+   probe that cannot tell busy from down would call lb-bot down), and
+   `LB_PROBE_TIMEOUT` = 4 s on `/api/health` so an lb-bot that *hangs* reads as
+   down in seconds. The `/api/summary` fallback keeps the route's own timeout: on
+   an older lb-bot it is a genuinely heavy read.
+2. **An authenticated inbound call** — `/lb/notify`, `/lb/fill` or `/lb/index`.
+   This only ever moves the verdict to *true*; the probe is what notices lb-bot
+   going away. The token is the shared `HUB_TOKEN`, so **any holder of it** (every
+   device) can flip `available` to true, and broadcast one `lb` frame, by posting
+   to an inbound route; the next probe corrects it within 60 s. Harmless — the
+   frame grants nothing a device could not already read — but know it when a log
+   says lb-bot "came back" while it was down.
+3. **A client's `/lb/status` read** that went upstream (not a cache hit).
+
+So a flapping lb-bot can produce two `lb` frames close together (a probe saying
+down, then a push or a client read saying up). They are built at the moment of
+the change and arrive in order.
+
+#### How a client applies the feed
+
+- **When to pull:** on **every** `welcome`, on **every** `index` frame, and every
+  15 minutes as the backstop. One sync in flight at a time; a trigger arriving
+  during one queues one follow-up.
+- **Apply a page in one local transaction.** Per artist, replace *all* its rows at
+  once, so a client never holds a half-updated artist — and only if the item's
+  `seq` is greater than the seq held locally for that key, which makes duplicates
+  and out-of-order delivery harmless. A tombstone deletes the key only if its `seq`
+  is greater than the local one. After the commit, `cursor = max(cursor,
+  nextSince)`; loop while `more`. A page that says `more` but does not move the
+  cursor ends the pass.
+- **Failure:** on `503` (busy), `502`/`504` or a network error, back off and leave
+  the cursor and the rows exactly as they were.
+- **Drift check**, once per pass after the final page: compare the local artist
+  count and seq sum with that page's `artistCount`/`seqSum` (the final page's
+  snapshot, so a bulk build running meanwhile does not cause repair loops). On a
+  mismatch fetch `/lb/index/keys`, delete local keys the server no longer lists,
+  and for keys whose server seq differs from the local one (or that are missing
+  locally) rewind `cursor` to `min(their server seqs) − 1` and pull again — at most
+  once per sync. There is no per-key fetch route, so the repair re-reads everything
+  above that point; on a large mirror one drifting low-seq key means most of the
+  index again. **Never wipe for drift.**
+- **Lookup by Navidrome id** must reproduce lb-bot's `_index_get_artist` exactly:
+  the mbid key first when the caller has an mbid; otherwise the rows where
+  `key == "nd:" + id` or `ndArtistId == id`, ordered `scannedAt` descending then
+  `key` (binary order). That is what makes the brief two-row state during an
+  `nd:` → mbid key swap resolve the same way on every client and on the server.
+  An empty id must match nothing.
+- `stale` is computed on the client (above). A mirror row carries no `scan` record:
+  rescan progress and a failed scan's reason still come from
+  `GET /lb/artist/discography` and the `artistScanned` library event.
+- **The mirror is local data and renders whatever `available` says** — offline, or
+  with lb-bot down, an artist page still shows what the last pull knew. Only a
+  disabled or unconfigured hub means "forget what the hub said".
+- An artist the mirror does not hold falls back to `GET /lb/artist/discography`,
+  as it did before the mirror existed.
+
 ---
 
 ## 16. Preview sidecar (`/preview/*` + `ext:` track ids)
@@ -1339,7 +1744,7 @@ wonders why the media does not go through it.
 - Serving media on the WebSocket port at all would mean writing to
   `self.transport` by hand and raising `BrokenPipeError` to suppress the
   library's own write — and even then `open_timeout` (the handshake deadline,
-  which the proxies answer from inside, §7 of CLAUDE.md's gotchas) truncates the
+  which the proxies answer from inside) truncates the
   body mid-stream. That is the exact bug class the slow lb-bot routes were just
   bitten by.
 

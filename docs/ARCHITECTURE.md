@@ -94,7 +94,7 @@ preview-sidecar proxies, §5 — which are not part of this catalog.)
 | Frame | Direction | Purpose |
 |---|---|---|
 | `hello` | client → hub | announce device (id, token, name, platform, caps) |
-| `welcome` | hub → client | session snapshot + device list |
+| `welcome` | hub → client | session snapshot + device list (+ `savedQueues`, `mixes`, and lb-bot's `lb` verdict and `lbIndex` head) |
 | `act` | controller → hub | intent: `play/pause/playpause/next/previous/jump/seek/setQueue/enqueue/volume/repeat/shuffle/transfer/move/remove/clear` + saved-queue mgmt `renameSavedQueue/deleteSavedQueue/deleteSavedQueues/syncSavedQueues` + mix mgmt `saveMix/renameMix/deleteMix/touchMix` |
 | `do` | hub → active receiver | directive: `load/play/pause/jump/seek/setVolume/setRepeat/setShuffle/release/queueChanged` |
 | `report` | active receiver → hub | ~1 Hz position/index/isPlaying |
@@ -104,6 +104,7 @@ preview-sidecar proxies, §5 — which are not part of this catalog.)
 | `devices` | hub → clients | device list changes |
 | `savedQueues` | hub → clients | shared saved-queue history changed (also embedded in `welcome`) |
 | `mixes` | hub → clients | "Mixed for You" recipes changed (also embedded in `welcome`) |
+| `library` `fill` `index` `lb` | hub → clients | lb-bot relays: an album landed / a fill row moved / lb-bot's index head moved / lb-bot's availability changed (`PROTOCOL.md` §15.1–15.3) |
 | `error` | hub → client | error |
 
 **Hub safeguards:**
@@ -149,9 +150,13 @@ history with the active queue highlighted. Each client keeps a local store as an
 lacks a name never blanks one), with **tombstoned deletions** so a client's stale row can't resurrect
 a deleted queue. Tombstones are kept on both sides: a client replays the deletions it made while
 offline (`syncSavedQueues.deleted`), and a tombstoned id is inert on the hub — neither a re-sync nor
-a `setQueue` from a device that kept playing can bring the record back. A record's **identity is a listening session, not a track list**: name, kind and
-cover are stamped once at birth, and edits (reorder/remove/play-next/top-up/shuffle) refresh the
-*same* record — only a genuine new play mints another. See `PROTOCOL.md` §8.3.
+a `setQueue` from a device that kept playing can bring the record back. A record's **identity is a listening session, not a track list**: its origin name and kind
+are stamped once at birth, and edits (reorder/remove/play-next/top-up/shuffle) refresh the
+*same* record — only a genuine new play mints another. The card's **art and title follow the
+resume track** (`songs[currentIndex]`; the title unless the user named the queue), so it shows
+the track you would resume on rather than the one the queue started with. History is persisted
+and broadcast to every device, so the hub strips credentialed Subsonic stream and cover URLs from
+it; clients rebuild both from the track id. See `PROTOCOL.md` §8.3.
 
 ---
 
@@ -301,8 +306,9 @@ workspace instead, scoped to the review group the discography scan already built
 `group_id` on an `incomplete` row is a live handle needing no separate scan. `/lb/gap` reads one such
 group (missing tracks, ranked sources, the running search); `/lb/gap/{auto,fetch,cancel,rescan}`
 act on it. Everything else in that workspace, including the whole-library `/api/gaps` list, stays
-off the wire. `/lb/gap` is the one route the hub *projects*: it drops each source's peer file
-listing, which is hundreds of KB no client renders.
+off the wire. The gap view is the one body the hub *projects* — on `/lb/gap` and wherever a gap
+POST echoes it back: it drops each source's peer file listing, which is hundreds of KB no client
+renders, and lb-bot's host paths (`placeFolder`/`placeFile`), which only lb-bot's own UI needs.
 
 Missing releases are **not** a shelf of their own: they are grouped by the same release-type key the
 owned albums use and rendered inside those sections (an unowned album sits in *Albums*, faded and
@@ -310,11 +316,13 @@ dashed, next to the ones you have; a partly-owned one carries its `9/12` count).
 shelf **Navidrome-first** — lb-bot's list is its own view of the artist, and an album whose Navidrome
 record its matcher couldn't claim has no row at all, so starting from lb-bot's list would hide albums
 the user owns. When a fill lands, lb-bot flips its own index row to `present`
-and — if `LB_BOT_HUB_URL`/`LB_BOT_HUB_TOKEN` are set — POSTs `<hub>/lb/notify`, the one inbound
-route, which the hub fans out as a `library` broadcast so open pages on other devices refresh too
+and — if `LB_BOT_HUB_URL`/`LB_BOT_HUB_TOKEN` are set — POSTs `<hub>/lb/notify`, which the hub
+fans out as a `library` broadcast so open pages on other devices refresh too
 (`PROTOCOL.md` §15.1). Both are needed: without the index flip a filled album shows up twice — and
 the page also reconciles missing rows against the albums Navidrome actually holds, since anything
 that fills the library *outside* a tracked fill leaves the index row stale until the next rescan.
+`/lb/notify` is one of three inbound routes: `/lb/fill` carries a fill row moving (a `fill`
+frame, which refetches nothing) and `/lb/index` the index head (below).
 Downloads take a per-album `quality` (the global Source preference is the wrong granularity), and
 the watch survives a restart.
 
@@ -331,9 +339,10 @@ that deliberately never auto-retries, so a wishlist is where `retryable: false` 
 instead of a dead end.
 
 All four are in `LB_LIBRARY_ROUTES`, but for two different reasons worth keeping straight. The
-Deezer rows and `artist/related` are cached six hours because a chart barely moves — what moves is
-the ownership badge on each row, and a stale one offers to fetch a record already on disk. The
-wishlist is there for the opposite reason: a landing is precisely what takes a row *off* it.
+Deezer rows are cached six hours because a chart barely moves — what moves is the ownership badge
+on each row, and a stale one offers to fetch a record already on disk (`artist/related` carries
+the same badge but keeps a 60 s cache, like `artist/similar`). The wishlist is there for the
+opposite reason: a landing is precisely what takes a row *off* it.
 
 **A download is reviewed, not fired blind.** `/lb/album/sources` returns the ranked Soulseek
 folders with coverage paired against the canonical MusicBrainz tracklist (never a file count) and
@@ -362,7 +371,7 @@ decorative; and it caches a transient MusicBrainz failure for five minutes and a
 retrying inside that window — one 503 turned into a hard "Could not resolve album" on that album for
 every later attempt, with nothing the user could do.
 
-Three things it is easy to get wrong, all settled in the design doc: covers for unowned releases
+Three things it is easy to get wrong: covers for unowned releases
 come **straight from the Cover Art Archive** (lb-bot's `/api/cover` is Navidrome art keyed by a
 Navidrome album id); download progress comes from `/lb/album/status`, **not** from the task id
 the download returns — that task completes when slskd accepts the enqueue, about a minute before
@@ -370,6 +379,24 @@ anything reaches the library; and a client must **not** drop an lb-bot row the m
 saying `missing`. A completed fill flips that row to `present` while the local library cache still
 has no album for it, so filtering on `missing` makes an album vanish from the page *because* the
 download succeeded.
+
+**Clients keep a local mirror of lb-bot's index** (`PROTOCOL.md` §15.3). Both persist lb-bot's
+`artists` + `release_groups` tables (IndexedDB in Feishin, Room in Navic) and read an artist's
+discography from them synchronously, so the missing albums paint in the same frame as the owned
+ones, offline too. **Only lb-bot writes the index**: index, rescan and acquire go to lb-bot, and
+the mirror changes only when the result comes back through the feed — anything optimistic stays
+in the fill ledgers. The feed is versioned by a **seq** that lb-bot's SQLite triggers stamp on
+every write (tombstones for deletes) and an **epoch**, which is the only thing that wipes a
+mirror. lb-bot POSTs its new head to `<hub>/lb/index` at most every 2 s; the hub keeps it as a
+hint (`welcome.lbIndex`) and broadcasts an `index` frame — deliberately not a `library` event,
+which would make every client refetch its whole library every 2 s during a bulk index build.
+Clients pull `GET /lb/index/changes` from their own cursor on every `welcome`, every `index`
+frame and every 15 minutes (a one-slot pool of its own, never cached or shared between callers),
+and repair drift through `/lb/index/keys` rather than a wipe. `welcome.lb` and the `lb` frame
+carry the hub's verdict on lb-bot's availability, so a client need not probe `/lb/status`
+before rendering, plus `webUrl` — a plain link to lb-bot's own web UI for the cases only it can
+settle (`LBBOT_WEB_URL`, else `LBBOT_URL`). An artist the mirror does not hold falls back to
+`/lb/artist/discography`.
 
 ---
 
@@ -430,16 +457,20 @@ download succeeded.
 ### Hub — `hub/hub.py`
 Single file. `Hub` class: `handler` (per-connection), `_on_act`, `_on_report`, `_transfer`,
 `_disconnect`, `_broadcast_*`. Proxies: an `HttpProxy` base (route whitelist, token check,
-concurrency cap, per-route TTL cache) with `SonicProxy`/`SONIC_ROUTES`, `LbProxy`/`LB_ROUTES` and
+slot pools, per-route TTL cache with per-route invalidation) with `SonicProxy`/`SONIC_ROUTES`, `LbProxy`/`LB_ROUTES` and
 `PreviewProxy`/`PREVIEW_ROUTES` on top, dispatched in order by `_build_proxy_protocol` (a `websockets` protocol subclass — the legacy
 server rejects non-GET and hides the request body from a plain `process_request` callable).
 `PreviewProxy` is the one that overrides `call` to rewrite a body (signing `streamUrl` after the
 cache — read its docstring before "unifying" it with the others). "Mixed for You" is `self.mixes` +
 `_sanitize_mix`/`_mixes_list`/`_broadcast_mixes` and the four `act` branches, modelled line for
 line on the saved-queue ones.
+Each proxy has 4 upstream slots, plus a 2-slot fast pool for the polled and cancelling lb-bot
+routes and a 1-slot sync pool for the index pulls, so a status poll never queues behind a
+150 s source search. `LbProxy._set_available` is the only place lb-bot's availability verdict
+moves and the only one that broadcasts the `lb` frame.
 `hub/tools/` has manual test scripts (`fake_receiver.py`,
-`controller.py`, `test_transfer.py`) and eleven automated suites. Docker via `hub/Dockerfile` +
-`docker-compose.yml`.
+`controller.py`, `test_transfer.py`) and the automated `test_*.py` suites, each of which exits 0
+when it passes. Docker via `hub/Dockerfile` + `docker-compose.yml`.
 
 ### Preview sidecar — `preview/preview.py`
 Single file, stdlib + `yt-dlp`. `serve_client` is a hand-rolled HTTP/1.1 server on
@@ -504,6 +535,8 @@ cd hub
 # create .env from .env.example: HUB_TOKEN, NAVIDROME_URL, HUB_MIRROR_PLAYQUEUE, HUB_ND_USER/PASS,
 #                                AUDIOMUSE_URL + AUDIOMUSE_TOKEN (Tier-2 proxy; unset = disabled),
 #                                LBBOT_URL (lb-bot proxy; unset = disabled),
+#                                LBBOT_WEB_URL (optional: the lb-bot UI link clients show,
+#                                if LBBOT_URL is not reachable from where they are),
 #                                PREVIEW_URL + PREVIEW_PUBLIC_URL + PREVIEW_SECRET (preview
 #                                sidecar; unset = disabled). PREVIEW_SECRET is NOT HUB_TOKEN.
 docker compose up -d          # or: python hub.py   (Python 3.11+, `websockets`)
@@ -552,7 +585,10 @@ assuming an install failure is anything else.
 - Navic files use **tabs**; multi-line `Edit` matches are fragile — prefer matching single bare lines.
 - Keep Tier-2 AudioMuse **fail-soft** (grey out + fall back to Tier 1 when the plugin/index is missing).
 - Same for lb-bot, but stricter: not configured / unreachable / unindexed all render **nothing**.
-  The artist page must look exactly as it does today whenever that layer is absent.
+  The artist page must look exactly as it does today whenever that layer is absent. The one
+  exception is the index mirror: it is local data, so offline or with lb-bot down an artist page
+  still shows what the last pull knew. Only a hub the user disabled or never configured means
+  "forget what the hub said".
 - Cast requires **publicly reachable** stream/cover URLs (`https://music.example.com`, not Tailscale/LAN IPs).
   The same applies to a **preview**: `PREVIEW_PUBLIC_URL` is what makes one castable, and without it
   the hub advertises `previewCastable: false` so both clients refuse the transfer *with a reason*
