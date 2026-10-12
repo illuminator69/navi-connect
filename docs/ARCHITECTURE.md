@@ -308,7 +308,8 @@ group (missing tracks, ranked sources, the running search); `/lb/gap/{auto,fetch
 act on it. Everything else in that workspace, including the whole-library `/api/gaps` list, stays
 off the wire. The gap view is the one body the hub *projects* — on `/lb/gap` and wherever a gap
 POST echoes it back: it drops each source's peer file listing, which is hundreds of KB no client
-renders, and lb-bot's host paths (`placeFolder`/`placeFile`), which only lb-bot's own UI needs.
+renders, and the paths only lb-bot's own UI needs — lb-bot's host paths (`placeFolder`/`placeFile`)
+and the peer's path of a file picked by hand for a track (`manualPick`).
 
 Missing releases are **not** a shelf of their own: they are grouped by the same release-type key the
 owned albums use and rendered inside those sections (an unowned album sits in *Albums*, faded and

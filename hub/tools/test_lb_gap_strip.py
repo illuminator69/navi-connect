@@ -11,6 +11,10 @@ LB_ROUTES). No Feishin/Navic/PROTOCOL code reads `placeFolder`/`placeFile`
 (lb-bot's own SPA reads them directly from lb-bot, not via the hub), so they
 should never reach a client through the hub proxy either.
 
+Q-043: the same holds for `tracks[].manualPick`, lb-bot's record of the file
+picked by hand for a track — its `filename` is a peer's raw slskd path. Neither
+client reads any key of it, so the whole object is dropped.
+
 No hub subprocess: the upstream call is stubbed with a synthetic `/lb/gap`
 body, same technique as test_lb_status_probe.py. Exits non-zero on failure.
 """
@@ -158,13 +162,90 @@ async def run_posts() -> list[str]:
     return failures
 
 
+def _gap_without_pick() -> dict:
+    """A gap view carrying nothing the projection removes."""
+    return {
+        "groupId": "g1", "status": "picking",
+        "sources": [{"peer": "alice", "score": 5}],
+        "tracks": [{"id": "t1", "position": 1, "title": "Track One", "state": "downloaded"},
+                   {"id": "t2", "position": 2, "title": "Track Two", "state": "missing"},
+                   {"id": "t3", "position": 3, "title": "Track Three", "state": "present"}],
+    }
+
+
+def _gap_with_pick() -> dict:
+    """The same gap with a file picked by hand for one track: one row carries
+    the pick, one a null, one no key at all."""
+    gap = _gap_without_pick()
+    gap["tracks"][0]["manualPick"] = {
+        "filename": "@@peer\\Music\\Artist - Album\\01 - Track One.flac"}
+    gap["tracks"][1]["manualPick"] = None
+    return gap
+
+
+async def run_manual_pick() -> list[str]:
+    """Q-043: `tracks[].manualPick` goes, on the poll and on every POST that echoes
+    the gap; a gap that never carried one comes out as it went in."""
+    failures: list[str] = []
+    clean = _gap_without_pick()
+    get_route = ("GET", "/lb/gap")
+    original = hub._proxy_upstream_blocking
+    original_upstream = type(hub.LB).upstream
+    type(hub.LB).upstream = property(lambda self: "http://lb.invalid")
+    try:
+        for label, gap in (("with a manualPick", _gap_with_pick()),
+                           ("without a manualPick", _gap_without_pick())):
+            upstream_body = json.dumps(gap).encode()
+            hub._proxy_upstream_blocking = lambda *a, _b=upstream_body, **k: (200, _b, "application/json")
+            hub.LB._cache.clear()
+            status, body, _c = await hub.LB.call(
+                get_route, hub.LB_ROUTES[get_route], [("group_id", "g1")], None)
+            if status != 200:
+                failures.append(f"/lb/gap ({label}): expected 200, got {status}")
+            elif json.loads(body) != clean:
+                failures.append(f"/lb/gap ({label}): expected the gap minus manualPick and "
+                                f"nothing else, got {json.loads(body)!r}")
+
+            upstream_body = json.dumps({"ok": True, "gap": gap}).encode()
+            hub._proxy_upstream_blocking = lambda *a, _b=upstream_body, **k: (200, _b, "application/json")
+            for route in POST_ROUTES:
+                hub.LB._cache.clear()
+                status, body, _c = await hub.LB.call(
+                    route, hub.LB_ROUTES[route], [], {"group_id": "g1", "sourceId": "s", "allow": True})
+                if status != 200:
+                    failures.append(f"{route[1]} ({label}): expected 200, got {status}")
+                elif json.loads(body) != {"ok": True, "gap": clean}:
+                    failures.append(f"{route[1]} ({label}): expected the gap minus manualPick "
+                                    f"and nothing else, got {json.loads(body)!r}")
+    finally:
+        hub._proxy_upstream_blocking = original
+        type(hub.LB).upstream = original_upstream
+        hub.LB._cache.clear()
+
+    # The real rule set over shapes it cannot apply to: no `tracks`, a `tracks`
+    # that is not a list, rows that are not objects. Those pass through, and must
+    # not cost the object row beside them its strip (`_strip` swallows an error
+    # by handing the whole body back).
+    for odd in ({"groupId": "g1"}, {"tracks": None}, {"tracks": "nope"},
+                {"tracks": [1, None, "manualPick", ["manualPick"],
+                            {"id": "t", "manualPick": {"filename": "x"}}]}):
+        raw = json.dumps(odd).encode()
+        out = json.loads(hub.LbProxy._strip({"strip": hub.GAP_STRIP_RULES}, 200, raw))
+        expect = json.loads(raw)
+        if isinstance(expect.get("tracks"), list):
+            expect["tracks"][-1].pop("manualPick")
+        if out != expect:
+            failures.append(f"gap rules over {odd!r}: got {out!r}")
+    return failures
+
+
 def main() -> int:
-    failures = asyncio.run(run()) + asyncio.run(run_posts())
+    failures = asyncio.run(run()) + asyncio.run(run_posts()) + asyncio.run(run_manual_pick())
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
         return 1
-    print("PASS - lb gap strip: tracks.placeFolder/placeFile stripped, "
+    print("PASS - lb gap strip: tracks.placeFolder/placeFile/manualPick stripped, "
           "sources.files stripped, other fields survive; POST replies' gap.* stripped")
     return 0
 

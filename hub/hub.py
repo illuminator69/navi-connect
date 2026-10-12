@@ -500,7 +500,7 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
 # routes share the same rules behind a `gap.` prefix.
 GAP_STRIP_RULES: tuple[tuple[str, str], ...] = (
     ("sources", "files"), ("sources", "filesTruncated"),
-    ("tracks", "placeFolder"), ("tracks", "placeFile"),
+    ("tracks", "placeFolder"), ("tracks", "placeFile"), ("tracks", "manualPick"),
 )
 GAP_REPLY_STRIP_RULES: tuple[tuple[str, str], ...] = tuple(
     (f"gap.{k}", f) for k, f in GAP_STRIP_RULES)
@@ -1002,7 +1002,9 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # `tracks[].placeFolder`/`placeFile` are lb-bot HOST paths (an absolute
         # `/downloads/<folder>` path and a peer's raw filename) — its own SPA
         # reads them directly, not through the hub, and no client code needs
-        # them (Q-017c).
+        # them (Q-017c). `tracks[].manualPick` is lb-bot's record of the file
+        # picked by hand for a track, and its `filename` is a peer's raw slskd
+        # path; no client reads any key of it, so the whole object goes (Q-043).
         "strip": GAP_STRIP_RULES,
     },
     ("GET", "/lb/gap/source-files"): {
@@ -1257,8 +1259,8 @@ class HttpProxy:
         """Drop fields the clients never render from a successful response.
 
         Not a security control — the whitelist is that. It is a projection:
-        bandwidth (`sources.files`) and host-path hygiene (`placeFolder`/
-        `placeFile`), for an upstream view shaped for a local web UI that carries a
+        bandwidth (`sources.files`) and path hygiene (`placeFolder`/`placeFile`,
+        `manualPick`), for an upstream view shaped for a local web UI that carries a
         payload nobody on a phone wants. Each rule is (list_key, field): the field
         is removed from every object in that list. `list_key` is a top-level key or
         a dotted path (`"gap.tracks"`) for views nested in a POST reply; a missing

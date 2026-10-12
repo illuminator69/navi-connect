@@ -1033,17 +1033,22 @@ folder, which clients must say rather than imply otherwise.
 **`GET /lb/gap` is projected.** Its upstream embeds every ranked source's entire
 peer file listing, ten sources to a page: hundreds of KB on a path a phone polls
 every 5 s, into a cache bounded by entry count rather than bytes. The hub strips
-`sources[].files`, `sources[].filesTruncated`, `tracks[].placeFolder` and
-`tracks[].placeFile` (`spec["strip"]`), keeping the per-source summaries the
-pickers actually render — peer, format, bitrate, coverage, risk flags, score.
+`sources[].files`, `sources[].filesTruncated`, `tracks[].placeFolder`,
+`tracks[].placeFile` and `tracks[].manualPick` (`spec["strip"]`), keeping the
+per-source summaries the pickers actually render — peer, format, bitrate,
+coverage, risk flags, score.
 `placeFolder`/`placeFile` are lb-bot HOST paths (an absolute `/downloads/<folder>`
 path and a peer's raw filename) that only lb-bot's own SPA needs, reading them
-directly rather than through the hub. It is a projection with two reasons —
-bandwidth (`sources[].files`) and host-path hygiene (`placeFolder`/`placeFile`)
-— not an access control (the whitelist is that). A non-200, a non-JSON body or an
-unexpected shape passes through untouched: a projection must never fail a request.
+directly rather than through the hub. `manualPick` (stripped since 2026-10-12) is
+lb-bot's record of the file picked by hand for a track; its `filename` is a
+peer's raw slskd path, and neither client reads any key of the object, so the
+whole of it goes. It is a projection with two reasons —
+bandwidth (`sources[].files`) and path hygiene (`placeFolder`/`placeFile`,
+`manualPick`) — not an access control (the whitelist is that). A non-200, a
+non-JSON body or an unexpected shape passes through untouched: a projection must
+never fail a request.
 
-**The same two fields are stripped a second time, lb-bot-side, on the poll.**
+**`placeFolder`/`placeFile` are stripped a second time, lb-bot-side, on the poll.**
 `GET /lb/gap` is one read of one group; both clients also poll `GET /lb/fills`
 (`?release_mbids=&group_ids=`) every 30 s for everything they are watching, and
 until 2026-09-28 lb-bot's own `_fills_view` answered each gap with
@@ -1053,6 +1058,8 @@ devices unstripped on the most-polled route even though the hub was already
 scrubbing the far less-polled single-group read. `_fills_view` now drops them
 from every track of a gap summary before answering (a copy, not the same dicts
 `GET /api/gaps/<id>` — lb-bot's own SPA's route — hands back with them intact).
+The hub has no rule of its own on `/lb/fills`: what a gap summary's tracks carry
+there, `manualPick` included, is `_fills_view`'s to decide.
 **The POST replies that echo a gap are projected too** (since 2026-10-02).
 `/lb/gap/fetch` (both its success and `alreadyActive` replies),
 `/lb/gap/auto`, `/lb/gap/cancel`, `/lb/gap/rescan` and `/lb/album/allow-mp3`
