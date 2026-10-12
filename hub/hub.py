@@ -439,6 +439,11 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
 #     cache:     cacheable; `ttl` overrides PROXY_CACHE_TTL
 #     timeout:   overrides PROXY_TIMEOUT for a known-slow upstream
 #     pool:      "default" (absent), "fast" or "sync" — see PROXY_*_INFLIGHT
+#     pool_when: {param name: pool}; a request carrying that query param takes
+#                that pool instead of `pool` (a route cheap for one query only)
+#     invalidates:  routes whose cached answers a 2xx answer of this route drops
+#     invalidates_on_answer: the same, but on ANY answer below 500 (a 404 counts;
+#                a 5xx and the hub's own errors do not) — for polled job routes
 #     coalesce:  False opts a GET out of sharing an identical in-flight call;
 #                absent means it shares one (see HttpProxy.call)
 #     fallback:  an upstream path retried once when `path` answers 404 — an
@@ -561,6 +566,179 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "method": "POST", "path": "/api/artist/release",
         "body": ("rgid", "mbid", "nd_id", "name", "external",
                  "title", "artist", "type", "year"), "cache": False,
+    },
+    ("GET", "/lb/overrides"): {
+        # I-019: the user's artist-MBID overrides, one row per Navidrome artist id,
+        # plus `toCheck`, the "matches to check" list. That list is not a plain
+        # SQLite read: the handler also reads Navidrome's artist list and groups
+        # the index, and it depends on scan results. Cached at the default TTL and
+        # flushed by the POSTs that change it (the user's own set/remove never reads
+        # back a stale map), by /lb/notify (LB_LIBRARY_ROUTES), by the two polled
+        # job routes (album/override, artist/merge) and by an index push
+        # (LB_INDEX_INVALIDATES), so a scan
+        # that just landed does not leave an artist listed as unmatched. A second
+        # client sees another's change within the TTL or on its next refresh.
+        "method": "GET", "path": "/api/overrides",
+        "params": (), "cache": True,
+    },
+    ("POST", "/lb/artist/override"): {
+        # Set (or replace) the override. PROXY_SLOW_TIMEOUT because lb-bot
+        # validates the MBID against MusicBrainz behind its one-request-a-second
+        # lock, so a set can queue behind a running discography scan; the default
+        # 20 s would turn a healthy wait into a hub 504 `busy` (a hub timeout is a
+        # 504, distinct from lb-bot's own 502 with `retryable`, passed through).
+        # Never cached. Error statuses (400/404/409/502) pass through untouched.
+        "method": "POST", "path": "/api/artist/override",
+        "body": ("nd_id", "mbid", "name"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/artist/override/remove"): {
+        # Same slow-timeout reasoning: lb-bot runs a strict MusicBrainz name search
+        # before deleting (the rescan it kicks off is a background task, not part of
+        # the reply), and it can be refused 409 while a fill is in flight.
+        "method": "POST", "path": "/api/artist/override/remove",
+        "body": ("nd_id",), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    # ---- I-022 / I-023: album release override, cover, artist name merge ----
+    ("GET", "/lb/album/override"): {
+        # The album as tagged now + its override row. A client POLLS this after an
+        # apply or a remove (by `id`, since the album id it started from is dead;
+        # a 404 `no_override` is how a remove is seen to finish), so it is never
+        # cached. The `?id=` poll rides the fast pool (`pool_when`, below) so a
+        # status poll does not queue behind a slow MusicBrainz route; `?album_id=`
+        # does not. Local reads on lb-bot: default timeout.
+        "method": "GET", "path": "/api/album/override",
+        "params": ("album_id", "id"), "cache": False,
+        # Only the `?id=` poll is a local read. `?album_id=` is an album read from
+        # Navidrome that can cost a MusicBrainz request, so it takes the default
+        # pool like every other such read. Every answer it passes through (200 and
+        # 404 alike: a 404 `no_override` is a finished remove) flushes
+        # /lb/overrides, which no notice announces after a failed or removed job.
+        "pool_when": {"id": "fast"}, "invalidates_on_answer": {("GET", "/lb/overrides")},
+    },
+    ("GET", "/lb/album/covers"): {
+        # Cover Art Archive candidates for a release / release group. Cached long
+        # like `album/releases`: the Archive changes rarely and a picker reopens it.
+        # PROXY_SLOW_TIMEOUT because a cold call is a MusicBrainz lookup (1 req/s
+        # lock) plus an Archive fetch; the 502 `retryable` it can answer is not cached.
+        "method": "GET", "path": "/api/album/covers",
+        "params": ("rgid", "release_mbid"), "cache": True,
+        "ttl": PROXY_CACHE_TTL_LONG, "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/override/preview"): {
+        # Writes nothing, but matches every file against the release's tracklist,
+        # which is a MusicBrainz fetch behind its lock: PROXY_SLOW_TIMEOUT. Never
+        # cached (the answer follows the files on disk).
+        "method": "POST", "path": "/api/album/override/preview",
+        "body": ("album_id", "release_mbid"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/override"): {
+        # Apply. Answers at once (the retag runs in the background) but validates
+        # the release against MusicBrainz first, hence PROXY_SLOW_TIMEOUT. `force`
+        # is a JSON boolean; the body filter passes values through untouched.
+        # 409 `poor_match` carries `matched`/`total`, passed through with the status.
+        "method": "POST", "path": "/api/album/override",
+        "body": ("album_id", "release_mbid", "cover_url", "force"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/cover"): {
+        # Cover alone; synchronous on lb-bot, which fetches the image from the
+        # Archive before it answers, so PROXY_SLOW_TIMEOUT.
+        "method": "POST", "path": "/api/album/cover",
+        "body": ("album_id", "cover_url"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/album/override/remove"): {
+        # Undo. The restore runs in the background, but lb-bot first stats every
+        # file on record (its reach check) on disks that may be spun down, so the
+        # default 20 s could 504 an undo that is already running and that no
+        # client then follows: PROXY_SLOW_TIMEOUT.
+        "method": "POST", "path": "/api/album/override/remove",
+        "body": ("id",), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/artist/merge/preview"): {
+        # Counts the variant spelling's albums and files; resolves both artists'
+        # effective MBID, which can be a MusicBrainz lookup: PROXY_SLOW_TIMEOUT.
+        "method": "GET", "path": "/api/artist/merge/preview",
+        "params": ("nd_id", "from_nd_id"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("POST", "/lb/artist/merge"): {
+        # The retag runs in the background, but lb-bot PLANS the whole merge
+        # before it answers (one getAlbum per album, a tag read per file), so the
+        # default timeout could 504 a merge that is already running and that no
+        # client then follows: PROXY_SLOW_TIMEOUT.
+        "method": "POST", "path": "/api/artist/merge",
+        "body": ("nd_id", "from_nd_id"), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/artist/merge"): {
+        # Merge row, POLLED until `merged`/`failed` (and until 404 `no_merge`
+        # after an undo): never cached, fast pool (assigned below).
+        "method": "GET", "path": "/api/artist/merge",
+        "params": ("id",), "cache": False,
+        # Same flush as album/override: 200 and 404 (`no_merge` = undo finished).
+        "invalidates_on_answer": {("GET", "/lb/overrides")},
+    },
+    ("POST", "/lb/artist/merge/undo"): {
+        # Same as album/override/remove: lb-bot stats every file before it answers.
+        "method": "POST", "path": "/api/artist/merge/undo",
+        "body": ("id",), "cache": False,
+        "timeout": PROXY_SLOW_TIMEOUT,
+    },
+    ("GET", "/lb/listening/status"): {
+        # I-006: the ListenBrainz mirror's state (off / importing / ready / error)
+        # and import progress. It is polled while the first backfill runs, so it
+        # is never cached (a cached "importing 40 of 900" would stall the bar) and
+        # rides the fast pool with the other polls (assigned below), where a
+        # saturated default pool cannot starve the progress readout.
+        "method": "GET", "path": "/api/listening/status",
+        "params": (), "cache": False,
+    },
+    ("GET", "/lb/listening/summary"): {
+        # The My Listening screen in one body. Local SQLite on lb-bot's side, well
+        # inside PROXY_TIMEOUT, so no slow timeout. NOT cached, and the reason is
+        # that the hub cannot see the thing the answer depends on: lb-bot fills its
+        # listens mirror in the background (a first import of ~180 pages, then a
+        # pull every 10 minutes), and a client re-reading the summary the moment
+        # the import finishes would be handed the body cached MID-import and show
+        # partial totals as if final. lb-bot memoizes the aggregation itself, keyed
+        # so it is always consistent with the mirror, and re-joins ownership per
+        # answer, so a hub copy buys nothing worth that risk. (Not in
+        # LB_LIBRARY_ROUTES for the same reason: an uncached route has nothing to
+        # flush.) `coalesce: False` closes the other half of the same window: a read
+        # that arrives while an identical one is upstream would JOIN it and get a
+        # body computed before the import ended; the client re-reads on a timer
+        # while importing and again the moment it ends. `tz` is a client-sent IANA
+        # name (lb-bot's container runs in UTC) and is forwarded as sent.
+        "method": "GET", "path": "/api/listening/summary",
+        "params": ("period", "tz"), "cache": False, "coalesce": False,
+    },
+    ("GET", "/lb/listening/unowned"): {
+        # "Most played but not in your library". NOT cached, for the summary's
+        # reason: the rows are computed from a mirror that fills in the background
+        # and from library ownership, neither of which the hub can observe, and
+        # lb-bot already memoizes the aggregation consistently on its own side.
+        # `coalesce: False` for the summary's reason: joining an in-flight read is
+        # the same stale-by-minutes answer, just shared.
+        "method": "GET", "path": "/api/listening/unowned",
+        "params": ("period", "kind", "limit"), "cache": False, "coalesce": False,
+    },
+    ("GET", "/lb/listening/recent"): {
+        # The recent-plays list, paged by `before`. Never cached: the first page
+        # is the one a user reloads to see their latest listen, and every page key
+        # carries a different `before` so a cache would only hold dead pages.
+        "method": "GET", "path": "/api/listening/recent",
+        "params": ("before", "limit"), "cache": False,
+    },
+    ("POST", "/lb/listening/sync"): {
+        # "Sync now". lb-bot only asks its worker to pull and answers at once, so
+        # the default timeout is plenty. No body keys: it takes no input.
+        "method": "POST", "path": "/api/listening/sync",
+        "body": (), "cache": False,
     },
     ("GET", "/lb/fresh-releases"): {
         # `limit` is not a nicety. Unbounded, this route answers with the entire
@@ -772,9 +950,13 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # `allowMp3`: the whole-album counterpart of a gap group's opt-in. A
         # `format_rejected` fill had `mp3WouldHelp` on the wire and no route
         # that could act on it, because `/lb/album/allow-mp3` needs a group.
+        # `allFiles` (B-084): "Download all files in this folder" on a picked
+        # source — a JSON boolean the body filter passes through untouched. Without
+        # it here the hub drops the key silently and lb-bot downloads the album's
+        # tracks only; the client learns that from the `allFiles` echo in the answer.
         "body": ("rgid", "release_mbid", "artist", "title", "total_tracks",
                  "sourceUsername", "sourceFolder", "quality", "excludeUsers",
-                 "allowMp3"),
+                 "allowMp3", "allFiles"),
         "cache": False,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
@@ -920,6 +1102,7 @@ PREVIEW_ROUTES: dict[tuple[str, str], dict] = {
 # The polled and the cancelling routes take the small fast pool (see
 # PROXY_FAST_INFLIGHT); everything else shares the default one.
 for _fast in (("GET", "/lb/album/status"), ("GET", "/lb/fills"), ("GET", "/lb/gap"),
+              ("GET", "/lb/listening/status"), ("GET", "/lb/artist/merge"),
               ("POST", "/lb/album/cancel"), ("POST", "/lb/gap/cancel")):
     LB_ROUTES[_fast]["pool"] = "fast"
 # The index mirror's pulls take their own one-slot pool (PROXY_SYNC_INFLIGHT).
@@ -930,6 +1113,19 @@ for _sync in (("GET", "/lb/index/changes"), ("GET", "/lb/index/keys")):
 LB_ROUTES[("POST", "/lb/wishlist")]["invalidates"] = {("GET", "/lb/wishlist")}
 LB_ROUTES[("POST", "/lb/wishlist/remove")]["invalidates"] = {("GET", "/lb/wishlist")}
 LB_ROUTES[("POST", "/lb/artist/release")]["invalidates"] = {("GET", "/lb/artist/discography")}
+# I-019: an override changes which MBID the discography is read under, and the
+# set starts a rescan; both the map and the cached discography are stale at once.
+for _ovr in (("POST", "/lb/artist/override"), ("POST", "/lb/artist/override/remove")):
+    LB_ROUTES[_ovr]["invalidates"] = {("GET", "/lb/overrides"),
+                                      ("GET", "/lb/artist/discography")}
+# I-022 / I-023: an album retag, a cover change and an artist merge change the
+# override/merge lists and what the discography reads as owned. `preview` writes
+# nothing and flushes nothing.
+for _alb in (("POST", "/lb/album/override"), ("POST", "/lb/album/cover"),
+             ("POST", "/lb/album/override/remove"), ("POST", "/lb/artist/merge"),
+             ("POST", "/lb/artist/merge/undo")):
+    LB_ROUTES[_alb]["invalidates"] = {("GET", "/lb/overrides"),
+                                      ("GET", "/lb/artist/discography")}
 
 _PATH_ARG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
@@ -1214,8 +1410,9 @@ class HttpProxy:
             if hit is not None:
                 return hit
 
-        # `coalesce: False` is the index mirror's sync routes: a caller that
-        # joins a read which set off before a write gets the pre-write answer.
+        # `coalesce: False` is the index mirror's sync routes and the listening
+        # summary / unowned reads: a caller that joins a read which set off before
+        # a write (or before the listens import ended) gets the earlier answer.
         coalesce = (spec["method"] == "GET" and not refresh
                     and spec.get("coalesce", True))
         leader = self._inflight.get(key) if coalesce else None
@@ -1251,6 +1448,11 @@ class HttpProxy:
         payload = json.dumps(body).encode() if body is not None else None
 
         pool = spec.get("pool", "default")
+        # A route whose cost depends on which query it was given (see
+        # `pool_when`: param name -> pool).
+        for name, named_pool in (spec.get("pool_when") or {}).items():
+            if any(k == name for k, _v in params):
+                pool = named_pool
         sem = self._pools[pool]
         queue_timeout = (PROXY_QUEUE_TIMEOUT_FAST if pool in ("fast", "sync")
                          else spec.get("timeout", PROXY_TIMEOUT))
@@ -1282,6 +1484,10 @@ class HttpProxy:
         # answered the list without the row for up to a minute.
         if 200 <= status < 300 and spec.get("invalidates"):
             self.invalidate(set(spec["invalidates"]))
+        # A polled job route: any answer the lb-bot gave (not its 5xx, not the
+        # hub's own error) means the job's list may have moved.
+        if status < 500 and spec.get("invalidates_on_answer"):
+            self.invalidate(set(spec["invalidates_on_answer"]))
         return status, data, ctype
 
     async def _fetch(self, spec: dict, upstream_path: str,
@@ -1837,9 +2043,10 @@ _LB_FILL_STR = ("kind", "key", "releaseMbid", "rgid", "groupId", "state", "statu
                 "artist", "album", "failureKind", "reason", "source", "taskStatus",
                 "quality")
 _LB_FILL_INT = ("done", "failed", "total", "percent", "bytesDone", "bytesTotal",
-                "speedBps", "activeFiles", "attempts")
+                "speedBps", "activeFiles", "attempts", "leftOut")
 _LB_FILL_FLOAT = ("updatedAt", "serverTime", "retryAt")
-_LB_FILL_BOOL = ("retryable", "mp3WouldHelp", "allowMp3", "cancellable", "verifyGaveUp")
+_LB_FILL_BOOL = ("retryable", "mp3WouldHelp", "allowMp3", "cancellable", "verifyGaveUp",
+                  "allFiles")
 # A fill that ended makes the ranked source list it was picked from stale: a
 # "try another source" re-read within the 60 s TTL got the same list back,
 # with the peer that had just failed still at the top.
@@ -1849,10 +2056,13 @@ _LB_FILL_TERMINAL = ("failed", "cancelled")
 # more so — during a bulk build it arrives every 2 s, and a `library` frame at
 # that rate would have every client refetch its whole library continuously.
 LB_INDEX_PATH = "/lb/index"
-# The one cache an index push drops: the discography read, the clients' fallback
-# when they have no mirror. Named so the proxy-cache test invalidates exactly
-# what the handler does.
-LB_INDEX_INVALIDATES = frozenset({("GET", "/lb/artist/discography")})
+# The caches an index push drops: the discography read, the clients' fallback
+# when they have no mirror, and the override map, whose `toCheck` list depends on
+# scan results (a list still showing an artist as unmatched after its scan landed
+# is worse than one extra upstream read per throttled push). Named so the
+# proxy-cache test invalidates exactly what the handler does.
+LB_INDEX_INVALIDATES = frozenset({("GET", "/lb/artist/discography"),
+                                  ("GET", "/lb/overrides")})
 _LB_INDEX_EPOCH_MAX = 64
 _LB_NOTIFY_STR_MAX = 200
 _LB_NOTIFY_IDS_MAX = 16
@@ -1860,6 +2070,8 @@ _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"
 
 # Cached lb-bot answers a landed album makes wrong. Deliberately NOT the long-TTL
 # MusicBrainz routes (editions, tracklists): a fill changes nothing about those.
+# `/lb/overrides` (I-022/I-023) is there for a client that only watches: the
+# album and merge lists change with a landing's retag and nothing else tells it.
 # `/lb/album/lookup` is a MusicBrainz search and belongs here anyway — the
 # ranking does not move, but the `releaseOwned` badge it now carries does, and
 # a stale badge is a row offering to fetch a record already on disk.
@@ -1878,6 +2090,7 @@ LB_LIBRARY_ROUTES = {
     ("GET", "/lb/wishlist"),
     ("GET", "/lb/fresh-releases"),
     ("GET", "/lb/status"),
+    ("GET", "/lb/overrides"),
 }
 
 # One discography release row, in the exact shape GET /lb/artist/discography

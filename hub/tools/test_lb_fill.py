@@ -117,6 +117,22 @@ async def run() -> list[str]:
     if not fake.frames or fake.frames[0].get("state") != "cancelled":
         failures.append(f"terminal frame not broadcast: {fake.frames}")
 
+    # B-084: `leftOut` (int) and `allFiles` (bool) ride the frame; absent stays absent
+    for k in ("leftOut", "allFiles"):
+        if k in frame:
+            failures.append(f"{k!r} appeared in a frame whose push did not carry it")
+    for extra, want in (({"leftOut": 6, "allFiles": False}, {"leftOut": 6, "allFiles": False}),
+                        ({"leftOut": 0.0, "allFiles": True}, {"leftOut": 0, "allFiles": True}),
+                        ({"leftOut": "6"}, {}), ({}, {})):
+        fake.frames.clear()
+        await push({"kind": "album", "key": "rg-1", "state": "downloading", **extra})
+        got = fake.frames[0] if fake.frames else {}
+        for k in ("leftOut", "allFiles"):
+            if k in want and got.get(k) != want[k]:
+                failures.append(f"push {extra}: frame[{k!r}] = {got.get(k)!r}, want {want[k]!r}")
+            if k not in want and k in got:
+                failures.append(f"push {extra}: frame carries {k!r}={got[k]!r}, want it absent")
+
     # gap and wishlist kinds pass; anything else is refused
     fake.frames.clear()
     await push({"kind": "gap", "key": "g1", "status": "downloading", "taskStatus": "running"})

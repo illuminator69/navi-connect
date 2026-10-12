@@ -181,13 +181,16 @@ def static_checks() -> list[str]:
                 failures.append(f"{route}[{k!r}] = {spec.get(k)!r}, expected {v!r}")
         if tuple(spec.get("params") or ()) != params:
             failures.append(f"{route} params = {spec.get('params')!r}, expected {params!r}")
+    # I-006: these two opt out too (tools/test_lb_listening_routes.py asserts why).
+    LISTENING_NO_COALESCE = (("GET", "/lb/listening/summary"), ("GET", "/lb/listening/unowned"))
     # `coalesce` is a new key and absent must mean today's behaviour everywhere else.
     for table in (hub.LB_ROUTES, hub.SONIC_ROUTES, hub.PREVIEW_ROUTES):
         for route, spec in table.items():
-            if route in (changes, keys):
+            if route in (changes, keys, *LISTENING_NO_COALESCE):
                 continue
             if "coalesce" in spec:
-                failures.append(f"{route} grew a coalesce key; only the sync routes opt out")
+                failures.append(f"{route} grew a coalesce key; only the sync routes and "
+                                "the listening summary/unowned reads opt out")
     for route in (changes, keys, ("POST", "/lb/index")):
         if route in hub.LB_LIBRARY_ROUTES:
             failures.append(f"{route} is in LB_LIBRARY_ROUTES — the index is not a library event")
