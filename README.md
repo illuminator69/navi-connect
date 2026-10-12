@@ -78,7 +78,7 @@ Four pieces, three of them optional:
 | **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active — and never touches audio. Python, one file, ~200 lines of protocol. Lives in this repo under `hub/`. |
 | **Clients** | Every client is both a controller and a receiver. **Feishin** (desktop) and **Navic** (Android) each connect over WebSocket and can play, or hand playback to someone else. |
 | **AudioMuse-AI** | Optional. The recommendation engine behind radio, Song Journey and Mood Flow. Reached through the hub, so no device carries its credentials. |
-| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, and can acquire it. Also reached only through the hub. |
+| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, can acquire it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
 | **Preview sidecar** | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and

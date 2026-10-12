@@ -850,7 +850,7 @@ validate it again (http(s) only) and hide the link when it is empty. Added
 | `GET /lb/index/changes` | `GET /api/index/changes` | `since`, `epoch` | **never**, and never coalesced (sync pool, §15.3) |
 | `GET /lb/index/keys` | `GET /api/index/keys` | — | **never**, and never coalesced (sync pool, §15.3) |
 | `GET /lb/artist/discography` | same | `nd_id`, `mbid` | 60 s (cleared by `/lb/notify` and by `/lb/index`) |
-| `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — |
+| `POST /lb/artist/discography` | same | `mbid`, `name`, `nd_id`, `external` | — (may answer `task_id: ""` with `covered: true`, §15.4) |
 | `POST /lb/artist/release` | same | `rgid`, `mbid`, `nd_id`, `name`, `external`, `title`, `artist`, `type`, `year` | — |
 | `GET /lb/fresh-releases` | same | `days`, `limit` | 60 s |
 | `GET /lb/album/releases` | same | `rgid` | 6 h |
@@ -870,7 +870,7 @@ validate it again (http(s) only) and hide the link when it is empty. Added
 | `GET /lb/meta/artist` | `GET /api/meta/artist` | `mbid`, `name`, `refresh` | 6 h |
 | `GET /lb/meta/album` | `GET /api/meta/album` | `rgid`, `release_mbid`, `refresh` | 6 h |
 | `GET /lb/album/sources` | same | `rgid`, `release_mbid`, `artist`, `album`, `total` | 60 s |
-| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality`, `excludeUsers`, `allowMp3` | — |
+| `POST /lb/album/download` | same | `rgid`, `release_mbid`, `artist`, `title`, `total_tracks`, `sourceUsername`, `sourceFolder`, `quality`, `excludeUsers`, `allowMp3`, `allFiles` (boolean, §15.5) | — (45 s timeout) |
 | `GET /lb/album/status` | same | `release_mbid`, `rgid` | **never** (fast pool) |
 | `GET /lb/fills` | `GET /api/fills` | `release_mbids`, `group_ids` (comma-separated, ≤ 32 each) | **never** (fast pool) |
 | `POST /lb/album/cancel` | `POST /api/album/cancel` | `release_mbid` | — (fast pool) |
@@ -882,18 +882,36 @@ validate it again (http(s) only) and hide the link when it is empty. Added
 | `POST /lb/gap/fetch` | `POST /api/gaps/{group_id}/fetch` | `group_id`, `sourceId` | — |
 | `POST /lb/gap/cancel` | `POST /api/gaps/{group_id}/cancel` | `group_id` | — (fast pool) |
 | `POST /lb/gap/rescan` | `POST /api/gaps/{group_id}/rescan` | `group_id` | — |
+| `GET /lb/overrides` | same | — | 60 s (cleared by any override or merge POST on a 2xx, by `/lb/notify`, by `/lb/index`, and by every answer of the two polled job routes, §15.5) |
+| `POST /lb/artist/override` | same | `nd_id`, `mbid`, `name` | — (45 s timeout) |
+| `POST /lb/artist/override/remove` | same | `nd_id` | — (45 s timeout) |
+| `GET /lb/album/override` | `GET /api/album/override` | `album_id`, `id` | **never** (fast pool when the request carries `id`, §15.5) |
+| `GET /lb/album/covers` | same | `rgid`, `release_mbid` | 6 h (45 s timeout) |
+| `POST /lb/album/override/preview` | same | `album_id`, `release_mbid` | — (45 s timeout) |
+| `POST /lb/album/override` | same | `album_id`, `release_mbid`, `cover_url`, `force` (boolean) | — (45 s timeout) |
+| `POST /lb/album/cover` | same | `album_id`, `cover_url` | — (45 s timeout) |
+| `POST /lb/album/override/remove` | same | `id` | — (45 s timeout) |
+| `GET /lb/artist/merge/preview` | same | `nd_id`, `from_nd_id` | **never** (45 s timeout) |
+| `POST /lb/artist/merge` | same | `nd_id`, `from_nd_id` | — (45 s timeout) |
+| `GET /lb/artist/merge` | same | `id` | **never** (fast pool) |
+| `POST /lb/artist/merge/undo` | same | `id` | — (45 s timeout) |
+| `GET /lb/listening/status` | same | — | **never** (fast pool) |
+| `GET /lb/listening/summary` | same | `period`, `tz` | **never**, and never coalesced (§15.4) |
+| `GET /lb/listening/unowned` | same | `period`, `kind`, `limit` | **never**, and never coalesced (§15.4) |
+| `GET /lb/listening/recent` | same | `before`, `limit` | **never** |
+| `POST /lb/listening/sync` | same | — (any body is dropped) | — |
 
 No upstream token is injected — lb-bot has none to inject.
 
 **Three slot pools.** Every route above shares `PROXY_MAX_INFLIGHT` (4) upstream slots
-per proxy, first come first served — except the five marked *fast pool*, which have
+per proxy, first come first served — except the routes marked *fast pool* (six, plus the two polled job routes of §15.5), which have
 two slots of their own (`PROXY_FAST_INFLIGHT`), and the two marked *sync pool*, which
 have one (`PROXY_SYNC_INFLIGHT`, §15.3). A status poll used to queue behind four `album/sources`
 fan-outs (150 s each) until the handshake deadline dropped its socket with no
 answer at all. Waiting for a slot times out (`PROXY_QUEUE_TIMEOUT_FAST`, 10 s on the
 fast and sync pools; the route's own timeout on the default one) into `503 {"error": …,
 "busy": true}` rather than a dropped connection; identical `GET`s in flight share
-one upstream call (except the two sync routes, whose spec says `coalesce: False`); a timed-out upstream is `504 {"busy": true}` and a refused one
+one upstream call (except the two sync routes and the listening `summary` / `unowned`, whose specs say `coalesce: False`); a timed-out upstream is `504 {"busy": true}` and a refused one
 `502 {"down": true}`, so a client can say which. `POST /lb/wishlist`,
 `/lb/wishlist/remove` and `/lb/artist/release` invalidate their own cached reads on
 success — `/lb/notify` covers a landing, not the user's own action.
@@ -1327,6 +1345,8 @@ push flushes nothing except the cached `album/sources` ranking when the fill end
 just failed. Nothing is replayed on `welcome`: the push accelerates the poll
 (§15, `/lb/fills`) and never replaces it. Both clients hand a `fill` frame and a
 poll answer to the **same** apply function, so push cannot disagree with poll.
+`/lb/notify` also drops the hub's cached `GET /lb/overrides` since 2026-10-12 (§15.5). The frame's typed
+fields include the per-fill `leftOut` and `allFiles` (§15.5).
 
 - Configured **on lb-bot**: `LB_BOT_HUB_URL` + `LB_BOT_HUB_TOKEN` (the same
   `HUB_TOKEN`). Unset on either side means no ping, never an error — the placement
@@ -1611,7 +1631,8 @@ anyway.
   proxied `/lb/index/changes` and `/keys` fall through), `405` on anything but
   POST, `400` on a malformed body (a `bool` is not a seq).
 - The hub invalidates **only** `GET /lb/artist/discography` — the clients' network
-  fallback when an artist is not mirrored — and never `LB_LIBRARY_ROUTES`. `index`
+  fallback when an artist is not mirrored — and, since 2026-10-04, `GET /lb/overrides`
+  (its `toCheck` list depends on scan results, §15.4); never `LB_LIBRARY_ROUTES`. `index`
   is not a library event, any more than `fill` is. Because cache generations are
   per route (§15.1), a push voids only a discography read in flight: a 45–150 s
   `/lb/album/sources` or a six-hour MusicBrainz read that is upstream across a push
@@ -1716,6 +1737,315 @@ the change and arrive in order.
   disabled or unconfigured hub means "forget what the hub said".
 - An artist the mirror does not hold falls back to `GET /lb/artist/discography`,
   as it did before the mirror existed.
+
+### 15.4 Artist MBID overrides and the listening mirror
+
+Added 2026-10-04; route rows are in the §15 table.
+
+**Artist MBID overrides.** A library artist's MusicBrainz id normally comes from Navidrome's file
+tags, or from lb-bot's own name-search guess when there is no tag. An override is the user's pick, stored in
+lb-bot (`artist_overrides`) and followed by every consumer there. `GET /lb/overrides` answers
+`{"artists": [{ndArtistId, mbid, name, tagMbid, setAt}], "toCheck": [{ndArtistId, name, kind, mbid, albums}]}`.
+`toCheck` lists untagged album artists whose guess matched none of their owned albums (`kind: "unmatched"`)
+or that have no MBID at all (`"unresolved"`); it is **absent**, not empty, from an older lb-bot and whenever
+Navidrome's artist list is unavailable, and a client then shows no list. The client rule is
+`effectiveArtistMbid(ndId, tagMbid) = overrides[ndId]?.mbid ?? tagMbid`, used wherever an artist MBID feeds
+an lb-bot call.
+
+A set carries a bare UUID (a URL is a 400) and answers `{ok, mbid, name, task_id}`; the answered `mbid` is
+the one to use (MusicBrainz merges artists). lb-bot starts the discography scan itself.
+**`task_id: ""` means lb-bot deliberately started no scan, and the client must not start one**: it answers
+that when the MBID's discography is already held by another live library artist (a scan from this artist
+would re-file that row against the wrong albums), when a remove leaves nothing resolvable, and for an artist
+Navidrome no longer lists. `POST /lb/artist/discography` applies the same check **for an artist that has an
+override** and answers `task_id: ""` with `covered: true`; only `covered: true` supports the sentence "this
+discography is shared", and a blank `task_id` without it says only that lb-bot did not start the scan.
+Errors pass through the hub unchanged: 400; 404 `code: "unknown_mbid"` /
+`"no_override"`; 409 `code: "busy"` (a fill for that artist is in flight, including a placed fill not yet
+verified, so up to about 11 minutes); 502 `retryable: true` (MusicBrainz or Navidrome's artist list
+unavailable — nothing stored).
+
+**Listening.** lb-bot mirrors the configured user's ListenBrainz listens into its own SQLite file
+(`listens.db`) with one background writer: a first backfill (paged, resumable across a restart), a pull
+every 10 minutes, and a daily catch-up of the trailing 14 days for listens submitted late. The routes only
+read. `period` is one of `7d`, `30d`, `90d`, `365d`, `all`; `tz` is an IANA zone name from the client
+(lb-bot's container runs in UTC). `status.state` is `off` (no ListenBrainz user), `importing`, `ready` or
+`error` (the last sync failed; stored rows are still served). `owned` on a listening row means the library
+holds the album: lb-bot's index says so, or Navidrome's album list has it by release MBID or by the same
+artist and title. A route that cannot decide ownership answers 503 rather than a 200 that reads as
+"nothing".
+
+**Why `summary` and `unowned` are neither cached nor coalesced.** The hub cannot know when lb-bot's mirror
+changes. A cached or joined answer taken mid-import was handed to a client that re-read at the moment the
+import ended, which then showed partial totals as final. lb-bot keeps its own consistent memo of the
+aggregation and joins ownership per answer, so the hub's copy bought nothing. `status` and `recent` stay
+coalesced (two clients' polls share one fast-pool slot).
+
+**Fresh rider.** Rows of `GET /lb/fresh-releases` gain `artistPlays` (int): all-time plays of the row's
+artists in the listens mirror, 0 when none or while the mirror is off or importing. The route is still
+cached 60 s, so the field can lag the mirror by that long. A client offers its "Artists you play" scope only
+when some row has `artistPlays > 0`: the wire cannot tell "none of your artists released" from "the mirror
+is off".
+
+**Version skew.** An lb-bot older than the hub answers the new GETs `404` with no `code` and the new POSTs
+`405` (its catch-all route is GET-only); the hub relays both, caches neither and invalidates nothing.
+A client treats a code-less 404 or a 405 as "this lb-bot is older": a screen opens to one plain sentence, a
+control inside a page is hidden after the first such answer. A newer lb-bot behind an older hub is simply
+not advertised, and the surfaces stay hidden. A hub timeout on a write is `504 {"busy": true}` and does not
+say whether lb-bot stored it; the overrides map heals on the next `index` frame.
+
+**Refresh About.** `GET /lb/meta/artist|album` with `refresh=1` bypasses the hub's cache and coalescing for
+that read and stores the fresh answer under the ordinary key. lb-bot answers 502 `retryable` and keeps its
+stored entry when a source did not answer; `found: false` is stored and answered only when the sources
+answered and had nothing.
+
+### 15.5 Album release override, cover, artist name merge, and "download all files"
+
+Added 2026-10-12; route rows are in the §15 table. The wire is **additive**:
+an older lb-bot answers the new GETs `404` with no `code` and the new POSTs `405`, and a client treats that as
+§15.4 does ("this lb-bot is older": a screen says so in one muted sentence, a control inside a page hides after
+the first such answer, never an error state). A `404` that carries a `code` is lb-bot's own answer. Every error
+body has an `error` string a client may show as is. Request keys are snake_case, response fields camelCase; ids
+are `album_id` / `albumId` (a **Navidrome album id**), `nd_id` / `ndArtistId` (a Navidrome artist id),
+`release_mbid`, `rgid`, `mbid` (bare UUIDs; a URL is a 400) and `id` (an override or merge id lb-bot mints,
+opaque). No filesystem path is ever on the wire: files are named by title, albums by artist and title.
+Clients gate the album surface on the advertised string `POST /lb/album/override` and the merge surface on
+`POST /lb/artist/merge`.
+
+**What it is.** *Album override:* for an album the library owns, the user picks which MusicBrainz release
+it is. lb-bot **retags the album's files** to that release (release id, disc and track numbers and totals,
+titles, date: tags only, never a rename or a move), keeps the previous tags so the change can be undone, and can
+save a chosen Cover Art Archive image as the album's `cover.jpg`. *Name merge:* Navidrome keys artists by
+**name**, so "Belle & Sebastian" and "Belle and Sebastian" are two artists even with one MusicBrainz id; lb-bot
+retags the variant spelling's files to the kept name (undoable) when both entries resolve to the same
+MusicBrainz artist. State lives in lb-bot (`library_index.db`) and is reached through the proxy.
+
+**Navidrome must report real paths.** Navidrome hands a Subsonic client a *synthesized* path per song unless
+"Report Real Path" is on for that client's player. `preview`, `apply`, `cover` and `remove` (and the merge's
+preview and apply) answer **409 `{"code":"files_unreachable","reachable":n,"total":m}`** when lb-bot cannot find
+every one of the album's files inside its own music folder; the `error` text names the remedy (turn the setting
+on for the lb-bot player in Navidrome's Players settings). All or nothing: a retag of part of an album would
+split it in two. A client shows lb-bot's `error` text as for any code it does not know.
+
+#### Album override
+
+```
+AlbumState = {albumId, artist, album, releaseMbid ("" when untagged), rgid ("" when lb-bot cannot tell),
+              tracks: [{disc, track, title, duration}] (as tagged, ordered), override: null | OverrideRow}
+OverrideRow = {id, state: "applying"|"applied"|"failed"|"removing", releaseMbid, prevReleaseMbid ("" when the
+              album was untagged), rgid, artist, album, albumId (the album's CURRENT id, "" while Navidrome
+              has not indexed the retagged album), coverUrl ("" when none was chosen), setAt (epoch s),
+              done, total (files written / to write), failures: [{title, reason}]}
+Cover   = {thumb, full, releaseMbid ("" for a release-group image), source: "release"|"release-group"}
+Preview = {albumId, releaseMbid, release: {title, disambiguation, year, country, format, trackCount, discCount},
+           files: [{from: {disc, track, title}, to: {disc, track, title} | null, basis, changed}],
+           matched, unmatched, missing: [{disc, track, title}]}
+```
+
+| Route | In | 200 body |
+|---|---|---|
+| `GET /lb/album/override` | `album_id` **or** `id` | `AlbumState` |
+| `GET /lb/album/covers` | `rgid`, `release_mbid` (either or both) | `{"covers": [Cover]}` |
+| `POST /lb/album/override/preview` | `album_id`, `release_mbid` | `Preview` |
+| `POST /lb/album/override` | `album_id`, `release_mbid`, `cover_url`?, `force`? | `{ok, id, state: "applying"}` |
+| `POST /lb/album/cover` | `album_id`, `cover_url` | `{ok, id}` |
+| `POST /lb/album/override/remove` | `id` | `{ok, id, state: "removing"}` |
+
+- **`GET album/override`**: with `album_id` it describes that album and carries the override row whose album it
+  is; with `id` it describes the row's album, which is what a client **polls** after apply or remove, because
+  the album id it started from is dead. 404 `unknown_album` when Navidrome has no such album; 404
+  `no_override` for an unknown `id`: **after a remove finishes the row is gone, so this 404 is how a poll learns
+  the remove completed.** `rgid` may be `""` (an untagged album of an artist lb-bot has not indexed); the client
+  then resolves a release group through `GET /lb/album/lookup` (answer validated against artist and title;
+  declining is fine) before listing editions with `GET /lb/album/releases?rgid=` and
+  `GET /lb/album/tracklist?release_mbid=`, which are unchanged. A pasted release MBID or a
+  `musicbrainz.org/release/<uuid>` URL is accepted by the picker (the client extracts the UUID).
+- **`covers`**: the chosen release's own front first, then the release group's fronts, de-duplicated, at most
+  12. `[]` means the Archive has none; 502 `retryable` that it did not answer. `thumb` / `full` are public Cover
+  Art Archive URLs the client loads directly. For a release that is not one of the listed editions (a pasted id)
+  a client asks with `release_mbid` alone; lb-bot then derives that release's own group. `cover_url` on apply or
+  cover must be one of the `full` URLs `covers` answered (lb-bot fetches only from `coverartarchive.org` /
+  `archive.org`; anything else is a 400).
+- **`preview` writes nothing.** `basis` says how a file was matched to its slot: `mbid` (recording id tag),
+  `exact` / `prefix` / `contained` / `fuzzy` (title), `duration`, or `""` for a file with `to: null`. `changed`
+  is false when the file already carries exactly the slot's numbers, title and release id. A file with no slot
+  is **left untouched** by an apply; Navidrome will list it as an album of its own, and the client says so
+  before the user applies.
+- **`apply`** answers at once and works in the background. Applying to an album that already has an override
+  replaces the release on the **same row**; the undo record keeps the tags from before the first apply.
+  `applied` with a non-empty `failures` is a partial result. A job that wrote **nothing** (`done == 0` after its
+  last write) ends `failed` at once. **`cover`** changes the cover alone (the release stays), creates or updates
+  the row, so the change is listed and undoable like any other; it is synchronous. **`remove`** restores every
+  tag it changed and the previous cover (or deletes the `cover.jpg` it wrote when there was none), in the
+  background; a remove that restored some files but not all ends `failed` after the same closing steps.
+- **`applying` becomes `applied`** once every file is written **and** Navidrome has indexed the album again, or
+  60 seconds after the last write, whichever comes first; so usually `applied` already carries the new
+  `albumId`. While lb-bot waits for the index, `done == total` and the state is still `applying`. A client must
+  still handle `applied` with `albumId` `""` (the 60 s ran out). A remove's row disappears (404 `no_override`)
+  on the same condition. lb-bot then sends the ordinary **library notification** (`/lb/notify`, the `library`
+  frame); there is no new frame.
+- **Errors**: 400 missing or malformed id / MBID / `cover_url`; 404 `unknown_album`, `no_override`,
+  `unknown_release` (MusicBrainz has no such release); 409 `busy` (a fill for the album is in flight); 409
+  `in_progress` (an apply or remove is already running for it); 409 `poor_match` with `matched` and `total`
+  (fewer than half the album's files have a slot on the chosen release and `force` was not `true`: the client
+  asks for a confirmation that names both numbers and resends with `"force": true`); 409 `files_unreachable`;
+  502 `retryable` (MusicBrainz or Navidrome did not answer, nothing written). `force` is a **JSON boolean**; the
+  hub forwards body values untouched.
+- **Restart.** lb-bot restarted mid-apply: the row reads `failed` ("interrupted") and `remove` restores what was
+  written.
+
+#### Artist name merge
+
+```
+MergePreview = {into: {ndArtistId, name}, from: {ndArtistId, name}, mbid, albums, files,
+                sample: [{album, tracks}] (at most 10 albums)}
+MergeRow     = {id, state: "merging"|"merged"|"failed"|"undoing", into: {ndArtistId, name},
+                from: {ndArtistId, name}, mbid, done, total, failures: [{album, title, reason}], setAt}
+```
+
+| Route | In | 200 body |
+|---|---|---|
+| `GET /lb/artist/merge/preview` | `nd_id`, `from_nd_id` | `MergePreview` |
+| `POST /lb/artist/merge` | `nd_id`, `from_nd_id` | `{ok, id, state: "merging"}` |
+| `GET /lb/artist/merge` | `id` | `MergeRow` |
+| `POST /lb/artist/merge/undo` | `id` | `{ok, id, state: "undoing"}` |
+
+`nd_id` is the entry whose **name is kept**; `from_nd_id` the spelling that is rewritten. (`from.ndArtistId` is
+the rewritten spelling's id at merge time, dead once Navidrome re-indexes; it lets a second device tell which
+local artist to re-read, and a client may ignore it.) lb-bot merges only two library artists whose **effective**
+MusicBrainz id (the user's override first, the tag second) is the same and not empty, so an artist override is
+how two differently-tagged entries become mergeable. A merge is a **substitution of values and nothing else**:
+in every key the merge reads (canonical and alias, album-artist and track-artist) each value that folds equal to
+the `from` name becomes the kept name; other values and their order stay; no key is added or deleted. Folders
+are not renamed; what changes is what Navidrome lists, and the library notification follows. `merging` becomes
+`merged` on the same rule as `applying` (writes done and a scan finished, or 60 s); an undo's row disappears
+(404 `no_merge`) likewise, and the poll ends on that 404.
+
+Errors: 400; 404 `unknown_artist` (Navidrome lists neither), `no_merge`; 409 `different_artists` (the effective
+MBIDs differ or are empty), 409 **`collaboration`** (the two entries are not in one merge set, below), `busy`
+(a fill for either is in flight), `in_progress`, `files_unreachable` (the `from` artist's albums); 502
+`retryable`. A job that wrote no file ends `failed` at once.
+
+#### `GET /lb/overrides` gained three fields
+
+```
+"albums":   [OverrideRow]   every album override, newest first
+"merges":   [MergeRow]      every merge that can still be undone, newest first
+"siblings": [{"mbid", "artists": [{ndArtistId, name, albums, collab}]}]
+```
+
+**Absent is not empty.** Each of the three is absent when lb-bot could not work it out (a client reads a missing
+field as "no list") and `[]` when there is nothing; an older lb-bot sends none. `artists` and `toCheck` are
+unchanged (§15.4). A **`siblings` group is a merge set**: two or more library artists with the same effective
+MBID that can be merged into one another. Names that fold alike are always in one set; an entry that is a
+*collaboration credit* of another same-MBID entry (its name splits into several acts and one act is the other's
+whole name: "JPEGMAFIA × Danny Brown" beside "JPEGMAFIA"; "and", "×", "&", "、", "と" and a leading "The" are
+read as joiners) forms its own set per fold-equal name, and among the non-credits a name of several acts is
+never in one set with a name of one act. An artist id is in at most one group, but **two groups may carry the
+same `mbid`**, so a client finds a group by the artist id it contains, never by `mbid`. Within a group the entry
+with the most albums comes first. `collab` is absent (false) on every listed entry of a current lb-bot and is
+kept for a build before this rule; a client offers "Merge into one name" only between entries that are not
+`collab`. The `409 collaboration` refusal uses the same definition and also asks the two names directly.
+
+**How the hub treats them.** `GET /lb/album/override` and `GET /lb/artist/merge` are polled, so they are never
+cached; the hub does flush its `GET /lb/overrides` copy on **every** answer lb-bot gives to either (200 and 404
+alike: a 404 `no_override` / `no_merge` is how a finished remove or undo is seen), but not on a 5xx or the hub's
+own error. So the list a client reads when its job ends is read fresh, including after a `failed` end that no
+notice announces. `GET /lb/overrides` is also flushed by `/lb/notify` (the `library` frame), by `/lb/index`
+(§15.3) and by any 2xx of the five mutating POSTs (`album/override`, `album/cover`, `album/override/remove`,
+`artist/merge`, `artist/merge/undo`; they also flush `GET /lb/artist/discography`); `preview` flushes nothing.
+`GET /lb/album/override` takes the fast pool only when the request carries `id` (a status poll); with `album_id`
+it is an album read from Navidrome that can cost a MusicBrainz request and shares the default pool.
+`GET /lb/artist/merge` is on the fast pool. Both polls keep the default timeout; every other new route takes
+`PROXY_SLOW_TIMEOUT` (45 s), the two undo POSTs and `POST /lb/artist/merge` included: lb-bot plans the whole merge, or stats every file on record
+before an undo, before it answers, and a hub 504 would leave a running job that no client follows.
+Error statuses and bodies (400/404/409/502 with `code`, `matched`, `total`, `reachable`) pass through unchanged. While a client follows a job, other reads of `/lb/overrides` therefore go upstream instead of to the
+60 s copy; that is the stated cost.
+
+**`covered` beside a blank `task_id`.** `POST /lb/artist/override` and `.../remove` (§15.4) answer
+`"covered": true` beside a blank `task_id` when no scan was started because the MusicBrainz artist the library
+artist now resolves to is a row another live library artist holds. It is absent in every other case. A client
+may say "shares its discography with another artist" of a blank `task_id` **only** when it reads this.
+
+#### "Download all files in this folder"
+
+A whole-album download used to ask a source folder for every file in it. lb-bot now asks a folder **only for the
+release's tracks when the folder has them all**, and reports when a source has more.
+
+- **`GET /lb/album/sources`**: each source row may carry **`extraFiles`** (integer): the audio files lb-bot has
+  seen in that folder that a plain download will not ask for. It is `0` unless every track of the release is
+  paired with a file of the folder, then the seen files less the paired ones. **Absent** when the tracklist is
+  not known; a client reads absent as "nothing to say". It counts the files the search returned, which can be
+  fewer than the folder holds. `fileCount`, `coverage`, `coverageFull`, `coverageDetail` and `files` are
+  unchanged. A client computes nothing from `files` or `fileCount` itself.
+- **`POST /lb/album/download`** body gains **`allFiles`** (boolean, default false): ask the folder I picked for
+  every audio file in it. Only with `sourceUsername` (a click on a source); `allFiles: true` without it is a
+  400 `{"error": "allFiles needs a picked source (sourceUsername)"}` and nothing starts. It is consent for **that
+  folder only**: after a switch to another source the new source is asked for the release's tracks only. What is
+  *filed* does not change: the import files an extra only when the album was shown and the file's own tags name
+  the album.
+- **The answer echoes `allFiles`** (boolean) on every 200 of this route: for a new fill what was asked; for
+  `existing: true` (a fill already running) what **that** fill was started with. An older hub drops the key from
+  the body without a word, so the echo is how a client knows: it asked for all and reads `allFiles` false or
+  absent, so it says lb-bot is downloading the album's tracks only and never claims "all files".
+- **The fill view** (`GET /lb/album/status`, each album in `GET /lb/fills`, and the pushed `fill` frame below)
+  gains `allFiles` (the fill's current source was asked for every audio file at the user's request; false after
+  a switch) and `leftOut` (integer: audio files of the current source's folder, the peer's full listing read at
+  the download, that were not asked for; `0` when the folder was asked whole). `total` stays "files asked
+  for". Old ledger rows read `false` / `0`.
+- **The pushed frame.** `_lb_fill_frame` (§15.1) rebuilds a fill push field by field, so a field reaches a client
+  in a frame only if it is listed: `leftOut` is in the integer fields and `allFiles` in the boolean ones
+  (2026-10-12; before that they arrived on polls only). Semantics unchanged: a key the push does not carry is
+  **omitted** from the frame (absent is not `0` or `false`), and a non-numeric `leftOut` is dropped like the other
+  integers.
+- The client rows: with `extraFiles > 0` the row keeps its primary download ("the album's tracks") and adds a
+  quiet "N more files in this folder" (singular "1 more file") and a second, visibly secondary action "Download
+  all M files" (`M = fileCount`) that sends the same request plus `allFiles: true`. Where a client already shows
+  a status line for a running or finished album download, `leftOut > 0` adds "N other files in the folder were
+  left out".
+
+#### What both clients do (there is no shared build; this is the contract)
+
+"Fix album match" (entry points: the owned album's page or menu, and a "Wrong edition?" link on the gap-fill
+surface; only when `POST /lb/album/override` is advertised): open reads `GET /lb/album/override?album_id=` and
+shows what the album is tagged as now and, when `override` is set, that lb-bot changed it, with **Undo**; picking
+an edition runs `preview` and shows the release line, a from-to table (unchanged rows collapsed or dimmed) and
+three counts (files that change, files with no slot, tracks still missing); the cover step is a grid from
+`covers` with **"Keep the current cover" as the default**, and is skipped when there are no candidates; apply,
+poll, then on `applied` say what was written and leave the dead album id (open `albumId` when non-empty, else the
+artist page). The one fixed sentence before apply: "lb-bot rewrites the tags of N files and keeps the previous
+ones, so this can be undone." Every sentence states only what lb-bot answered; **a client never says whether a
+favourite, rating or play count survives** (not measured for this route). "Merge into one name", inside the
+artist match surface, is shown when `siblings` has a group containing the artist and `POST /lb/artist/merge` is
+advertised: the other spellings with their album counts, the kept name defaulting to the one with the most
+albums, `merge/preview` giving "N files in M albums", apply, poll, done. The "lb-bot data" panel lists `albums`
+and `merges` beside the artist overrides, each with Undo.
+
+- A remove or undo that fails at once is seen: lb-bot flips the row to `removing` / `undoing` before it
+  answers and can reach `failed` before the first poll, so the poll starts with "the active state has been seen"
+  taken from the POST's own `state`; a row already `failed` at the first tick ends the job as failed.
+- The give-up clock measures silence, not length: the three-minute bound restarts whenever the row's
+  `state` or `done` differs from the previous tick (a poll every 2 s). A job that advances never times out.
+- A job that timed out is not settled later; the surface says lb-bot is still working and that "lb-bot
+  data" in Settings shows the result. A job that ended and was dismissed is remembered (`id@setAt`) and not
+  followed again in that process.
+- The wait for Navidrome reads as a wait: the writes are over when `total > 0 && done + failures.length
+  >= total` while the state is still an active one; then the surface says the tags are written and lb-bot is
+  waiting for Navidrome to index them (up to a minute), with no determinate bar.
+- A client offers "Merge into one name" only between entries that are not `collab`.
+- A preview refusal of any kind offers Try again, except "this lb-bot is older"; inside the merge block
+  an older lb-bot hides the block.
+- Undoing a cover-only change (`releaseMbid == prevReleaseMbid`, non-blank) stays on the album page; its
+  id did not change.
+- Covers for a release that is not a listed edition are asked with `release_mbid` alone.
+- The result sentence counts problems, not files: a cover that could not be saved is a `failures` entry
+  titled "Cover image"; say how many files were written, then "N problems" above the list.
+- The override lists are re-read on the hub's `library` frame as well as on `index`.
+- The dead id is the client's to forget: when a job ends and the album's id changed, a client keeping albums in
+  a local store removes the dead id's row itself; the job outlives the surface that started it.
+
+**Not measured, so not claimed:** what an album retag does to a Navidrome favourite, rating or play count. A
+move with unchanged tags keeps track and album ids; a retag to another release changes the album id.
 
 ---
 

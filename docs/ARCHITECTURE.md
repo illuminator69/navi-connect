@@ -324,7 +324,25 @@ that fills the library *outside* a tracked fill leaves the index row stale until
 `/lb/notify` is one of three inbound routes: `/lb/fill` carries a fill row moving (a `fill`
 frame, which refetches nothing) and `/lb/index` the index head (below).
 Downloads take a per-album `quality` (the global Source preference is the wrong granularity), and
-the watch survives a restart.
+the watch survives a restart. A source row may say it holds **more files than the release's tracks**
+(`extraFiles`), and a click on that source can ask for the whole folder (`allFiles` on `album/download`,
+echoed in the answer; `leftOut` on the fill says what was not asked for) — a plain download asks a folder
+only for the release's tracks when it has them all (`PROTOCOL.md` §15.5).
+
+**Retagging what the library already holds.** Four more route groups let a client correct a library
+rather than extend it, all in `PROTOCOL.md` §15.4–15.5: the user's **artist MusicBrainz id override**
+(`/lb/overrides`, `/lb/artist/override*`), the ListenBrainz-mirrored **listening** reads
+(`/lb/listening/*`), an **album → release override** with an optional Cover Art Archive cover
+(`/lb/album/override*`, `/lb/album/covers`, `/lb/album/cover`) and an **artist name merge**
+(`/lb/artist/merge*`: Navidrome keys artists by name, so two spellings of one MusicBrainz artist are two
+entries). The last two make lb-bot **rewrite the tags of the files** — never a rename — keep the previous
+tags, and undo from them. Both are background jobs: the POST answers at once and the client **polls**
+`GET /lb/album/override?id=` / `GET /lb/artist/merge?id=` until the row ends (a 404 `no_override` /
+`no_merge` is how a finished undo is seen). The hub caches neither poll, flushes its copy of
+`GET /lb/overrides` on every answer to them and on `/lb/notify`, and gives `?id=` the fast pool; the
+`album_id` read, which can cost a MusicBrainz request, shares the default pool. The undo and merge POSTs
+take the 45 s timeout, since lb-bot plans or checks every file before it answers. lb-bot needs Navidrome's
+"Report Real Path" on for its player to find the files (otherwise 409 `files_unreachable`).
 
 **Deezer, paste-a-link and the wishlist.** Four more route groups, all whitelisted in
 `LB_ROUTES` (`PROTOCOL.md` §15). `/lb/deezer/chart` and `/lb/deezer/editorial` are Deezer's free
@@ -465,7 +483,7 @@ cache — read its docstring before "unifying" it with the others). "Mixed for Y
 `_sanitize_mix`/`_mixes_list`/`_broadcast_mixes` and the four `act` branches, modelled line for
 line on the saved-queue ones.
 Each proxy has 4 upstream slots, plus a 2-slot fast pool for the polled and cancelling lb-bot
-routes and a 1-slot sync pool for the index pulls, so a status poll never queues behind a
+routes (including the album-override and merge status polls) and a 1-slot sync pool for the index pulls, so a status poll never queues behind a
 150 s source search. `LbProxy._set_available` is the only place lb-bot's availability verdict
 moves and the only one that broadcasts the `lb` frame.
 `hub/tools/` has manual test scripts (`fake_receiver.py`,

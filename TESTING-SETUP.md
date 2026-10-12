@@ -238,6 +238,11 @@ The variables that matter:
 | `LASTFM_API_KEY`, `SPOTIFY_CLIENT_ID/SECRET` | Optional enrichment |
 
 **Deployment gotchas that will bite you** (all from lb-bot's own docs):
+- Retagging an album's release, setting its cover, or merging two spellings of an artist needs
+  Navidrome's **Report Real Path** switched on for lb-bot's player (Navidrome → Settings → Players →
+  the lb-bot player). Off, Navidrome hands lb-bot a made-up path per song, lb-bot cannot find the files,
+  and those routes answer 409 `files_unreachable` naming this remedy. lb-bot also needs write access to
+  the music mount for these (it rewrites tags in place and keeps the previous ones for the undo).
 - The container runs as `99:100` (Unraid `nobody:users`). All three mounts — `/config`, `/downloads`,
   `/music` — must be writable by that uid, `/downloads` included, because placement *unlinks* the
   source after copying.
@@ -438,6 +443,10 @@ Navic (basic operation confirmed live).
 - Download progress comes from `/lb/album/status`, **not** from the task id the download returns.
   That task completes when slskd accepts the enqueue — roughly a minute before anything reaches the
   library.
+- A retag changes the album's Navidrome id, so an album may briefly be listed twice or under the old id
+  until Navidrome has scanned (lb-bot waits up to a minute for it). Files with no slot on the chosen
+  release are left untouched and show up as an album of their own. What happens to favourites, ratings
+  and play counts across a retag has not been measured; the clients do not promise either way.
 - A completed fill flips lb-bot's index row to `present` while the local library cache still has no
   album for it. Briefly, an album can look like it vanished *because* the download succeeded.
 - The per-album `quality` setting is a **ranking** term upstream, not a filter. You may not get the
@@ -457,8 +466,9 @@ Navic (basic operation confirmed live).
 - Cast adoption after force-stop; paused idle-out; a DHCP address change mid-session.
 - **Cast scrobbling**, including the negative case: with Feishin also running, Navic should be
   `BRIDGED_ELSEWHERE` and must **not** scrobble. Double-counting is the failure mode.
-- **The lb-bot edition override end to end**, and the rescan spinner surviving until `scanned_at`
-  moves. Needs hub + lb-bot restarted first.
+- **The lb-bot album override, cover change and name merge end to end** (apply, partial result,
+  undo, the "Download all files" row), and the rescan spinner surviving until `scanned_at` moves.
+  Needs hub + lb-bot restarted first, and Report Real Path on.
 - **The full saved-queue walk-through** with hub + Feishin + a fresh Navic APK together.
 - **iOS compilation.** Mechanical edits, entirely unverified.
 
