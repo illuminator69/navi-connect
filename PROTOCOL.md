@@ -1514,6 +1514,20 @@ a success nor a failure.
 as finished; `total` is every track that isn't `present`; `failed` is counted apart; the
 percent rounds half up.
 
+**Gap track numbers** (one rule in both clients' gap sheet or modal). A gap view's
+`tracks[]` rows carry `disc` beside `position` since 2026-10-10: an integer, always sent
+by a current lb-bot, `0` when the disc is not known; an older lb-bot sends no field, and
+a client reads that as `0`. `position` is the track's number on its own disc, so a
+two-disc gap listed by position alone reads 1, 2, 1, 2. A gap shows the disc only when
+some row has `disc > 1`: a row with `disc >= 1` is then labelled `<disc>-<position>`
+(`2-1`), and a row with `disc == 0` keeps its bare position rather than claim a disc
+lb-bot did not name. With no row above disc 1 nothing changes: a single-disc gap, and
+any gap from an older lb-bot, reads as it did. The hub passes `disc` through untouched:
+its projection of the gap view (§15, "`GET /lb/gap` is projected") only removes the
+fields it names, `/lb/fills` is relayed as lb-bot answers it, and the `fill` frame
+(§15.1) — the one gap shape the hub rebuilds field by field — is a flat summary with no
+`tracks`.
+
 ### 15.3 The index mirror — `/lb/index/*`, `POST /lb/index`, and the `index` and `lb` frames
 
 Every client keeps a **local copy of lb-bot's library index** (its `artists` and
