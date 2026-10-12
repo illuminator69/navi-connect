@@ -51,7 +51,7 @@ sources are ready, and what it's working on.
 
 <p align="center">
   <img src="docs/screenshots/lb-bot-fill-gaps.png" width="720"
-       alt="lb-bot Fill gaps workspace showing an album with 14 of 16 present, 2 tracks missing, and the missing track list" />
+       alt="lb-bot's Needs you page: the queue of albums with gaps on the left, and one album open beside it with 14 of 16 tracks in the library, its 2 missing tracks listed and a Find sources button" />
 </p>
 
 ### Everything else
