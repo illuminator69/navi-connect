@@ -59,21 +59,26 @@ def tracks(n, prefix="t"):
 
 
 class Hub:
-    """One hub subprocess on a free port, with its own state file and log."""
+    """One hub subprocess on a free port, with its own state file and log.
 
-    def __init__(self, debug=False):
+    `env` is added to the hub's environment. `stop()` then `start()` is a restart
+    on the same ports and the same state file, for a case about what survives one.
+    """
+
+    def __init__(self, debug=False, env=None):
         self.port, self.health_port = _free_port(), _free_port()
         self.url = f"ws://127.0.0.1:{self.port}"
         self.state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
         self.logfile = tempfile.NamedTemporaryFile(suffix=".log", delete=False)
         self.debug = debug
+        self.env = dict(env or {})
         self.proc = None
 
-    async def __aenter__(self):
+    async def start(self):
         env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(self.port),
                "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": self.state,
                "HUB_HOST": "127.0.0.1", "HUB_HEALTH_PORT": str(self.health_port),
-               "HUB_DEBUG": "1" if self.debug else ""}
+               "HUB_DEBUG": "1" if self.debug else "", **self.env}
         self.proc = subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR,
                                      stdout=self.logfile, stderr=subprocess.STDOUT)
         # The health port is bound first, the WebSocket port right after it.
@@ -87,12 +92,19 @@ class Hub:
         await asyncio.sleep(0.4)
         return self
 
-    async def __aexit__(self, *exc):
+    async def stop(self):
+        """SIGTERM: the hub's graceful stop, which flushes its state file."""
         self.proc.terminate()
         try:
             await asyncio.to_thread(self.proc.wait, 5)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+    async def __aenter__(self):
+        return await self.start()
+
+    async def __aexit__(self, *exc):
+        await self.stop()
         unlink_state(self.state)
         self.logfile.close()
         os.unlink(self.logfile.name)
@@ -115,12 +127,14 @@ class Peer:
     `applied` to its `seq` and report at once, which is the contract.
     `auto_release`: answer `do:release` with a final report and `released`.
     Both are switched off by a case that wants to break the contract by hand.
+    Further keywords go into `hello.device` as they are (`kind`, `bridgedBy`).
     """
 
-    def __init__(self, name, device_id=None, caps=("receiver", "controller")):
+    def __init__(self, name, device_id=None, caps=("receiver", "controller"), **device):
         self.name = name
         self.device_id = device_id or name.lower()
         self.caps = list(caps)
+        self.device = device
         self.ws = None
         self.frames = []          # every frame, in arrival order
         self.sessions = []        # every `session` frame
@@ -146,7 +160,7 @@ class Peer:
         await self.ws.send(json.dumps({
             "t": "hello", "token": TOKEN,
             "device": {"id": self.device_id, "name": self.name,
-                       "platform": "test", "caps": self.caps}}))
+                       "platform": "test", "caps": self.caps, **self.device}}))
         asyncio.create_task(self._loop())
         if settle:
             await asyncio.sleep(settle)

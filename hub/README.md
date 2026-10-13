@@ -106,7 +106,9 @@ HUB_TOKEN=dev python tools/controller.py
 `fake_receiver.py --echo` takes the cap `cmdEcho` and keeps the receiver's side of
 the command echo (PROTOCOL §5.3); `--stale-first`, `--settle-ms N`, `--never-settle`
 and `--playing-after-clear` each break that contract in one way, so the hub's answer
-can be watched. `lag_proxy.py 4791 ws://127.0.0.1:4790 --delay-ms 300` relays the
+can be watched. `--kind speaker --volume 35` makes it say what it is and how loud it
+is (PROTOCOL §3.1, §5.3): the row in `controller.py`'s device list shows both, and
+follows the level when the receiver changes it. `lag_proxy.py 4791 ws://127.0.0.1:4790 --delay-ms 300` relays the
 WebSocket with a delay each way: point a client at the proxy to see what a control
 does on a slow link (the hub's HTTP routes are not relayed).
 
@@ -117,6 +119,7 @@ pip install -r requirements.txt
 python tools/test_transfer.py     # asserts resume at the same index + position
 python tools/test_cmd_echo.py     # do.seq / report.applied, reconnect, the backstop
 python tools/test_act_ack.py      # act.cid / ack, refusals, acts held by a transfer
+python tools/test_device_rows.py  # hello.device.kind, deviceState.volume, across a restart
 ```
 
 Every `tools/test_*.py` is a script that starts its own hub on a free port and exits
@@ -126,7 +129,10 @@ non-zero on failure.
 
 Each client (Feishin fork, Navic fork) is both controller and receiver:
 
-- connect, send `hello` with a stable device id + `caps`;
+- connect, send `hello` with a stable device id + `caps`, and `kind` (what the
+  device is: `computer`, `phone`, `tablet`, `speaker`, `tv`, `group`);
+- report its own volume in `deviceState {volume}` after `welcome` and on every
+  change (PROTOCOL §5.3);
 - as **receiver**: obey `do` (`load/play/pause/jump/seek/queueChanged/clear/
   setVolume/setRepeat/setShuffle/release`) and emit `report` ~1 Hz while playing;
   with the cap `cmdEcho`, echo `do.seq` in `report.applied` (PROTOCOL §5.3);

@@ -305,6 +305,30 @@ def _as_str(v: Any, max_len: int = SQ_STR_MAX) -> Optional[str]:
     return v[:max_len]
 
 
+# What a device says it is (`hello.device.kind`, PROTOCOL §3.1): the icon a picker
+# draws. The hub never interprets it, so the vocabulary can grow without a hub
+# release; only the shape is checked, because the value is stored and re-sent to
+# every client on every `devices` frame.
+_KIND_RE = re.compile(r"[a-z]{1,16}")
+
+
+def _as_kind(v: Any) -> Optional[str]:
+    """A device kind (1 to 16 lowercase letters), or None for anything else."""
+    return v if isinstance(v, str) and _KIND_RE.fullmatch(v) else None
+
+
+def _as_level(v: Any) -> Optional[int]:
+    """A volume level a device reported, clamped to 0..100, or None if it is not
+    a number. None and never a default: a report that cannot be read must leave
+    the row as it was, not set it to something."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return max(0, min(100, round(v)))
+    except (ValueError, OverflowError):  # NaN and Infinity, which json.loads accepts
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # State file: reading it defensively, and the fsynced backup beside it
 # --------------------------------------------------------------------------- #
@@ -455,9 +479,14 @@ class Device:
     name: str = "Unknown"
     platform: str = "unknown"
     caps: list[str] = field(default_factory=lambda: ["controller"])
+    # What the device says it is (see _as_kind); None = it never said. Persisted,
+    # so a row keeps its icon while the device is offline and across a restart.
+    kind: Optional[str] = None
     # PRESENCE: a WebSocket claiming this id is attached right now. For a bridged
     # Chromecast that is the BRIDGE's socket — it says nothing about the speaker.
     online: bool = False
+    # What the device last said its level is (`deviceState.volume`), else what it
+    # was last told (`act:volume`). Always an int: a client reads a null as 100.
     volume: int = 100
     last_seen: int = 0
     ws: Any = None                       # live websocket, not persisted
@@ -523,6 +552,7 @@ class Device:
             "id": self.id,
             "name": self.name,
             "platform": self.platform,
+            "kind": self.kind,
             "caps": self.caps,
             "online": self.online,
             "isActive": self.id == active_id,
@@ -2824,7 +2854,10 @@ class Hub:
                         id=did, name=d.get("name", "Unknown"),
                         platform=d.get("platform", "unknown"),
                         caps=d.get("caps", ["controller"]),
-                        volume=d.get("volume", 100),
+                        kind=_as_kind(d.get("kind")),
+                        # Never anything but an int 0..100, whatever the file holds:
+                        # the row is relayed as it is and a client reads null as 100.
+                        volume=_as_int(d.get("volume"), 100, 0, 100),
                         # _as_int: _prune_devices compares this on every sweep, long
                         # after this guard is gone.
                         last_seen=_as_int(d.get("lastSeen")),
@@ -2906,8 +2939,8 @@ class Hub:
             "mixes": mixes,
             "lbIndex": self.lb_index,
             "devices": [
-                {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
-                 "volume": d.volume, "lastSeen": d.last_seen}
+                {"id": d.id, "name": d.name, "platform": d.platform, "kind": d.kind,
+                 "caps": d.caps, "volume": d.volume, "lastSeen": d.last_seen}
                 for d in self.devices.values()
             ],
         }
@@ -3817,6 +3850,12 @@ class Hub:
         dev.name = desc.get("name", dev.name)
         dev.platform = desc.get("platform", dev.platform)
         dev.caps = desc.get("caps", dev.caps)
+        # A `kind` that does not have the shape is dropped, which reads as "not
+        # given", and a hello that gives none leaves the stored one alone, like
+        # `name` and `platform` above: the hardware is still what it was.
+        kind = _as_kind(desc.get("kind"))
+        if kind is not None:
+            dev.kind = kind
         # A bridged device (a Chromecast) is claimed on behalf of another client.
         # Recording who holds it lets a picker say "bridged by the desktop" and lets
         # a would-be second bridge see the slot is taken (PROTOCOL §12.2).
@@ -4564,12 +4603,20 @@ class Hub:
             await self._refuse(act, "bad_action", f"unknown action {action!r}")
 
     async def _on_device_state(self, dev: Device, msg: dict) -> None:
-        """A bridge's verdict on the hardware behind it (PROTOCOL §12.2).
+        """What a device says about itself between `hello`s (PROTOCOL §5.3).
 
-        Only meaningful from a bridged device: an ordinary client IS its own
-        hardware, so a socket from it already proves reachability. Rebroadcast only
-        on an actual change — bridges re-assert on a timer and a 30 s device fan-out
-        to every client would be pure noise.
+        `reachable` / `appRunning` are a bridge's verdict on the hardware behind
+        it (§12.2), only meaningful from a bridged device: an ordinary client IS
+        its own hardware, so a socket from it already proves reachability.
+
+        `volume` is the device's own level, from ANY device: the row then shows
+        what the device is set to, also after it was changed at the device. It is
+        a report, never a request, so nothing is sent back; in particular not a
+        `do:setVolume`, which the device would apply and report again.
+
+        Rebroadcast only on an actual change. Bridges re-assert on a timer and
+        every device repeats its level on each connect: a device fan-out to every
+        client for those would be pure noise.
         """
         reachable = msg.get("reachable")
         app_running = msg.get("appRunning")
@@ -4579,6 +4626,11 @@ class Hub:
             dev.reachable_at = int(time.time() * 1000)
         if app_running is not None:
             dev.app_running = bool(app_running)
+        level = _as_level(msg.get("volume"))
+        volume_changed = level is not None and level != dev.volume
+        if volume_changed:
+            dlog(f"VOLUME {dev.name}/{dev.id[:8]} reports {level} (row said {dev.volume})")
+            dev.volume = level
         if dev.effective_reachable() != before:
             log(f"~ {dev.name} ({dev.id[:8]}) reachable={dev.reachable}")
             await self._broadcast_devices()
@@ -4592,6 +4644,9 @@ class Hub:
                 self.session.bump()
                 await self._broadcast_session()
                 await self._broadcast_devices()
+        elif volume_changed:
+            # (A reachability change above has already sent the row, level included.)
+            await self._broadcast_devices()
 
     async def _run_transfer(self, act: Act) -> None:
         """Carry one transfer out and ack it: when the handoff is committed or

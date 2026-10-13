@@ -24,6 +24,11 @@ can be watched without a real client:
     --echo --never-settle         take a directive and never carry it out: the
                                   state and `applied` stay where they were
     --echo --playing-after-clear  empty the queue on `clear` but keep "playing"
+
+It also says what it is and how loud it is (PROTOCOL §3.1, §5.3): --kind K goes
+into `hello.device.kind`, and its volume (--volume N to start with, 100 otherwise)
+is reported in `deviceState` after `welcome` and whenever it changes. A
+`do:setVolume` is applied, and so reported, while this receiver holds the session.
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ import argparse
 import asyncio
 import json
 import os
+from typing import Optional
 
 import websockets
 
@@ -41,6 +47,7 @@ class FakeReceiver:
     def __init__(self, url: str, token: str, name: str, device_id: str, *,
                  echo: bool = False, stale_first: bool = False, settle_ms: int = 0,
                  never_settle: bool = False, playing_after_clear: bool = False,
+                 kind: Optional[str] = None, volume: int = 100,
                  quiet: bool = False) -> None:
         self.url, self.token, self.name, self.device_id = url, token, name, device_id
         self.echo = echo
@@ -48,6 +55,8 @@ class FakeReceiver:
         self.settle_ms = settle_ms
         self.never_settle = never_settle
         self.playing_after_clear = playing_after_clear
+        self.kind = kind
+        self.volume = volume
         self.quiet = quiet
         self.pos_ms = 0
         self.index = 0
@@ -55,6 +64,8 @@ class FakeReceiver:
         self.have_queue = False
         # The echo: the `seq` of the last directive carried out on THIS connection.
         self.applied = 0
+        # Whether the hub's session names this device, from `welcome` and `session`.
+        self.active = False
         self.ws = None
 
     def say(self, *a) -> None:
@@ -68,6 +79,18 @@ class FakeReceiver:
         if self.echo:
             frame["applied"] = self.applied
         await self.ws.send(json.dumps(frame))
+
+    async def set_volume(self, level: int) -> None:
+        """Change the level here, as a hardware key would, and say so. A report,
+        not a request: the hub stores it and answers nothing."""
+        level = max(0, min(100, int(level)))
+        if level == self.volume:
+            return
+        self.volume = level
+        await self.report_volume()
+
+    async def report_volume(self) -> None:
+        await self.ws.send(json.dumps({"t": "deviceState", "volume": self.volume}))
 
     async def _ticker(self) -> None:
         while True:
@@ -111,7 +134,11 @@ class FakeReceiver:
     async def _on_do(self, msg: dict) -> None:
         cmd = msg.get("cmd")
         if cmd == "setVolume":
+            if not self.active:
+                self.say(f"volume {msg.get('level')} ignored: not the playing device")
+                return
             self.say(f"volume {msg.get('level')}")
+            await self.set_volume(msg.get("level", self.volume))
             return
         if cmd == "release":
             self.playing = False
@@ -146,11 +173,11 @@ class FakeReceiver:
         async with websockets.connect(self.url, max_size=4 * 1024 * 1024) as ws:
             self.ws = ws
             caps = ["receiver", "controller"] + (["cmdEcho"] if self.echo else [])
-            await ws.send(json.dumps({
-                "t": "hello", "token": self.token,
-                "device": {"id": self.device_id, "name": self.name, "platform": "fake",
-                           "caps": caps},
-            }))
+            device = {"id": self.device_id, "name": self.name, "platform": "fake",
+                      "caps": caps}
+            if self.kind is not None:
+                device["kind"] = self.kind
+            await ws.send(json.dumps({"t": "hello", "token": self.token, "device": device}))
             tick_task = asyncio.create_task(self._ticker())
             try:
                 async for raw in ws:
@@ -161,6 +188,12 @@ class FakeReceiver:
                         self.applied = 0
                         self.say(f"connected as {msg['deviceId'][:8]}"
                                  f" (hub features: {msg.get('features', [])})")
+                        self.active = (msg.get("session") or {}).get(
+                            "activeDeviceId") == msg["deviceId"]
+                        # The level on connect, so the row is true from the start.
+                        await self.report_volume()
+                    elif t == "session":
+                        self.active = msg.get("activeDeviceId") == self.device_id
                     elif t == "do":
                         await self._on_do(msg)
             finally:
@@ -183,13 +216,19 @@ def main() -> None:
                     help="take directives and never carry them out")
     ap.add_argument("--playing-after-clear", action="store_true",
                     help='keep reporting "playing" after a clear')
+    ap.add_argument("--kind", default=None, metavar="K",
+                    help="what this device is, for the picker's icon: computer, "
+                         "phone, tablet, speaker, tv, group")
+    ap.add_argument("--volume", type=int, default=100, metavar="N",
+                    help="the level it starts at and reports on connect (0-100)")
     args = ap.parse_args()
     device_id = args.id or ("fake-" + args.name.lower().replace(" ", "-"))
     asyncio.run(FakeReceiver(
         args.url, args.token, args.name, device_id, echo=args.echo,
         stale_first=args.stale_first, settle_ms=args.settle_ms,
         never_settle=args.never_settle,
-        playing_after_clear=args.playing_after_clear).run())
+        playing_after_clear=args.playing_after_clear,
+        kind=args.kind, volume=max(0, min(100, args.volume))).run())
 
 
 if __name__ == "__main__":

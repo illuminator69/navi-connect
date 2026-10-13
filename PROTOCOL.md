@@ -77,7 +77,8 @@ it is purely a controller. Every device is always a potential controller.
 ```
 Client → Hub : { "t":"hello", "token":"<shared-secret>",
                  "device": { "id":"<persisted-uuid|null>", "name":"Feishin-PC",
-                             "platform":"desktop|android", "caps":["receiver","controller"],
+                             "platform":"desktop|android", "kind":"computer",
+                             "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                  "features": ["cmdEcho", "actAck"],
@@ -90,6 +91,14 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 - Bad/missing `token` → hub sends `{ "t":"error", "code":"auth", ... }` and closes.
 - If `device.id` is null the hub mints a UUID; the client persists it and reuses
   it on every future `hello` (so reconnects don't create duplicate devices).
+- `kind` says what the device is, for the icon a picker draws: `computer`, `phone`,
+  `tablet`, `speaker`, `tv` or `group`. Optional. The hub does not interpret it: it
+  keeps any string of 1 to 16 lowercase letters, stores it with the device (an
+  offline row keeps its icon, also across a hub restart) and relays it in every
+  DeviceInfo (§3.2). Anything else is dropped as if it had not been sent, and a
+  `hello` without one leaves the stored value alone. A client that meets a value it
+  does not know, or `null`, draws its generic icon. No feature flag: an older hub
+  ignores the key.
 - `caps` is also how a client opts into optional behaviour. `"loadAck"` means this
   receiver answers a transfer's `do:load` with a `loaded` frame (§7.1); a receiver
   that does not advertise it is never held to the timeout. `"transferAckV2"` means it
@@ -116,11 +125,18 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 ### 3.2 DeviceInfo
 
 ```json
-{ "id":"cast-abc", "name":"📺 Living Room", "platform":"chromecast",
+{ "id":"cast-abc", "name":"Living Room", "platform":"chromecast", "kind":"tv",
   "caps":["receiver","loadAck"], "online":true, "isActive":false,
   "lastSeen":1755500000000, "volume":40,
   "reachable":true, "appRunning":true, "bridgedBy":"feishin-pc" }
 ```
+
+`kind` is what the device said it is in `hello` (§3.1), or `null` if it never said.
+
+`volume` is the level the device last **reported** (`deviceState.volume`, §5.3),
+else the level it was last **told** (`act:volume`), else 100. Always an integer
+0–100, never `null`. A device applies a level in its own steps (a phone has 15 to
+25) and reports what it actually set, so a row told 37 may come to say 36.
 
 **`online` and `reachable` answer different questions, and conflating them is a
 bug.** `online` means *a WebSocket claiming this id is attached right now*. For a
@@ -183,7 +199,7 @@ on the strength of a report from a bridge that may itself be wedged.
 ### 4.3 DeviceInfo (registry; mirrored to all)
 
 ```jsonc
-{ "id":"uuid", "name":"Feishin-PC", "platform":"desktop",
+{ "id":"uuid", "name":"Feishin-PC", "platform":"desktop", "kind":"computer",
   "caps":["receiver","controller","loadAck"], "online":true,
   "isActive":false, "lastSeen": 1730000000000, "volume": 100,
   // presence (`online`) and reachability are different questions — see §3.2
@@ -368,17 +384,31 @@ could not start. Silence for the directive's `timeoutMs` (10 s) counts as failur
 `transferId` echoes `do:load` and is required from receivers advertising
 `transferAckV2`. See §7.1-7.2.
 
-**`t:"deviceState"` — a bridge's verdict on its hardware** (bridged devices only):
+**`t:"deviceState"` — what a device says about itself.** Every key is optional and
+each stands on its own:
 
 ```jsonc
-{ "t":"deviceState", "reachable":true, "appRunning":true }
+{ "t":"deviceState", "volume":35 }                                        // any device
+{ "t":"deviceState", "reachable":true, "appRunning":true, "volume":35 }   // a bridge
 ```
 
-Sent on change and at least every 30 s. Only meaningful from a device with
-`bridgedBy` set: an ordinary client *is* its own hardware, so its socket already
-proves reachability. `reachable:false` while that device holds the session makes
-the hub pause and relinquish the active slot — nothing else can notice, because
-the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
+`volume` (integer 0–100) is the device's own level, accepted from **every** device,
+receiver or not. The hub stores it as the row's `volume` (§3.2) and broadcasts
+`devices` only when the level changed. It is a report, not a request: the hub never
+answers it with a `do:setVolume`. A value out of range is clamped, and one that is
+not a number changes nothing.
+
+- A device reports its level once after `welcome` and then on every change, at most
+  4 times a second, the last value always sent. The hub does not throttle it.
+- A device that applies a `do:setVolume` sees its own level change and reports that
+  too. That is wanted: the row then says what the device set, not what it was asked.
+
+`reachable` / `appRunning` are a bridge's verdict on its hardware, sent on change
+and at least every 30 s. Only meaningful from a device with `bridgedBy` set: an
+ordinary client *is* its own hardware, so its socket already proves reachability.
+`reachable:false` while that device holds the session makes the hub pause and
+relinquish the active slot — nothing else can notice, because the bridge's own
+socket stays perfectly healthy. See §3.2 and §12.2.
 
 ### 5.4 Hub → all: **broadcasts**
 
@@ -386,7 +416,7 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 |-----|---------|------|
 | `session` | `<Session>` | any intent change (new queue, index, repeat…) |
 | `progress` | `{ positionMs, index, isPlaying }` | throttled live position from active receiver |
-| `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active |
+| `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active, or a row changed (reachability, volume) |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
 | `mixes` | `{ mixes:[<Mix>...] }` | "Mixed for You" recipes changed (§17); also in `welcome` |
 | `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
@@ -858,7 +888,7 @@ mDNS and opens **one hub WebSocket per speaker**, registering it as
 
 ```json
 {"t":"hello","token":"…","device":{
-  "id":"cast-<txt.id>","name":"📺 <txt.fn>","platform":"chromecast",
+  "id":"cast-<txt.id>","name":"<txt.fn>","platform":"chromecast","kind":"tv",
   "caps":["receiver","loadAck"],"bridgedBy":"<bridging client's device id>"}}
 ```
 
@@ -896,6 +926,14 @@ the only party that can tell the difference, and it must say so:
 - Tear the bridge down once the speaker is gone for good — an unplugged Chromecast
   emits no mDNS goodbye, so a bridge that waits for one waits forever, and its
   healthy socket keeps advertising a dead speaker to every client on every network.
+
+**Kind and volume.** The bridge says what the hardware is with `kind` (§3.1), read
+from the `ca` capability bits of the Cast TXT record it already holds: bit 32 set is
+a `group`, else bit 1 (video out) a `tv`, else bit 4 (audio out) a `speaker`, else no
+`kind` at all. The name is the bare `fn`: the icon comes from `kind`, and the device
+id does not change. Whenever it holds a connection to the receiver the bridge reports
+the receiver's volume in `deviceState` (§5.3), from `RECEIVER_STATUS`:
+`status.volume.level` (0..1) as 0–100, and `muted` as 0.
 
 **Ownership.** Both clients can see the same speaker and would register the same
 `cast-<id>`. The hub closes the older socket with **`4003 superseded`** (§3), so

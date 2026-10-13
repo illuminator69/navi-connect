@@ -69,7 +69,9 @@ class Ctl:
                 for i, d in enumerate(self.devices):
                     star = "*" if d["isActive"] else " "
                     on = "online" if d["online"] else "offline"
-                    print(f"  [{i}]{star} {d['name']:16} {on:7} {d['caps']}")
+                    # `kind` is what the device says it is; an older hub sends none.
+                    print(f"  [{i}]{star} {d['name']:16} {d.get('kind') or '-':8} {on:7} "
+                          f"vol {d.get('volume', '?'):>3} {d['caps']}")
             if t == "welcome":
                 print(f"-- hub features: {msg.get('features', [])}")
                 self._print_session(msg["session"])
