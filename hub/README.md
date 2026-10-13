@@ -103,20 +103,32 @@ HUB_TOKEN=dev python tools/controller.py
 #   > transfer 1     (Bedroom resumes at 65s — the Spotify handoff)
 ```
 
+`fake_receiver.py --echo` takes the cap `cmdEcho` and keeps the receiver's side of
+the command echo (PROTOCOL §5.3); `--stale-first`, `--settle-ms N`, `--never-settle`
+and `--playing-after-clear` each break that contract in one way, so the hub's answer
+can be watched. `lag_proxy.py 4791 ws://127.0.0.1:4790 --delay-ms 300` relays the
+WebSocket with a delay each way: point a client at the proxy to see what a control
+does on a slow link (the hub's HTTP routes are not relayed).
+
 ### Automated check
 
 ```bash
 pip install -r requirements.txt
 python tools/test_transfer.py     # asserts resume at the same index + position
+python tools/test_cmd_echo.py     # do.seq / report.applied, reconnect, the backstop
 ```
+
+Every `tools/test_*.py` is a script that starts its own hub on a free port and exits
+non-zero on failure.
 
 ## What clients must implement
 
 Each client (Feishin fork, Navic fork) is both controller and receiver:
 
 - connect, send `hello` with a stable device id + `caps`;
-- as **receiver**: obey `do` (`load/play/pause/jump/seek/queueChanged/setVolume/
-  setRepeat/setShuffle/release`) and emit `report` ~1 Hz while playing;
+- as **receiver**: obey `do` (`load/play/pause/jump/seek/queueChanged/clear/
+  setVolume/setRepeat/setShuffle/release`) and emit `report` ~1 Hz while playing;
+  with the cap `cmdEcho`, echo `do.seq` in `report.applied` (PROTOCOL §5.3);
 - as **controller**: send `act` (`setQueue/play/pause/next/previous/seek/jump/
   repeat/shuffle/volume/transfer/...`).
 

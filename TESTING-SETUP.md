@@ -153,7 +153,7 @@ Optional, and worth adding once the basics work:
 | Variable | Does what |
 |---|---|
 | `NAVIDROME_URL`, `HUB_ND_USER`, `HUB_ND_PASS`, `HUB_MIRROR_PLAYQUEUE=true` | Mirrors the session to Navidrome's `savePlayQueue` so unmodified Subsonic clients resume where you left off. |
-| `HUB_HEALTH_PORT` (default `HUB_PORT`+1) | Plain-HTTP health endpoint for Docker healthchecks. |
+| `HUB_HEALTH_PORT` (default `HUB_PORT`+1) | Plain-HTTP health endpoint for Docker healthchecks. Its JSON also counts `staleReports` (receiver reports dropped because they were read before a command took effect: above zero is the rule working) and `echoBackstops` (a receiver left a command unconfirmed for 12 s: above zero is a client defect). |
 | `HUB_DEVICE_TTL_DAYS` | Drops devices unseen for N days at startup. `0` = keep forever. Set it to something once your picker fills with dead test devices. |
 | `HUB_DEBUG=true` | Per-frame logging at ~1 Hz. Very noisy. Turn it on when playback state misbehaves, off otherwise. |
 

@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -120,6 +121,22 @@ PROGRESS_THROTTLE = 1.0  # seconds between fanned-out progress broadcasts
 INTENT_GRACE = 2.0  # seconds during which receiver reports can't contradict a
                     # fresh user play/pause intent (guards against stale
                     # in-flight 1 Hz reports flipping the state back)
+# The command echo (PROTOCOL §5.2-5.3). A receiver advertising the cap "cmdEcho" gets
+# a `seq` on every directive that changes what its next report says, and names the
+# last one it has carried out in `report.applied`. A report is then judged by that
+# number instead of by INTENT_GRACE: the clock guessed how long a receiver needs,
+# and was wrong both ways (it believed a late stale sample and distrusted an early
+# true one). The clock stays for every device without the cap.
+ECHO_CAP = "cmdEcho"
+ECHO_CMDS = frozenset({"load", "play", "pause", "seek", "jump", "queueChanged", "clear"})
+# A receiver that never confirms a directive must not be distrusted for ever. Once
+# the OLDEST unconfirmed one is this old the device goes back to the INTENT_GRACE
+# rule until it catches up. A guard against a receiver that breaks its contract,
+# not the mechanism: both clients can hold a pause behind a load for ~8.5 s.
+ECHO_BACKSTOP = 12.0
+# What this hub understands beyond the base protocol, advertised in `welcome` so a
+# client can tell a hub that will echo from one that silently ignores the cap.
+HUB_FEATURES = ["cmdEcho"]
 MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 # "Mixed for You" — persistent regenerating recipes (PROTOCOL §17). A saved queue
@@ -444,6 +461,20 @@ class Device:
     reachable_at: int = 0                # when `reachable` was last asserted
     app_running: Optional[bool] = None   # receiver app up (cast bridges only)
     bridged_by: Optional[str] = None     # device id of the client holding this bridge
+    # The command echo (see ECHO_CAP). All of it is per connection: cleared where
+    # `welcome` is written, which is also where the receiver zeroes `applied`.
+    # `echo_need`: seq of the last stamped directive sent since `welcome`; a report
+    # with a smaller `applied` was read before that directive took effect.
+    echo_need: int = 0
+    # (seq, monotonic time) of each stamped directive not yet confirmed, oldest
+    # first. Only the head matters: it is what the backstop clock runs from.
+    echo_sent: Any = field(default_factory=deque)
+    echo_backstop: bool = False          # ECHO_BACKSTOP expired; old rule until caught up
+    echo_timer: Any = None               # the pending backstop callback, if any
+    # The load future a `loaded{ok:false}` resolved. Set from that frame until the
+    # transfer's waiter has rolled the slot back: reports in between describe a
+    # player that failed to start and must not be mirrored into the session.
+    load_refused: Any = None
 
     def effective_reachable(self, now_ms: Optional[int] = None) -> Optional[bool]:
         """`reachable`, demoted to unknown once the asserting bridge goes quiet.
@@ -2441,6 +2472,16 @@ class Hub:
         self._play_intent_at = 0.0  # monotonic time of the last user play/pause intent
         self._position_intent_at = 0.0  # monotonic time of the last seek/jump/skip intent
         self._pre_intent_position = 0  # position_ms just BEFORE that seek/jump/skip
+        self._index_intent_at = 0.0  # monotonic time of the last skip/jump to ANOTHER index
+        self._pre_intent_index = 0  # the index that skip/jump left
+        # The command echo: one counter for the whole process, so a number is never
+        # reused for another device or after a reconnect (PROTOCOL §5.2).
+        self._do_seq = 0
+        self._stale_reports = 0  # /health: reports dropped for `applied` < need
+        self._echo_backstops = 0  # /health: times ECHO_BACKSTOP expired on a device
+        # Tasks nobody awaits (closing a superseded socket). asyncio keeps only weak
+        # references to tasks, so an unreferenced one can be collected mid-flight.
+        self._bg_tasks: set = set()
         self._mirror_task: Optional[asyncio.Task] = None  # single mirror worker
         self._mirror_pending = False  # a newer snapshot is waiting to be written
         self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
@@ -2476,6 +2517,117 @@ class Hub:
         # the new target. MUST be called BEFORE overwriting session.position_ms.
         self._position_intent_at = time.monotonic()
         self._pre_intent_position = self.session.position_ms
+
+    def _mark_index_intent(self, new_index: int) -> None:
+        # The same guard for `index`, which had none: a 1 Hz tick sampled before a
+        # skip names the index just left and used to move the session back to it
+        # (three `session` frames for one `next`). Armed only when the index really
+        # changes: a jump to the current index leaves nothing to tell apart, and
+        # arming it would ignore a true report. MUST be called BEFORE overwriting
+        # session.index.
+        if new_index != self.session.index:
+            self._index_intent_at = time.monotonic()
+            self._pre_intent_index = self.session.index
+
+    def _spawn(self, coro: Any) -> None:
+        """Run `coro` in the background, holding a reference until it is done."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    # ----- the command echo (PROTOCOL §5.2-5.3) ---------------------------- #
+    def _echo_expect(self, dev: Optional[Device], seq: Optional[int] = None) -> Optional[int]:
+        """Raise `dev`'s need to a stamped directive's number and return that number.
+
+        Called by `_do` as it sends, and ahead of the send where a device becomes
+        active for a load that is still to be written (a transfer target): from
+        that instant its reports describe a player that has not loaded yet,
+        whatever they say. Passing the number back in is a no-op, so the later
+        `_do` records nothing twice. None for a device without the cap.
+        """
+        if dev is None or ECHO_CAP not in (dev.caps or []):
+            return None
+        if seq is None:
+            self._do_seq += 1
+            seq = self._do_seq
+        if seq > dev.echo_need:
+            dev.echo_need = seq
+            # Past the backstop the clock is spent: the device stays on the old rule
+            # until `applied` reaches `need`, so there is nothing left to time.
+            if not dev.echo_backstop:
+                dev.echo_sent.append((seq, time.monotonic()))
+                if len(dev.echo_sent) == 1:
+                    self._echo_arm(dev)
+        return seq
+
+    def _echo_confirm(self, dev: Device, applied: int) -> None:
+        """A report from `dev` named `applied`: everything up to it is confirmed."""
+        self._echo_settle(dev, applied)
+        if applied >= dev.echo_need:
+            dev.echo_sent.clear()
+            self._echo_arm(dev)
+            if dev.echo_backstop:
+                dev.echo_backstop = False
+                log(f"echo: {dev.name} ({dev.id[:8]}) caught up at do seq {applied}")
+
+    def _echo_settle(self, dev: Device, seq: Optional[int]) -> None:
+        """Stop the backstop clock for every directive up to `seq`.
+
+        Does not touch `need`: a report still has to name the number to be believed.
+        Besides a report, one thing settles a directive: the hub giving up on a
+        transfer's load. The receiver sends no echoing report after that one
+        (PROTOCOL §5.3, duty 4), so nothing else would ever stop its clock.
+        """
+        sent = dev.echo_sent
+        if seq is None or not sent or sent[0][0] > seq:
+            return
+        while sent and sent[0][0] <= seq:
+            sent.popleft()
+        self._echo_arm(dev)
+
+    def _echo_arm(self, dev: Device) -> None:
+        """(Re)start the backstop clock from the oldest unconfirmed directive.
+
+        From the OLDEST, so a receiver that never settles cannot keep itself
+        distrusted by being sent more directives: three pauses five seconds apart
+        still end the wait twelve seconds after the first.
+        """
+        if dev.echo_timer is not None:
+            dev.echo_timer.cancel()
+            dev.echo_timer = None
+        if dev.echo_backstop or not dev.echo_sent:
+            return
+        seq, sent_at = dev.echo_sent[0]
+        delay = max(0.0, sent_at + ECHO_BACKSTOP - time.monotonic())
+        dev.echo_timer = asyncio.get_running_loop().call_later(
+            delay, self._echo_backstop_fire, dev, seq)
+
+    def _echo_backstop_fire(self, dev: Device, seq: int) -> None:
+        dev.echo_timer = None
+        if dev.echo_backstop or not dev.echo_sent or dev.echo_sent[0][0] != seq:
+            self._echo_arm(dev)  # that directive was confirmed meanwhile
+            return
+        dev.echo_sent.clear()
+        if dev.id != self.session.active_device_id:
+            # It lost the slot with a directive unconfirmed. Its reports are not
+            # mirrored, so there is nothing to misjudge and nothing to count. Should
+            # it take the slot back without having caught up, the first report
+            # dropped for it starts this clock again (see _on_report).
+            return
+        dev.echo_backstop = True
+        self._echo_backstops += 1
+        log(f"echo backstop: {dev.name} ({dev.id[:8]}) has not confirmed do seq {seq} "
+            f"after {ECHO_BACKSTOP:.0f}s (need {dev.echo_need}); its reports go by the "
+            f"{INTENT_GRACE:.0f}s rule until it catches up")
+
+    def _echo_reset(self, dev: Device) -> None:
+        """Forget what `dev` was sent. The one reset point is its `welcome`."""
+        dev.echo_need = 0
+        dev.echo_sent.clear()
+        dev.echo_backstop = False
+        if dev.echo_timer is not None:
+            dev.echo_timer.cancel()
+            dev.echo_timer = None
 
     # ----- persistence ----------------------------------------------------- #
     def _load(self) -> None:
@@ -2673,6 +2825,13 @@ class Hub:
             "uptimeSeconds": int(time.monotonic() - self._started_at),
             "devices": len(self.devices),
             "online": sum(1 for d in self.devices.values() if d.online),
+            # The command echo at work (PROTOCOL §5.3). `staleReports` counts
+            # reports dropped because they were read before a directive took
+            # effect: above zero means the rule is doing its job. `echoBackstops`
+            # counts receivers that left a directive unconfirmed for
+            # ECHO_BACKSTOP: above zero means one is breaking its contract.
+            "staleReports": self._stale_reports,
+            "echoBackstops": self._echo_backstops,
         }
 
     def _state_payload(self) -> tuple[str, Optional[str]]:
@@ -2826,9 +2985,32 @@ class Hub:
              f"transferId {got!r}, awaiting {expected!r}")
         return False
 
-    async def _send_to(self, device_id: Optional[str], obj: dict) -> None:
-        if device_id:
-            await self._send(self.devices.get(device_id), obj)
+    async def _do(self, dev: Optional[Device], cmd: str, required: bool = False,
+                  seq: Optional[int] = None, **fields: Any) -> bool:
+        """Send one directive. EVERY `do` frame the hub writes is built here.
+
+        That is what makes the echo sound: a directive that changes what a report
+        says (ECHO_CMDS) carries a `seq` when its receiver has the cap, and the
+        device's need is raised in the same breath, before the frame is written.
+        A site that built its own frame would send an unnumbered pause the hub then
+        could not tell a stale report from (tools/test_cmd_echo.py greps for one).
+
+        `seq` is a number `_echo_expect` already handed out for this directive.
+        `required` is `_send_required`: the caller's next step depends on delivery.
+        """
+        frame = {"t": "do", "cmd": cmd, **fields}
+        if cmd in ECHO_CMDS and dev is not None and dev.ws is not None:
+            stamped = self._echo_expect(dev, seq)
+            if stamped is not None:
+                frame["seq"] = stamped
+                dlog(f"DO {cmd} seq={stamped} -> {dev.name}/{dev.id[:8]}")
+        if required:
+            return await self._send_required(dev, frame)
+        await self._send(dev, frame)
+        return True
+
+    def _dev(self, device_id: Optional[str]) -> Optional[Device]:
+        return self.devices.get(device_id) if device_id else None
 
     async def _broadcast(self, obj: dict) -> None:
         await asyncio.gather(
@@ -2838,7 +3020,7 @@ class Hub:
 
     async def _broadcast_session(self) -> None:
         self._save()
-        # DIAG (pause-echo hunt): the authoritative state every client is about to receive.
+        # DIAG (echo): the authoritative state every client is about to receive.
         dlog(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
              f"idx={self.session.index} active={self.session.active_device_id}")
         await self._broadcast({"t": "session", **self.session.snapshot()})
@@ -3489,10 +3671,17 @@ class Hub:
             # Before registering, so a device is never half-announced while its
             # welcome waits. A no-op once the hub's first lb-bot probe is in.
             await LB.wait_first_probe(LB_PROBE_STARTUP_WAIT)
-            dev = await self._register(msg.get("device", {}), ws)
+            # NOTHING may suspend between here and the write of `welcome`. _register
+            # adopts the socket, so from that line every directive for this device
+            # is written to it, and `welcome` has to be the first frame on it: it is
+            # where both sides zero the command echo (PROTOCOL §5.2), and a `do`
+            # ahead of it would be numbered for a connection that has not begun.
+            # `ws.send` writes its frame before it first suspends.
+            dev, arrival = self._register(msg.get("device", {}), ws)
             welcome = {
                 "t": "welcome",
                 "deviceId": dev.id,
+                "features": list(HUB_FEATURES),
                 "session": self.session.snapshot(),
                 "savedQueues": self._saved_queues_list(),
                 "mixes": self._mixes_list(),
@@ -3503,11 +3692,21 @@ class Hub:
             }
             if self.lb_index is not None:
                 welcome["lbIndex"] = dict(self.lb_index)
+            self._echo_reset(dev)
             await self._send(dev, welcome)
             await self._broadcast_devices()
-            log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}")
+            log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}; {arrival}")
 
             async for raw in ws:
+                if dev.ws is not ws:
+                    # Superseded: a newer socket registered this id and this one is
+                    # being closed in the background. What it still delivers was
+                    # sent on a connection the hub has moved on from. A report on it
+                    # carries the old connection's `applied`, and a `released` or
+                    # `loaded` would answer a question now put to the new socket;
+                    # those fall to their timeouts.
+                    dlog(f"frame from a superseded socket of {dev.name}/{dev.id[:8]} dropped")
+                    continue
                 try:
                     await self._on_message(dev, json.loads(raw))
                 except Exception as e:  # noqa: BLE001 — never let one bad frame kill the socket
@@ -3520,12 +3719,25 @@ class Hub:
             if dev:
                 await self._disconnect(dev, ws)
 
-    async def _register(self, desc: dict, ws: Any) -> Device:
+    def _register(self, desc: dict, ws: Any) -> tuple[Device, str]:
+        """Bind `ws` to the device `desc` names. Returns it, and a note for the log
+        on where it came from (new, back after N s, replacing a live socket).
+
+        Not a coroutine, on purpose: see the caller. Nothing here may wait.
+        """
         did = desc.get("id") or os.urandom(8).hex()
         dev = self.devices.get(did)
+        now_ms = int(time.time() * 1000)
         if dev is None:
             dev = Device(id=did)
             self.devices[did] = dev
+            arrival = "new id"
+        else:
+            # How long this id was gone, for the question I-035 asks of the log:
+            # does a dropped active device come back within a few seconds? Measured
+            # from its last frame, which for a clean disconnect is the disconnect.
+            away = max(0, now_ms - dev.last_seen) / 1000 if dev.last_seen else None
+            arrival = f"away {away:.1f}s" if away is not None else "away for an unknown time"
         # Evict a prior live socket for this device before adopting the new one.
         # Without this, a reconnect while the old WS is still half-open leaves
         # two sockets bound to one Device, both driving session state.
@@ -3545,18 +3757,22 @@ class Hub:
         dev.reachable_at = 0
         dev.app_running = None
         dev.online = True
-        # Adopt the new socket BEFORE awaiting the old one's close: _disconnect bails
-        # unless it owns dev.ws, so claiming it first is what stops the superseded
-        # socket's teardown from marking the device offline / clearing the active slot.
+        # Adopt the new socket BEFORE closing the old one: _disconnect bails unless
+        # it owns dev.ws, so claiming it first is what stops the superseded socket's
+        # teardown from marking the device offline / clearing the active slot.
         dev.ws = ws
         if old_ws is not None and old_ws is not ws:
-            try:
-                await self._close(old_ws, 4003, "superseded")
-            except Exception:  # noqa: BLE001 — best-effort; its finally still runs
-                pass
-        dev.last_seen = int(time.time() * 1000)
+            # Closed in the background. `close()` waits for the peer's close frame,
+            # and the socket being replaced is typically one the peer can no longer
+            # hear (Wi-Fi to mobile, a laptop lid): awaited here, a device coming
+            # back behind such a socket got its `welcome` 20 s late.
+            self._spawn(self._close(old_ws, 4003, "superseded"))
+            arrival += ", replacing a live socket"
+            if self.session.active_device_id == dev.id:
+                arrival += " (the active device)"
+        dev.last_seen = now_ms
         self._save()
-        return dev
+        return dev, arrival
 
     async def _disconnect(self, dev: Device, ws: Any) -> None:
         # Only tear down if THIS socket is still the device's live socket. On a
@@ -3574,7 +3790,16 @@ class Hub:
         dev.reachable_at = 0
         dev.app_running = None
         dev.bridged_by = None
-        log(f"- {dev.name} ({dev.id[:8]}) disconnected")
+        # Nothing reports on this connection again; stop its backstop clock. (The
+        # echo's own reset point is the next `welcome`.)
+        self._echo_reset(dev)
+        # Whether it held the session is the other half of what I-035 needs from the
+        # log (the `+` line says how long an id was away).
+        held = ""
+        if self.session.active_device_id == dev.id:
+            held = (" (was the active device, "
+                    f"{'playing' if self.session.is_playing else 'paused'})")
+        log(f"- {dev.name} ({dev.id[:8]}) disconnected{held}")
         # If the active receiver dropped, pause the session AND relinquish the active
         # slot (keep the queue/position). Clearing active_device_id is the "no live
         # receiver" signal controllers use to adopt the last-known queue locally
@@ -3606,6 +3831,14 @@ class Hub:
             elif not self._ack_matches(dev, msg, dev.load_tid, "loaded"):
                 pass
             else:
+                if not bool(msg.get("ok", True)):
+                    # The waiter this wakes rolls the slot back, but only on a later
+                    # turn of the loop, and a `report` queued right behind this frame
+                    # is read first: the device is still active, so the state of a
+                    # player that failed to start (index 0, 0 ms) would overwrite the
+                    # resume point the rollback is about to hand back. De-authorize
+                    # it now, as `released` does below; _await_load_ack lifts it.
+                    dev.load_refused = fut
                 fut.set_result(msg)
         elif t == "report":
             await self._on_report(dev, msg)
@@ -3655,9 +3888,48 @@ class Hub:
         # 'do'/'session'/'progress' are hub-authored; ignore if a client sends them.
 
     async def _on_report(self, dev: Device, msg: dict) -> None:
+        # `applied` is read from every report, also one that is about to be ignored:
+        # a receiver confirms a directive whether or not it holds the session, and
+        # the backstop clock must hear it.
+        echo = ECHO_CAP in (dev.caps or [])
+        applied = _as_int(msg.get("applied"), 0, lo=0) if echo else 0
+        if echo:
+            self._echo_confirm(dev, applied)
         # Only the active receiver is authoritative for live playback truth.
         if dev.id != self.session.active_device_id:
             return
+        s = self.session
+        who = f"{dev.name}/{dev.id[:8]}"
+        if dev.load_refused is not None:
+            # It answered a transfer's load with ok:false and the rollback is on its
+            # way (see the `loaded` branch of _on_message). Not believed until then.
+            dlog(f"REPORT from {who} DROPPED(load refused, rollback pending)")
+            return
+        # The command echo. `exact` = this report was read from the player after
+        # every directive the hub has sent it took effect, by the receiver's own
+        # word (PROTOCOL §5.3), so index and play state need no clock.
+        exact = False
+        if echo:
+            if applied >= dev.echo_need:
+                exact = True
+            elif not dev.echo_backstop:
+                # Read before a directive took effect: every field in it may be the
+                # state just left. Dropped whole; the receiver owes a fresh report
+                # the moment `applied` moves.
+                self._stale_reports += 1
+                if not dev.echo_sent:
+                    # Nothing is timing this wait (the clock for that directive was
+                    # stopped while the device did not hold the session). A drop
+                    # must always have the backstop behind it.
+                    dev.echo_sent.append((dev.echo_need, time.monotonic()))
+                    self._echo_arm(dev)
+                dlog(f"REPORT from {who} DROPPED(stale: applied={applied} < "
+                     f"need={dev.echo_need}) idx={msg.get('index')} "
+                     f"pos={msg.get('positionMs')} isPlaying={msg.get('isPlaying')}")
+                return
+            # else: past the backstop. This receiver has left a directive unconfirmed
+            # for ECHO_BACKSTOP, so it is judged by the clocks below like a device
+            # without the cap until `applied` reaches `need`.
         changed = False
         now = time.monotonic()
         if "positionMs" in msg:
@@ -3666,8 +3938,12 @@ class Hub:
             # Within the grace window, reject a report that sits closer to where we
             # just left than to where we intend to be — that's a stale tick. A report
             # near (or past) the new target is real progress and is accepted.
+            #
+            # Kept for a `cmdEcho` device too. It guards something the echo cannot
+            # see: a position POLL inside the receiver that straddles the seek, so a
+            # report sent after the seek took effect still carries the old position.
             report_pos = max(0, int(msg["positionMs"]))
-            target = self.session.position_ms
+            target = s.position_ms
             # "Stale" means the report still sits essentially AT the position we just
             # left. A relative compare (closer-to-pre than to-target) wrongly rejected
             # legitimate reports after a backward seek, where real progress from the
@@ -3676,25 +3952,46 @@ class Hub:
                      and abs(report_pos - self._pre_intent_position) < 1500
                      and abs(report_pos - target) >= 1500)
             if not stale:
-                self.session.position_ms = report_pos
+                s.position_ms = report_pos
             else:
-                dlog(f"REPORT pos={report_pos} from {dev.name}/{dev.id[:8]} "
+                dlog(f"REPORT pos={report_pos} from {who} "
                      f"IGNORED(pos-grace; pre={self._pre_intent_position} target={target})")
         if "index" in msg:
             idx = self._clamp_index(int(msg["index"]))
-            if idx != self.session.index:
-                self.session.index = idx; changed = True
-        if "isPlaying" in msg and msg["isPlaying"] != self.session.is_playing:
+            if idx != s.index:
+                # The mirror of the position rule, for a report judged by the clock:
+                # inside the grace after a skip or jump to another index, one that
+                # still names the index just left is a tick sampled before the skip.
+                left_behind = (not exact
+                               and now - self._index_intent_at < INTENT_GRACE
+                               and idx == self._pre_intent_index)
+                if left_behind:
+                    dlog(f"REPORT idx={idx} from {who} "
+                         f"IGNORED(index-grace; session is at {s.index})")
+                else:
+                    s.index = idx; changed = True
+        if "isPlaying" in msg and msg["isPlaying"] != s.is_playing:
+            playing = bool(msg["isPlaying"])
+            if playing and not s.queue:
+                # Nothing is queued, so nothing can be playing, whoever says so and
+                # whenever: a receiver whose `clear` empties its queue without
+                # pausing keeps reporting "playing" over an empty session.
+                verdict = "IGNORED(empty queue)"
+            elif exact:
+                verdict = "APPLIED(echo)"
+                s.is_playing = playing; changed = True
             # A report may have been sent BEFORE the receiver processed a fresh
             # play/pause command — accepting it would flip the user's intent
             # back (and the next transfer would then carry the wrong state).
-            within_grace = now - self._play_intent_at < INTENT_GRACE
-            # DIAG (pause-echo hunt): a report that contradicts current play-state.
-            dlog(f"REPORT from {dev.name}/{dev.id[:8]} isPlaying={msg.get('isPlaying')} "
-                 f"pos={msg.get('positionMs')} | is_playing={self.session.is_playing} "
-                 f"{'IGNORED(grace)' if within_grace else 'APPLIED'}")
-            if not within_grace:
-                self.session.is_playing = bool(msg["isPlaying"]); changed = True
+            elif now - self._play_intent_at < INTENT_GRACE:
+                verdict = "IGNORED(grace)"
+            else:
+                verdict = "APPLIED"
+                s.is_playing = playing; changed = True
+            # DIAG (echo): a report that contradicts current play-state.
+            dlog(f"REPORT from {who} isPlaying={msg.get('isPlaying')} "
+                 f"pos={msg.get('positionMs')} applied={msg.get('applied')} "
+                 f"| is_playing was {not playing} {verdict}")
 
         if msg.get("ended"):
             self.session.is_playing = False
@@ -3733,7 +4030,7 @@ class Hub:
         action = msg.get("action")
         s = self.session
         active = s.active_device_id
-        # DIAG (pause-echo hunt): every act frame, with the fields that move play-state.
+        # DIAG (echo): every act frame, with the fields that move play-state.
         dlog(f"ACT {action} from {dev.name}/{dev.id[:8]} "
              f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
              f"| pre is_playing={s.is_playing}")
@@ -3745,6 +4042,8 @@ class Hub:
             s.set_active(active)
             promoted = True
             await self._broadcast_devices()
+        # The device every directive of this act goes to.
+        adev = self._dev(active)
 
         # Acts that only make sense against a live receiver. We still apply the intent
         # (so the session stays coherent and clients mirror it), but the sender is told
@@ -3792,9 +4091,8 @@ class Hub:
             # playing locally (e.g. Feishin claiming active), so echoing do:load
             # back would reload/restart it.
             if active and active != dev.id:
-                await self._send_to(active, {"t": "do", "cmd": "load",
-                                             "tracks": s.queue, "index": s.index,
-                                             "positionMs": s.position_ms, "play": s.is_playing})
+                await self._do(adev, "load", tracks=s.queue, index=s.index,
+                               positionMs=s.position_ms, play=s.is_playing)
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
@@ -3812,8 +4110,7 @@ class Hub:
             # Auto DJ / manual enqueue grows the CURRENT saved queue in place.
             self._sync_current_saved_queue()
             s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "queueChanged",
-                                         "tracks": s.queue, "index": s.index})
+            await self._do(adev, "queueChanged", tracks=s.queue, index=s.index)
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
@@ -3833,7 +4130,7 @@ class Hub:
             s.bump()
             # `queueChanged` carries a track list and receivers ignore an empty one,
             # so an emptied queue needs its own command to actually stop the device.
-            await self._send_to(active, {"t": "do", "cmd": "clear"})
+            await self._do(adev, "clear")
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
@@ -3875,13 +4172,11 @@ class Hub:
             self._sync_current_saved_queue()
             s.bump()
             if not s.queue:
-                await self._send_to(active, {"t": "do", "cmd": "clear"})
+                await self._do(adev, "clear")
             else:
-                await self._send_to(active, {"t": "do", "cmd": "queueChanged",
-                                             "tracks": s.queue, "index": s.index})
+                await self._do(adev, "queueChanged", tracks=s.queue, index=s.index)
                 if jump_after_remove:
-                    await self._send_to(active, {"t": "do", "cmd": "jump",
-                                                 "index": s.index})
+                    await self._do(adev, "jump", index=s.index)
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
@@ -3892,56 +4187,58 @@ class Hub:
                 # device was force-stopped). It has no idea what the session holds, so
                 # a bare do:play would resume ITS own stale local queue/position —
                 # hand it the session's queue + resume point instead (PROTOCOL §5.1).
-                await self._send_to(active, {"t": "do", "cmd": "load",
-                                             "tracks": s.queue, "index": s.index,
-                                             "positionMs": s.position_ms, "play": True})
+                await self._do(adev, "load", tracks=s.queue, index=s.index,
+                               positionMs=s.position_ms, play=True)
             else:
-                await self._send_to(active, {"t": "do", "cmd": "play"})
+                await self._do(adev, "play")
             await self._broadcast_session()
 
         elif action == "pause":
             s.is_playing = False; self._mark_play_intent(); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "pause"})
+            await self._do(adev, "pause")
             await self._broadcast_session()
 
         elif action == "playpause":
             s.is_playing = not s.is_playing; self._mark_play_intent(); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "play" if s.is_playing else "pause"})
+            await self._do(adev, "play" if s.is_playing else "pause")
             await self._broadcast_session()
 
         elif action in ("next", "previous"):
             nxt = self._step_index(1 if action == "next" else -1)
             if nxt is None:
                 s.is_playing = False; self._mark_play_intent(); s.bump()
-                await self._send_to(active, {"t": "do", "cmd": "pause"})
+                await self._do(adev, "pause")
             else:
                 self._mark_position_intent()
+                self._mark_index_intent(nxt)
                 s.index = nxt; s.position_ms = 0; s.bump()
-                await self._send_to(active, {"t": "do", "cmd": "jump", "index": s.index})
+                await self._do(adev, "jump", index=s.index)
             await self._broadcast_session()
 
         elif action == "jump":
+            target_index = self._clamp_index(int(msg["index"]))
             self._mark_position_intent()
-            s.index = self._clamp_index(int(msg["index"])); s.position_ms = 0; s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "jump", "index": s.index})
+            self._mark_index_intent(target_index)
+            s.index = target_index; s.position_ms = 0; s.bump()
+            await self._do(adev, "jump", index=s.index)
             await self._broadcast_session()
 
         elif action == "seek":
+            target_ms = max(0, int(msg["positionMs"]))
             self._mark_position_intent()
-            s.position_ms = max(0, int(msg["positionMs"])); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "seek", "positionMs": s.position_ms})
+            s.position_ms = target_ms; s.bump()
+            await self._do(adev, "seek", positionMs=s.position_ms)
             await self._broadcast_session()
 
         elif action == "repeat":
             s.repeat = msg.get("mode", "none"); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "setRepeat", "mode": s.repeat})
+            await self._do(adev, "setRepeat", mode=s.repeat)
             await self._broadcast_session()
 
         elif action == "shuffle":
             s.shuffle = bool(msg.get("on", False))
             self._rebuild_order(); s.bump()
-            await self._send_to(active, {"t": "do", "cmd": "setShuffle",
-                                         "on": s.shuffle, "order": s.order})
+            await self._do(adev, "setShuffle", on=s.shuffle, order=s.order)
             await self._broadcast_session()
 
         elif action == "volume":
@@ -3949,18 +4246,18 @@ class Hub:
             active_dev = self.devices.get(active) if active else None
             if active_dev is not None:
                 active_dev.volume = level
-            await self._send_to(active, {"t": "do", "cmd": "setVolume", "level": level})
+            await self._do(adev, "setVolume", level=level)
             await self._broadcast_devices()
 
         elif action in ("favorite", "rating"):
             # Relay a purpose-built directive with whitelisted fields only — echoing
             # the raw act back would forward the sender's auth token to the receiver.
-            relay = {"t": "do", "cmd": action, "id": msg.get("id")}
             if action == "favorite":
-                relay["favorite"] = bool(msg.get("favorite", True))
+                await self._do(adev, "favorite", id=msg.get("id"),
+                               favorite=bool(msg.get("favorite", True)))
             else:
-                relay["rating"] = max(0, min(5, int(msg.get("rating", 0))))
-            await self._send_to(active, relay)
+                await self._do(adev, "rating", id=msg.get("id"),
+                               rating=max(0, min(5, int(msg.get("rating", 0)))))
 
         elif action == "transfer":
             # Deliberately NOT awaited here. A transfer awaits the old device's
@@ -4139,7 +4436,7 @@ class Hub:
                 s.is_playing = play
                 self._mark_play_intent()
                 s.bump()
-                await self._send(target, {"t": "do", "cmd": "play" if play else "pause"})
+                await self._do(target, "play" if play else "pause")
                 await self._broadcast_session()
             log(f"transfer -> {target.name}: already active, no-op")
             return
@@ -4150,8 +4447,7 @@ class Hub:
             fut = asyncio.get_running_loop().create_future()
             old.release_future = fut
             old.release_tid = tid
-            sent = await self._send_required(
-                old, {"t": "do", "cmd": "release", "transferId": tid})
+            sent = await self._do(old, "release", required=True, transferId=tid)
             try:
                 # A frame that never left the process will never be answered. Waiting
                 # RELEASE_TIMEOUT for it just delays the handoff by a second and a half
@@ -4166,6 +4462,13 @@ class Hub:
         # s.position_ms / s.index now reflect the old device's final report (or last known).
 
         gen = s.set_active(target_id)
+        # The load's number is taken HERE, not where the load is written. From this
+        # line the target is the active device and its reports are mirrored; until
+        # the load has taken effect they describe whatever it was doing before
+        # (probe P4: index 3 at 99 s over a session at index 1, 42 s). Raising its
+        # need now drops them all, and the two broadcasts below can no longer open
+        # a window in which they are believed.
+        load_seq = self._echo_expect(target)
         s.is_playing = play
         self._mark_play_intent()
         s.bump()
@@ -4193,20 +4496,19 @@ class Hub:
         # bridge picks its own — Navic allowed 25s per connect attempt, twice — and a
         # load that lands after the rollback is audio on a speaker no client believes
         # is active. Measured from dispatch; the receiver must answer inside it.
-        await self._send_required(target, {"t": "do", "cmd": "load",
-                                           "transferId": tid,
-                                           "timeoutMs": int(LOAD_TIMEOUT * 1000),
-                                           "tracks": s.queue, "index": s.index,
-                                           "positionMs": s.position_ms, "play": play})
+        await self._do(target, "load", required=True, seq=load_seq,
+                       transferId=tid, timeoutMs=int(LOAD_TIMEOUT * 1000),
+                       tracks=s.queue, index=s.index,
+                       positionMs=s.position_ms, play=play)
         log(f"transfer {tid} -> {target.name} @ index {s.index}, {s.position_ms}ms")
         # Awaited off to the side: this runs inside the *controller's* read loop, and
         # blocking it for LOAD_TIMEOUT would stall every other frame that controller
         # sends while a slow speaker warms up.
         if fut is not None:
-            asyncio.create_task(self._await_load_ack(target, old_id, fut, tid, gen))
+            asyncio.create_task(self._await_load_ack(target, old_id, fut, tid, gen, load_seq))
 
     async def _await_load_ack(self, target: Device, old_id: Optional[str], fut: Any,
-                              tid: str, gen: int) -> None:
+                              tid: str, gen: int, load_seq: Optional[int] = None) -> None:
         """Roll the active slot back if a transfer target never starts playing.
 
         The hub commits `active_device_id` before sending `do:load` on purpose (the
@@ -4215,6 +4517,16 @@ class Hub:
         silent speaker until someone pressed something. A receiver that cannot start
         answers `loaded {ok:false}`; one that is wedged answers nothing.
         """
+        try:
+            await self._settle_load_ack(target, old_id, fut, tid, gen, load_seq)
+        finally:
+            # Whatever happened, the question this device was de-authorized over is
+            # answered (see the `loaded` branch of _on_message).
+            if target.load_refused is fut:
+                target.load_refused = None
+
+    async def _settle_load_ack(self, target: Device, old_id: Optional[str], fut: Any,
+                               tid: str, gen: int, load_seq: Optional[int]) -> None:
         ok, err = False, "timeout"
         try:
             msg = await asyncio.wait_for(fut, LOAD_TIMEOUT)
@@ -4234,6 +4546,8 @@ class Hub:
                 target.load_tid = None
         if ok:
             return
+        # The hub has given up on that load, so nothing is left to wait for on it.
+        self._echo_settle(target, load_seq)
         s = self.session
         # A newer transfer (or a takeover) already moved on — that decision wins.
         #

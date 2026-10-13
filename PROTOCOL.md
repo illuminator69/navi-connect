@@ -80,6 +80,7 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "platform":"desktop|android", "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
+                 "features": ["cmdEcho"],
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
@@ -93,7 +94,18 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
   receiver answers a transfer's `do:load` with a `loaded` frame (§7.1); a receiver
   that does not advertise it is never held to the timeout. `"transferAckV2"` means it
   also echoes the directive's `transferId` on `loaded` and `released`, so the hub can
-  match a reply to the attempt that asked for it (§7.2).
+  match a reply to the attempt that asked for it (§7.2). `"cmdEcho"` means it echoes
+  the number of the last directive it has carried out in every `report` and keeps
+  the five duties of §5.3; the hub then numbers its directives for it (§5.2).
+- `features` lists what this hub understands beyond the base protocol, so a client
+  can tell a hub that honours a cap from an older one that ignores it. Absent means
+  none. `"cmdEcho"`: the hub stamps `do.seq` and judges reports by `applied`.
+- `welcome` is the first frame the hub writes on a connection: no `do` precedes it.
+  It is the one reset point of the command echo, for both sides (§5.2).
+- A `hello` for a `device.id` whose previous socket is still open **replaces** that
+  socket: the hub answers `welcome` at once, closes the old socket (`4003`) without
+  waiting for it, and drops every frame that still arrives on it. A `released` or
+  `loaded` in flight there is lost with the rest, and its phase times out (§7).
 - `bridgedBy` is set only by a **virtual** device — a receiver whose socket is held
   on behalf of hardware the hub cannot reach itself (today: a Chromecast, §12.2).
   It names the client process holding the bridge.
@@ -237,6 +249,20 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 | `setRepeat` / `setShuffle` | `mode` / `on`, `order?` | apply mode |
 | `release` | — | send one final `report` then stop audio and drop active role (used during transfer / shutdown) |
 
+**`seq` — the directives that change what a report says** (to a receiver advertising
+`cmdEcho` only). `load`, `play`, `pause`, `seek`, `jump`, `queueChanged` and `clear`
+carry a number:
+
+```jsonc
+{ "t":"do", "cmd":"pause", "seq":57 }
+```
+
+`seq` is an integer from one counter in the hub process, starting at 1, so on a
+connection a later stamped directive always has the larger number. It means nothing
+across connections: both sides forget it at `welcome`, and nothing is persisted.
+`setVolume`, `setRepeat`, `setShuffle`, `favorite`, `rating` and `release` never carry
+one, and a receiver without the cap is never sent one.
+
 ### 5.3 Receiver → Hub: **reports** (`t:"report"`)
 
 ```jsonc
@@ -252,6 +278,61 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
   received while the session is **not** playing is fanned out as `progress`
   unthrottled, so the one report a receiver sends at a pause reaches controllers
   with the position it actually stopped at.
+
+**`applied` — the command echo** (receivers advertising `cmdEcho`):
+
+```jsonc
+{ "t":"report", "index":6, "positionMs":33000, "isPlaying":false, "applied":57 }
+```
+
+`applied: N` asserts: every stamped directive (§5.2) up to N has been carried out or
+given up on, **and the fields of this report were read from the player after that**.
+Absent means 0. A receiver that takes the cap MUST:
+
+1. Move `applied` forward only, only for directives received on the current
+   connection, and for every one of them on every exit: carried out, refused, failed
+   or superseded. Set it to 0 on reading `welcome`.
+2. Move it only once the directive's effect is in the player's state. Arrival is not
+   enough.
+3. Send any report that leaves before that with the previous number.
+4. When it moves, send a report at once, read from the player at that moment and not
+   from values cached by change events, whether or not it believes it is the active
+   device (the hub decides that). Two exceptions: none after `do:release`, whose
+   final report (which carries `applied`) and `released` are read from the player the
+   same way; and none after a **transfer's** load (one with a `transferId`) that it
+   answered `loaded{ok:false}`, because the hub rolls that back. Any other load that
+   fails is echoed, and the receiver pauses first, so the echo says "not playing".
+5. Give up after a short deadline of its own (about 1.5 s) on a directive whose
+   effect it cannot observe, and move `applied` anyway. From then on its reports are
+   simply the truth.
+
+What the hub does with it. Per device, *need* is the `seq` of the last stamped
+directive sent to it since its `welcome`; for a transfer target (§7) it is raised to
+the load's number the moment the target is made active, before the load is written.
+
+- `applied < need`: the report is **dropped whole**. Duty 4 guarantees a fresh one.
+- `applied >= need`: `index` and `isPlaying` are believed at once, with no clock.
+- Backstop: a receiver that leaves a directive unconfirmed for 12 s is logged
+  (device, `seq`) and judged by the clock rule below until `applied` reaches *need*.
+  The 12 s run from the **oldest** unconfirmed directive; later ones do not restart
+  them. A guard against a receiver that breaks its contract, not the mechanism.
+
+A device without the cap is judged by the clock, as it always was: for 2 s after a
+play/pause intent a report that contradicts it is ignored for `isPlaying`, and for 2 s
+after a skip or jump to **another** index a report still naming the index just left
+is ignored for `index`.
+
+Three rules hold for every device, with or without the cap:
+
+- For 2 s after a seek, skip or jump, a `positionMs` within 1.5 s of the position
+  just left (and not of the new one) is ignored. The echo cannot see this one: a
+  position *poll* inside the receiver can straddle the seek.
+- A report never turns the session to playing while the session's queue is empty.
+- A device that answered a transfer's load with `loaded{ok:false}` is not believed
+  from that frame until the hub has rolled the slot back (§7.1).
+
+The hub's `/health` JSON counts both outcomes: `staleReports` (reports dropped for
+`applied < need`) and `echoBackstops` (times the 12 s ran out).
 
 **`t:"loaded"` — transfer acknowledgement** (receivers advertising `loadAck` only):
 
@@ -370,6 +451,10 @@ the hub.
   last-known queue locally (paused) and can resume by pressing play (which claims the
   active slot); an explicit transfer still works too. A device that was genuinely still
   playing re-claims active via its normal reporter on reconnect.
+- *Active receiver reconnects while its old socket is still open* (Wi-Fi to mobile:
+  the old socket is dead but not yet timed out): it keeps the active slot and the
+  session is not paused. `welcome` is immediate (§3.1), the command echo starts from
+  0 on both sides, and nothing sent on the old socket counts any more.
 
 ### 7.1 Confirming the handoff (`loaded`)
 
