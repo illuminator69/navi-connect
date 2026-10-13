@@ -41,6 +41,13 @@ Clients then connect to `ws://<unraid-host>:4790`.
 If the mirror creds are unset the hub still works fully; it just skips the
 Navidrome write.
 
+Beside `state.json` the hub keeps `state.json.bak`: an fsynced copy, rewritten only
+when a "Mixed for You" recipe or a saved-queue deletion changes — the two things no
+client can send again. If `state.json` is empty or missing at start, the backup is
+loaded instead. If it cannot be parsed it is first renamed to
+`state.json.corrupt-<UTC timestamp>` and left for you to inspect; nothing reads or
+removes those. To reset the hub, delete all of them, not `state.json` alone.
+
 ### AudioMuse Tier-2 proxy (`/sonic/*`)
 
 With `AUDIOMUSE_URL` set, the same port also answers plain HTTP on a whitelist of

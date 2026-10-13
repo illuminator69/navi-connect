@@ -141,6 +141,14 @@ SAVED_QUEUE_SONGS_MAX = 1000  # per-record track cap for CLIENT-SUPPLIED history
 SAVED_QUEUE_SONGS_HARD_MAX = 20000
 SQ_STR_MAX = 512  # longest accepted string field inside a client-supplied saved-queue record
 POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position-only reports
+# state.json is rewritten whole, unsynced, on every session broadcast — fine for
+# what clients re-push or the hub rebuilds (saved queues, session, devices,
+# lbIndex), not for the two collections that exist nowhere else: `mixes` and the
+# `deletedSavedQueues` tombstones. A second copy of the file is therefore kept
+# beside it and fsynced, rewritten only when one of those two changes. Same
+# format as state.json, so `_load` reads either; an older hub ignores it.
+STATE_BACKUP_SUFFIX = ".bak"
+STATE_BACKUP_FLUSH_TIMEOUT = 3.0  # seconds a graceful stop waits for a backup in flight
 
 # --- proxy tuning (shared by the AudioMuse and lb-bot proxies) ---
 PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls PER PROXY (each of the three
@@ -263,6 +271,95 @@ def _as_str(v: Any, max_len: int = SQ_STR_MAX) -> Optional[str]:
     if not isinstance(v, str):
         return None
     return v[:max_len]
+
+
+# --------------------------------------------------------------------------- #
+# State file: reading it defensively, and the fsynced backup beside it
+# --------------------------------------------------------------------------- #
+def _read_state_file(path: str) -> tuple[str, Optional[dict]]:
+    """Read one state file. Returns `(status, data)`, status being one of
+    `ok`, `missing`, `empty` (zero bytes or whitespace) or `corrupt`.
+
+    `empty` and `corrupt` are kept apart on purpose. An empty file carries nothing
+    worth keeping — every subprocess suite starts from a zero-byte temp file —
+    while a corrupt one may be the only copy of something, so the caller sets it
+    aside instead of letting the next save overwrite it.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError as e:
+        log(f"cannot read {path}:", e)
+        return "corrupt", None
+    if not raw.strip():
+        return "empty", None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — bad UTF-8, bad JSON, absurd nesting
+        log(f"cannot parse {path}:", e)
+        return "corrupt", None
+    if not isinstance(data, dict):
+        log(f"cannot use {path}: top level is {type(data).__name__}, not an object")
+        return "corrupt", None
+    return "ok", data
+
+
+def _set_aside_state_file(path: str) -> Optional[str]:
+    """Rename an unreadable state file to `<path>.corrupt-<UTC timestamp>` so its
+    bytes survive the next save. Returns the new name, or None if the rename failed."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    target = f"{path}.corrupt-{stamp}"
+    n = 1
+    while os.path.exists(target):  # two set-asides inside one second
+        n += 1
+        target = f"{path}.corrupt-{stamp}-{n}"
+    try:
+        os.replace(path, target)
+    except OSError as e:
+        log(f"could not set {path} aside:", e)
+        return None
+    return target
+
+
+def _durable_signature(mixes: Any, tombstones: Any) -> Optional[str]:
+    """A comparable fingerprint of the part of the state nothing else can restore.
+
+    Takes the two collections rather than a Hub so the same function fingerprints
+    the live state and a parsed backup file. None means "cannot tell", which never
+    equals a real signature — so an unreadable backup is simply rewritten.
+    """
+    try:
+        return json.dumps([mixes or [], sorted((tombstones or {}).items())],
+                          sort_keys=True)
+    except Exception:  # noqa: BLE001 — a hand-edited backup with the wrong shapes
+        return None
+
+
+def _write_state_backup_blocking(path: str, payload: str) -> None:
+    """Write the backup durably: own temp name, fsync, rename, fsync the directory.
+
+    Blocking — called through `asyncio.to_thread`, or directly at boot before
+    anything is being served. Its temp file is not state.json's, so this never
+    races `_save()`'s own unsynced write.
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    # The rename is only durable once the directory is. Best-effort: the production
+    # volume is a FUSE share, where fsync on a directory can simply be refused.
+    try:
+        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -2347,6 +2444,14 @@ class Hub:
         self._mirror_task: Optional[asyncio.Task] = None  # single mirror worker
         self._mirror_pending = False  # a newer snapshot is waiting to be written
         self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
+        # The fsynced backup of state.json (STATE_BACKUP_SUFFIX). Same shape as the
+        # mirror above: one worker, latest payload wins, never two writers.
+        self._backup_task: Optional[asyncio.Task] = None
+        self._backup_pending = False
+        self._backup_latest: Optional[tuple[str, str]] = None  # (signature, payload)
+        # Signature of the newest backup written or queued; None = unknown, so the
+        # next save writes one. Set by _load() before anything can save.
+        self._backup_sig: Optional[str] = None
         self._started_at = time.monotonic()
         # Serializes transfers, which run off the issuing socket's read loop (see
         # _on_act's "transfer" branch) and so could otherwise interleave.
@@ -2374,18 +2479,84 @@ class Hub:
 
     # ----- persistence ----------------------------------------------------- #
     def _load(self) -> None:
-        try:
-            with open(STATE_PATH, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if not raw:
-                log("state file empty, starting fresh")
+        """Boot: read state.json, or fall back to its backup, or start fresh.
+
+        Parsing is kept apart from applying. A file that cannot be PARSED is set
+        aside under a `.corrupt-<UTC>` name and the backup is loaded instead; it
+        used to be logged and then overwritten by the first save, which is how a
+        damaged file became a lost one. A file that parses is APPLIED section by
+        section (see `_apply_state`).
+        """
+        bak_path = STATE_PATH + STATE_BACKUP_SUFFIX
+        status, data = _read_state_file(STATE_PATH)
+        restored = False
+        if status != "ok":
+            if status == "corrupt":
+                aside = _set_aside_state_file(STATE_PATH)
+                if aside:
+                    log(f"state file unreadable — set aside as {aside}")
+            bak_status, data = _read_state_file(bak_path)
+            if bak_status == "corrupt":
+                aside = _set_aside_state_file(bak_path)
+                if aside:
+                    log(f"state backup unreadable too — set aside as {aside}")
+            if bak_status != "ok":
+                log("state file empty, starting fresh" if status == "empty"
+                    else "no prior state, starting fresh")
+                # Nothing irreplaceable exists yet, so nothing is owed a backup: the
+                # empty state counts as already backed up, and the backup file first
+                # appears with the first mix or tombstone.
+                self._backup_sig = _durable_signature([], {})
                 return
-            data = json.loads(raw)
+            restored = True
+            log(f"state file {status} — restoring from {bak_path}")
+
+        self._apply_state(data)
+        log(f"loaded state: {len(self.session.queue)} queued, {len(self.devices)} known devices")
+
+        if restored:
+            # Put state.json back at once rather than on the first broadcast: until
+            # then the backup would be the only copy.
+            self._backup_sig = _durable_signature(data.get("mixes"),
+                                                  data.get("deletedSavedQueues"))
+            self._save(blocking_backup=True)
+            return
+        # A clean load. Bring the backup in line if it disagrees with what was just
+        # loaded — it is stale, unreadable, or (first boot on this build, with a mix
+        # or tombstone already in the file) not there yet. state.json wins.
+        bak_status, bak = _read_state_file(bak_path)
+        if bak_status == "ok":
+            self._backup_sig = _durable_signature(bak.get("mixes"),
+                                                  bak.get("deletedSavedQueues"))
+        elif bak_status == "corrupt":
+            self._backup_sig = None
+        else:
+            self._backup_sig = _durable_signature([], {})
+        try:
+            payload, sig = self._state_payload()
+        except Exception as e:  # noqa: BLE001
+            log("failed to build the state backup:", e)
+            return
+        self._request_backup(sig, payload, blocking=True)
+
+    def _apply_state(self, data: dict) -> None:
+        """Apply a parsed state file, each section guarded on its own.
+
+        One `try` around the lot meant `"mixes": null`, or a single device row with
+        no `id`, aborted everything after it — and the hub then ran, and saved, with
+        only what had been applied so far. That turned one bad value into the loss
+        of every section behind it. A section that cannot be read is now logged and
+        skipped; the others load.
+        """
+        def session() -> None:
             s = data.get("session", {})
+            queue = s.get("queue", [])
+            if not isinstance(queue, list):
+                raise TypeError(f"queue is {type(queue).__name__}, not a list")
             self.session = Session(
                 rev=s.get("rev", 0),
                 active_device_id=None,  # nothing is live yet after a restart
-                queue=s.get("queue", []),
+                queue=queue,
                 index=s.get("index", 0),
                 order=s.get("order"),
                 position_ms=s.get("positionMs", 0),
@@ -2397,6 +2568,8 @@ class Hub:
                 source_kind=s.get("sourceKind", "manual"),
                 source_name=s.get("sourceName"),
             )
+
+        def saved_queues() -> None:
             # Saved-queue history (rolling, capped). Keyed by id for cheap upsert.
             # Re-sanitised on the way in so a state.json written by an older build (which
             # stored client values verbatim) can't keep breaking _save() forever.
@@ -2404,6 +2577,8 @@ class Hub:
                 clean = self._sanitize_saved_queue(rec, SAVED_QUEUE_SONGS_HARD_MAX)
                 if clean is not None:
                     self.saved_queues[clean["id"]] = clean
+
+        def mixes() -> None:
             # Additive in exactly the way savedQueues is: there is no schema version
             # and no migration path in this file, only `data.get(key, default)`. So a
             # state.json from before mixes existed loads with zero of them, and an
@@ -2413,27 +2588,48 @@ class Hub:
                 clean = self._sanitize_mix(raw_mix)
                 if clean is not None:
                     self.mixes[clean["id"]] = clean
+
+        def lb_index() -> None:
             # Additive like `mixes`: a state.json from before the index mirror
             # simply has no hint, and welcome omits the field until lb-bot pushes.
             self.lb_index = _lb_index_hint(data.get("lbIndex"))
+
+        def tombstones() -> None:
             for rid, at in (data.get("deletedSavedQueues") or {}).items():
                 try:
                     self.deleted_saved_queues[rid] = int(at)
                 except (TypeError, ValueError):
                     continue
+
+        def devices() -> None:
             for d in data.get("devices", []):
-                self.devices[d["id"]] = Device(
-                    id=d["id"], name=d.get("name", "Unknown"),
-                    platform=d.get("platform", "unknown"),
-                    caps=d.get("caps", ["controller"]),
-                    volume=d.get("volume", 100), last_seen=d.get("lastSeen", 0),
-                )
+                try:  # per row: one bad device must not cost the whole registry
+                    did = d["id"]
+                    if not isinstance(did, str) or not did:
+                        raise ValueError(f"id is {did!r}")
+                    self.devices[did] = Device(
+                        id=did, name=d.get("name", "Unknown"),
+                        platform=d.get("platform", "unknown"),
+                        caps=d.get("caps", ["controller"]),
+                        volume=d.get("volume", 100),
+                        # _as_int: _prune_devices compares this on every sweep, long
+                        # after this guard is gone.
+                        last_seen=_as_int(d.get("lastSeen")),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log("state: skipped an unreadable device row:", e)
+
+        for name, section in (("session", session), ("savedQueues", saved_queues),
+                              ("mixes", mixes), ("lbIndex", lb_index),
+                              ("deletedSavedQueues", tombstones), ("devices", devices)):
+            try:
+                section()
+            except Exception as e:  # noqa: BLE001
+                log(f"state: skipped unreadable {name}:", e)
+        try:
             self._prune_devices()
-            log(f"loaded state: {len(self.session.queue)} queued, {len(self.devices)} known devices")
-        except FileNotFoundError:
-            log("no prior state, starting fresh")
         except Exception as e:  # noqa: BLE001
-            log("failed to load state:", e)
+            log("state: device pruning failed:", e)
 
     def _prune_devices(self) -> None:
         """Drop known devices not seen within DEVICE_TTL_DAYS (0 = keep forever).
@@ -2479,29 +2675,98 @@ class Hub:
             "online": sum(1 for d in self.devices.values() if d.online),
         }
 
-    def _save(self) -> None:
+    def _state_payload(self) -> tuple[str, Optional[str]]:
+        """state.json's text, serialised once, plus the signature of its
+        irreplaceable part (see `_durable_signature`)."""
+        mixes = self._mixes_list()
+        data = {
+            "session": self.session.snapshot(),
+            "savedQueues": self._saved_queues_list(),
+            "deletedSavedQueues": self.deleted_saved_queues,
+            "mixes": mixes,
+            "lbIndex": self.lb_index,
+            "devices": [
+                {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
+                 "volume": d.volume, "lastSeen": d.last_seen}
+                for d in self.devices.values()
+            ],
+        }
+        return json.dumps(data), _durable_signature(mixes, self.deleted_saved_queues)
+
+    def _save(self, blocking_backup: bool = False) -> None:
+        # Synchronous, on the loop, and NOT fsynced — on purpose. This runs on every
+        # session broadcast, and a second writer in a thread could land an older
+        # payload last. Durability for the part that needs it is the backup's job.
         try:
             # Built inside the try: _saved_queues_list() sorts records, and a persistence
             # failure must not escape into whichever act handler happened to trigger it.
-            data = {
-                "session": self.session.snapshot(),
-                "savedQueues": self._saved_queues_list(),
-                "deletedSavedQueues": self.deleted_saved_queues,
-                "mixes": self._mixes_list(),
-                "lbIndex": self.lb_index,
-                "devices": [
-                    {"id": d.id, "name": d.name, "platform": d.platform, "caps": d.caps,
-                     "volume": d.volume, "lastSeen": d.last_seen}
-                    for d in self.devices.values()
-                ],
-            }
+            payload, sig = self._state_payload()
             os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
             tmp = STATE_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
+                f.write(payload)
             os.replace(tmp, STATE_PATH)
         except Exception as e:  # noqa: BLE001
             log("failed to save state:", e)
+            return
+        self._request_backup(sig, payload, blocking=blocking_backup)
+
+    def _request_backup(self, sig: Optional[str], payload: str,
+                        blocking: bool = False) -> None:
+        """Queue a durable copy of `payload` if its irreplaceable part has changed.
+
+        Called on every save, and a no-op on nearly all of them: position, queue and
+        device changes leave the signature alone, so they cost no fsync. Single
+        flight, like the play-queue mirror — the newest payload replaces a waiting
+        one and one worker does the writing.
+        """
+        if sig is None or sig == self._backup_sig:
+            return
+        self._backup_sig = sig
+        self._backup_latest = (sig, payload)
+        if self._backup_task is not None and not self._backup_task.done():
+            self._backup_pending = True  # the running worker picks it up
+            return
+        if not blocking:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                blocking = True  # no loop (boot, or a test driving _save directly)
+        if blocking:
+            # Nothing is being served and no worker exists, so write it here.
+            self._backup_latest = None
+            self._write_backup(sig, payload)
+            return
+        self._backup_pending = True
+        self._backup_task = asyncio.create_task(self._backup_worker())
+
+    def _write_backup(self, sig: str, payload: str) -> None:
+        try:
+            _write_state_backup_blocking(STATE_PATH + STATE_BACKUP_SUFFIX, payload)
+        except Exception as e:  # noqa: BLE001
+            self._backup_failed(sig, e)
+
+    def _backup_failed(self, sig: str, err: Exception) -> None:
+        log("failed to write state backup:", err)
+        # Forget the signature so the next save tries again — unless a newer one
+        # has been queued since, in which case that attempt is already on its way.
+        if self._backup_sig == sig:
+            self._backup_sig = None
+
+    async def _backup_worker(self) -> None:
+        try:
+            while self._backup_pending:
+                self._backup_pending = False
+                sig, payload = self._backup_latest
+                self._backup_latest = None
+                try:
+                    await asyncio.to_thread(
+                        _write_state_backup_blocking,
+                        STATE_PATH + STATE_BACKUP_SUFFIX, payload)
+                except Exception as e:  # noqa: BLE001
+                    self._backup_failed(sig, e)
+        finally:
+            self._backup_task = None
 
     def set_lb_index(self, hint: dict) -> None:
         """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE).
@@ -3452,7 +3717,12 @@ class Hub:
             if now - self._last_position_save_at >= POSITION_SAVE_THROTTLE:
                 self._last_position_save_at = now
                 self._save()
-            if now - self._last_progress_sent >= PROGRESS_THROTTLE:
+            # The throttle is for the 1 Hz stream of a PLAYING receiver. A paused one
+            # sends a single report of where it actually stopped and then goes quiet;
+            # throttling that one away (it lands well inside a second of the last
+            # tick) left every controller up to ~1 s off until playback resumed.
+            if (not self.session.is_playing
+                    or now - self._last_progress_sent >= PROGRESS_THROTTLE):
                 self._last_progress_sent = now
                 await self._broadcast({"t": "progress",
                                        "positionMs": self.session.position_ms,
@@ -4213,6 +4483,12 @@ async def main() -> None:
     health_server.close()
     await health_server.wait_closed()
     hub._save()
+    if hub._backup_task is not None and not hub._backup_task.done():
+        try:  # that save may have queued a backup: let the worker write it (bounded)
+            await asyncio.wait_for(asyncio.shield(hub._backup_task),
+                                   STATE_BACKUP_FLUSH_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            pass
     if hub._mirror_task is not None and not hub._mirror_task.done():
         try:  # let a debounced savePlayQueue write finish (best-effort, short)
             await asyncio.wait_for(asyncio.shield(hub._mirror_task), 3)

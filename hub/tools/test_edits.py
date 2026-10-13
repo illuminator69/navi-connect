@@ -35,6 +35,16 @@ TOKEN = "test-token"
 URL = f"ws://127.0.0.1:{PORT}"
 
 
+def unlink_state(path):
+    """Remove a hub state file AND the backup the hub keeps beside it (`.bak`) —
+    which exists as soon as a run has saved a mix or tombstoned a saved queue."""
+    for p in (path, path + ".bak"):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+
+
 class Client:
     def __init__(self, name, device_id=None, caps=("receiver", "controller")):
         self.name = name
@@ -51,6 +61,7 @@ class Client:
         self.position = None         # latest session.positionMs
         self.dos = []                # every `do` directive received
         self.errors = []             # every `error` frame received
+        self.progress = []           # every `progress` frame received
 
     async def connect(self, url=URL):
         self.ws = await websockets.connect(url)
@@ -93,6 +104,8 @@ class Client:
                     self.dos.append(msg)
                 elif t == "error":
                     self.errors.append(msg)
+                elif t == "progress":
+                    self.progress.append(msg)
         except websockets.ConnectionClosed:
             pass
 
@@ -186,7 +199,7 @@ async def main():
             hub.wait(timeout=5)
         except subprocess.TimeoutExpired:
             hub.kill()
-        os.unlink(state)
+        unlink_state(state)
 
     if failures:
         print("FAIL:")
@@ -232,7 +245,7 @@ async def test_prune():
             hub.wait(timeout=5)
         except subprocess.TimeoutExpired:
             hub.kill()
-        os.unlink(state)
+        unlink_state(state)
 
     if failures:
         print("FAIL (prune):")
@@ -345,7 +358,7 @@ async def test_saved_queues():
             hub.wait(timeout=5)
         except subprocess.TimeoutExpired:
             hub.kill()
-        os.unlink(state)
+        unlink_state(state)
 
     if failures:
         print("FAIL (saved queues):")
@@ -494,7 +507,7 @@ async def test_audit_fixes():
             hub.wait(timeout=5)
         except subprocess.TimeoutExpired:
             hub.kill()
-        os.unlink(state)
+        unlink_state(state)
 
     if failures:
         print("FAIL (audit fixes):")

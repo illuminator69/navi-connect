@@ -11,6 +11,7 @@ Commands:
     queue                        load a 5-track demo queue and start playing
     play | pause | next | prev
     seek <ms>
+    volume <0-100>               set the active device's volume
     transfer <deviceIndex>       hand playback to that device, resume in place
     quit
 """
@@ -93,6 +94,8 @@ class Ctl:
                 await ws.send(json.dumps({"t": "act", "action": action}))
             elif cmd == "seek" and args:
                 await ws.send(json.dumps({"t": "act", "action": "seek", "positionMs": int(args[0])}))
+            elif cmd == "volume" and args:
+                await ws.send(json.dumps({"t": "act", "action": "volume", "level": int(args[0])}))
             elif cmd == "transfer" and args:
                 idx = int(args[0])
                 if 0 <= idx < len(self.devices):
@@ -102,7 +105,7 @@ class Ctl:
                     print("bad device index; run `devices`")
             else:
                 print("commands: devices | queue | play | pause | next | prev | seek <ms> | "
-                      "transfer <idx> | quit")
+                      "volume <0-100> | transfer <idx> | quit")
 
 
 def main() -> None:

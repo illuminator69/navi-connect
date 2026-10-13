@@ -158,7 +158,11 @@ Optional, and worth adding once the basics work:
 | `HUB_DEBUG=true` | Per-frame logging at ~1 Hz. Very noisy. Turn it on when playback state misbehaves, off otherwise. |
 
 The hub persists session + device state to `./data`. To reset a test to a clean slate, stop the
-container and delete that directory.
+container and delete that directory — the whole directory: once a mix or a saved-queue deletion
+exists there is a `state.json.bak` beside `state.json`, an fsynced copy the hub restores from when
+`state.json` is empty, missing or unreadable, so deleting `state.json` alone resets nothing. A
+`state.json` the hub cannot parse is renamed to `state.json.corrupt-<UTC timestamp>` rather than
+overwritten; those files are yours to inspect and delete.
 
 **Verify:** `docker logs navi-connect-hub` shows it listening on 4790. `hub/tools/fake_receiver.py`
 and `hub/tools/controller.py` let you drive a session with no real client at all — the fastest way to

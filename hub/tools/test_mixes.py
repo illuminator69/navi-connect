@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 
-from test_edits import TOKEN, Client, _free_port
+from test_edits import TOKEN, Client, _free_port, unlink_state
 
 HUB_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -159,7 +159,7 @@ async def test_crud_and_touch():
             failures.append(f"deleteMix left the recipe behind: {b.mixes}")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -243,8 +243,8 @@ async def test_cap_and_persistence():
             failures.append("a mix could not be added to a pre-mixes state file")
     finally:
         stop(hub)
-        os.unlink(legacy)
-        os.unlink(state)
+        unlink_state(legacy)
+        unlink_state(state)
     return failures
 
 

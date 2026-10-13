@@ -59,7 +59,9 @@ it is purely a controller. Every device is always a potential controller.
   `PING_TIMEOUT_MS`). A receiver missing 2 pongs is marked `online:false` and, if
   it was active, the session is auto-paused (queue/index/position retained).
 - **Reconnect:** clients reconnect with exponential backoff and re-send `hello`
-  with their persisted `deviceId` to reclaim their registry slot.
+  with their persisted `deviceId` to reclaim their registry slot. When the OS
+  reports the network back, or the machine wakes from sleep, a client should
+  reconnect at once rather than wait out the backoff it had reached.
 
 **Close codes.**
 
@@ -245,7 +247,11 @@ hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 - Sent **once per second while playing**, and **immediately** on any state change
   (play/pause, track change via local auto-advance, seek completion).
 - The hub updates `session.positionMs/index/isPlaying` from this and rebroadcasts
-  (throttled; position-only updates need not bump `rev`).
+  (throttled; position-only updates need not bump `rev`). The throttle
+  (`PROGRESS_THROTTLE`, 1 s) is for a playing receiver's 1 Hz stream: a report
+  received while the session is **not** playing is fanned out as `progress`
+  unthrottled, so the one report a receiver sends at a pause reaches controllers
+  with the position it actually stopped at.
 
 **`t:"loaded"` — transfer acknowledgement** (receivers advertising `loadAck` only):
 

@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 
-from test_edits import TOKEN, Client, _free_port
+from test_edits import TOKEN, Client, _free_port, unlink_state
 
 HUB_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -131,7 +131,7 @@ async def test_resurrection_and_batch():
             failures.append("syncSavedQueues merged a row the same frame deleted")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -172,7 +172,7 @@ async def test_live_record_reconciliation():
                 failures.append(f"an offline copy overwrote the live cursor: {live.get('currentIndex')}")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
 
     # --- 4. restart with a savedQueueId whose record is gone ------------------- #
     port2 = _free_port()
@@ -205,7 +205,7 @@ async def test_live_record_reconciliation():
             failures.append(f"a stale client copy became the live record: {orphan['songs']}")
     finally:
         stop(hub)
-        os.unlink(state2)
+        unlink_state(state2)
     return failures
 
 
@@ -262,7 +262,7 @@ async def test_malformed_input():
             failures.append("state.json didn't survive the malformed payload")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -326,7 +326,7 @@ async def test_history_scrubs_credentials():
             failures.append("the LIVE queue's preview streamUrl was altered")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -368,7 +368,7 @@ async def test_history_scrub_on_load():
                                 f"credentialed streamUrl after load: {song['streamUrl']!r}")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -467,7 +467,7 @@ async def test_history_scrubs_cover_credentials():
             failures.append("the LIVE queue lost/altered its imageUrl")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
@@ -516,7 +516,7 @@ async def test_history_cover_scrub_on_load():
                                 f"{legacy.get('coverImageUrl')!r}")
     finally:
         stop(hub)
-        os.unlink(state)
+        unlink_state(state)
     return failures
 
 
