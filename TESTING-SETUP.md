@@ -166,7 +166,9 @@ overwritten; those files are yours to inspect and delete.
 
 **Verify:** `docker logs navi-connect-hub` shows it listening on 4790. `hub/tools/fake_receiver.py`
 and `hub/tools/controller.py` let you drive a session with no real client at all — the fastest way to
-tell a hub problem from a client problem.
+tell a hub problem from a client problem. `hub/tools/lag_proxy.py <port> ws://<hub>:4790 --delay-ms 300`
+puts a slow link in front of the hub: point a client at the proxy's port to see what a control does
+when the hub's answer takes 600 ms (WebSocket only; `/lb/*` and `/sonic/*` are not relayed).
 
 ---
 

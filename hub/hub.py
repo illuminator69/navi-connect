@@ -135,8 +135,23 @@ ECHO_CMDS = frozenset({"load", "play", "pause", "seek", "jump", "queueChanged", 
 # not the mechanism: both clients can hold a pause behind a load for ~8.5 s.
 ECHO_BACKSTOP = 12.0
 # What this hub understands beyond the base protocol, advertised in `welcome` so a
-# client can tell a hub that will echo from one that silently ignores the cap.
-HUB_FEATURES = ["cmdEcho"]
+# client can tell a hub that will echo, and will ack, from one that silently
+# ignores the cap and the `cid`.
+HUB_FEATURES = ["cmdEcho", "actAck"]
+# Acknowledged acts (PROTOCOL §5.1, §5.4). An act carrying `cid` is answered with
+# an `ack` to its sender. Never `id`: eight actions use that for a track, a saved
+# queue or a mix.
+CID_MAX = 64
+# The acts that change the session. While a transfer is being carried out they are
+# HELD (PROTOCOL §7): applied in the middle of one they are sent to the device
+# being abandoned and then overwritten when the handoff commits, which is an act
+# accepted and then undone.
+HELD_ACTIONS = frozenset({"setQueue", "enqueue", "clear", "remove", "move", "play",
+                          "pause", "playpause", "next", "previous", "jump", "seek",
+                          "repeat", "shuffle"})
+# Of those, the ones a handoff can simply carry: the load it sends takes a play
+# state and a position, so the new device never starts what was already stopped.
+FOLDED_ACTIONS = frozenset({"play", "pause", "playpause", "seek"})
 MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 # "Mixed for You" — persistent regenerating recipes (PROTOCOL §17). A saved queue
@@ -471,6 +486,10 @@ class Device:
     echo_sent: Any = field(default_factory=deque)
     echo_backstop: bool = False          # ECHO_BACKSTOP expired; old rule until caught up
     echo_timer: Any = None               # the pending backstop callback, if any
+    # `rev` of the newest session snapshot written to this socket (`welcome` or
+    # `session`). It is what an `ack` reports, so that "the ack names a session
+    # you already hold" is true by construction and not by timing.
+    session_rev_sent: int = 0
     # The load future a `loaded{ok:false}` resolved. Set from that frame until the
     # transfer's waiter has rolled the slot back: reports in between describe a
     # player that failed to start and must not be mirrored into the session.
@@ -2438,6 +2457,45 @@ async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
     return _http_json(200, {"ok": True})
 
 
+class Act:
+    """One `act` frame on its way through the hub: who sent it, on which socket,
+    and what its `ack` will say (PROTOCOL §5.4).
+
+    The socket is kept because a `cid` belongs to a connection. An act that waited
+    behind a transfer can outlive the connection it came in on, and by then its
+    sender may be counting `cid`s from the start again on a new one.
+    """
+    __slots__ = ("dev", "ws", "msg", "cid", "ok", "code", "message", "acked", "committed")
+
+    def __init__(self, dev: "Device", msg: dict) -> None:
+        self.dev = dev
+        self.ws = dev.ws
+        self.msg = msg
+        cid = msg.get("cid")
+        self.cid: Optional[str] = cid[:CID_MAX] if isinstance(cid, str) and cid else None
+        self.ok = True
+        self.code: Optional[str] = None
+        self.message: Optional[str] = None
+        self.acked = False
+        self.committed = False      # a transfer: the handoff was made
+
+    @property
+    def action(self) -> Optional[str]:
+        # None for anything that is not a string: it is looked up in sets, and an
+        # unhashable `action` must end as an acked `bad_action`, not as a raise in
+        # the read loop that leaves a `cid` unanswered.
+        a = self.msg.get("action")
+        return a if isinstance(a, str) else None
+
+    @property
+    def stale(self) -> bool:
+        """Its sender's connection is gone (dropped, or replaced by a newer one)."""
+        return self.dev.ws is not self.ws
+
+    def fail(self, code: str, message: str, ok: bool = False) -> None:
+        self.ok, self.code, self.message = ok, code, message
+
+
 # --------------------------------------------------------------------------- #
 # Hub
 # --------------------------------------------------------------------------- #
@@ -2494,9 +2552,12 @@ class Hub:
         # next save writes one. Set by _load() before anything can save.
         self._backup_sig: Optional[str] = None
         self._started_at = time.monotonic()
-        # Serializes transfers, which run off the issuing socket's read loop (see
-        # _on_act's "transfer" branch) and so could otherwise interleave.
-        self._transfer_lock = asyncio.Lock()
+        # Transfers, and every act held behind one, in arrival order. One task
+        # drains it (`_drain_held`), so transfers cannot interleave; it exists
+        # exactly while the hub is holding acts, and is created by the transfer
+        # that starts the hold. See `_on_act`.
+        self._held: Any = deque()
+        self._drain_task: Optional[asyncio.Task] = None
         # Monotonic id for every handoff, carried on do:release/released and
         # do:load/loaded so a reply can be matched to the attempt that asked for it.
         self._transfer_seq = 0
@@ -3023,8 +3084,18 @@ class Hub:
         # DIAG (echo): the authoritative state every client is about to receive.
         dlog(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
              f"idx={self.session.index} active={self.session.active_device_id}")
-        await self._broadcast({"t": "session", **self.session.snapshot()})
+        frame = {"t": "session", **self.session.snapshot()}
+        await asyncio.gather(
+            *(self._send_session(d, frame) for d in self.devices.values() if d.online),
+            return_exceptions=True,
+        )
         self._mirror_play_queue()
+
+    async def _send_session(self, dev: Device, frame: dict) -> None:
+        # Noted in the same step as the write (`ws.send` writes before it first
+        # suspends), so an ack built later reports a revision already on the wire.
+        dev.session_rev_sent = frame["rev"]
+        await self._send(dev, frame)
 
     async def _broadcast_devices(self) -> None:
         await self._broadcast({"t": "devices",
@@ -3693,6 +3764,7 @@ class Hub:
             if self.lb_index is not None:
                 welcome["lbIndex"] = dict(self.lb_index)
             self._echo_reset(dev)
+            dev.session_rev_sent = welcome["session"]["rev"]
             await self._send(dev, welcome)
             await self._broadcast_devices()
             log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}; {arrival}")
@@ -4027,6 +4099,135 @@ class Hub:
                                        "isPlaying": self.session.is_playing})
 
     async def _on_act(self, dev: Device, msg: dict) -> None:
+        """Route one act: run it now, or queue it behind the transfer in flight.
+
+        A transfer is never awaited here. It waits for the old device's `released`
+        frame, and the overwhelmingly common case is the active receiver
+        transferring away from itself: same socket, so awaiting inside its read
+        loop means the hub cannot read the very frame it is waiting for. That
+        deadlock always ended in a RELEASE_TIMEOUT and a resume up to one report
+        interval (~1 s) stale. For the same reason an act that has to wait for a
+        transfer is queued for the task that carries it out, not awaited: the
+        socket it came from may be the one the transfer is listening to.
+
+        The hold lasts from the transfer act's arrival until the queue is empty
+        again, so everything held runs in arrival order, also relative to an act
+        that arrives while the held ones are being run.
+        """
+        act = Act(dev, msg)
+        if act.action == "transfer" or (self._drain_task is not None
+                                        and act.action in HELD_ACTIONS):
+            if act.action != "transfer":
+                dlog(f"ACT {act.action} from {dev.name}/{dev.id[:8]} HELD behind a "
+                     f"transfer ({len(self._held)} ahead of it)")
+            self._held.append(act)
+            if self._drain_task is None:
+                self._drain_task = asyncio.create_task(self._drain_held())
+            return
+        await self._run_act(act)
+
+    async def _drain_held(self) -> None:
+        try:
+            while self._held:
+                act = self._held.popleft()
+                try:
+                    if act.stale:
+                        # Same rule as a frame still arriving on a superseded
+                        # socket: it was sent on a connection that is over. (A held
+                        # `play` would otherwise promote a device that is gone.)
+                        dlog(f"held ACT {act.action} from {act.dev.name}/"
+                             f"{act.dev.id[:8]} dropped: its connection is gone")
+                    elif act.action == "transfer":
+                        await self._run_transfer(act)
+                    else:
+                        await self._run_act(act)
+                except Exception as e:  # noqa: BLE001 — one act must not strand the rest
+                    log("held act error:", e)
+        finally:
+            # No await between the last emptiness check and this line, so an act
+            # arriving now finds either the task or an empty queue, never neither.
+            self._drain_task = None
+
+    async def _run_act(self, act: Act) -> None:
+        try:
+            await self._apply_act(act)
+        except Exception as e:  # noqa: BLE001 — never let one bad frame kill the socket
+            # Raised while reading the act's fields (`_check_act` sees to it that
+            # this is before anything changed), so ok:false is the truth.
+            act.fail("bad_request", f"{type(e).__name__}: {e}"[:200])
+            log("message error:", e)
+        finally:
+            await self._ack(act)
+
+    async def _ack(self, act: Act) -> None:
+        """Answer an act that carried a `cid`. The LAST frame the act causes.
+
+        Callers send it after awaiting every broadcast the act made, and a
+        broadcast returns only once each socket's frame is written, so on the
+        sender's socket the ack follows them. When it arrives the sender's mirror
+        already holds the hub's answer, which is what lets a controller drop the
+        value it was showing in the meantime.
+        """
+        if act.cid is None or act.acked:
+            return
+        act.acked = True
+        if act.stale:
+            return  # a cid means nothing on another connection
+        frame: dict = {"t": "ack", "cid": act.cid, "ok": act.ok,
+                       "rev": act.dev.session_rev_sent}
+        if act.code:
+            frame["code"] = act.code
+            if act.message:
+                frame["message"] = act.message
+        await self._send(act.dev, frame)
+
+    async def _refuse(self, act: Act, code: str, message: str, *, ok: bool = False,
+                      to: Optional[Device] = None, everyone: bool = False) -> None:
+        """Every `error` about an act goes through here.
+
+        With a `cid` the failure is reported in the ack and nowhere else: to the
+        one who asked. Without one, the frames go where they always went (`to`,
+        default the sender; `everyone` for the two transfer refusals that used to
+        be broadcast), because a client that sends no `cid` reads nothing else.
+        `ok=True` is "applied to the session, though no device heard it".
+        """
+        act.fail(code, message, ok=ok)
+        if act.cid is not None:
+            return
+        frame = {"t": "error", "code": code, "message": message}
+        if everyone:
+            await self._broadcast(frame)
+        else:
+            await self._send(to if to is not None else act.dev, frame)
+
+    @staticmethod
+    def _check_act(action: Any, msg: dict) -> None:
+        """Raise if an act's fields cannot be read. Run before anything changes.
+
+        `ok:false` promises that the act changed nothing, so every conversion that
+        can fail has to fail here. `setQueue` used to assign the queue and then
+        raise on a bad `index`: the session held a queue no client had been told
+        about until something else broadcast it.
+        """
+        if action in ("setQueue", "enqueue"):
+            q = msg.get("tracks", [])
+            if not isinstance(q, list) or any(not isinstance(t, dict) for t in q):
+                raise ValueError("tracks must be a list of track objects")
+        if action == "setQueue":
+            int(msg.get("index", 0)), int(msg.get("positionMs", 0))
+        elif action in ("remove", "jump"):
+            int(msg["index"])
+        elif action == "move":
+            int(msg["from"]), int(msg["to"])
+        elif action == "seek":
+            int(msg["positionMs"])
+        elif action == "volume":
+            int(msg.get("level", 100))
+        elif action == "rating":
+            int(msg.get("rating", 0))
+
+    async def _apply_act(self, act: Act) -> None:
+        dev, msg = act.dev, act.msg
         action = msg.get("action")
         s = self.session
         active = s.active_device_id
@@ -4034,13 +4235,23 @@ class Hub:
         dlog(f"ACT {action} from {dev.name}/{dev.id[:8]} "
              f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
              f"| pre is_playing={s.is_playing}")
+        self._check_act(action, msg)
 
         # Promote the sender to active when there's nothing playing yet.
         promoted = False
+        takeover_seq = None
         if active is None and action in ("play", "setQueue"):
             active = dev.id
             s.set_active(active)
             promoted = True
+            if action == "play" and s.queue:
+                # A takeover: this device is about to be handed the session's queue
+                # (the `play` branch below). An act that waited behind a transfer
+                # runs off its sender's read loop, so the sender's own reports can
+                # arrive during the broadcast below, and it is the active device
+                # from this line on. Same rule as a transfer target: its need is
+                # raised here, to the number the load will carry.
+                takeover_seq = self._echo_expect(dev)
             await self._broadcast_devices()
         # The device every directive of this act goes to.
         adev = self._dev(active)
@@ -4050,8 +4261,11 @@ class Hub:
         # the directive went nowhere instead of it vanishing silently.
         if active is None and action in ("pause", "playpause", "next", "previous",
                                          "jump", "seek", "volume"):
-            await self._send(dev, {"t": "error", "code": "no_active_device",
-                                   "message": f"{action}: no device is currently active"})
+            # ok:true where the intent is applied to the session all the same;
+            # `volume` applies nothing, so for it this is a refusal.
+            await self._refuse(act, "no_active_device",
+                               f"{action}: no device is currently active",
+                               ok=action != "volume")
 
         if action == "setQueue":
             # Flush where we left the OUTGOING queue before it becomes "previous".
@@ -4187,8 +4401,8 @@ class Hub:
                 # device was force-stopped). It has no idea what the session holds, so
                 # a bare do:play would resume ITS own stale local queue/position —
                 # hand it the session's queue + resume point instead (PROTOCOL §5.1).
-                await self._do(adev, "load", tracks=s.queue, index=s.index,
-                               positionMs=s.position_ms, play=True)
+                await self._do(adev, "load", seq=takeover_seq, tracks=s.queue,
+                               index=s.index, positionMs=s.position_ms, play=True)
             else:
                 await self._do(adev, "play")
             await self._broadcast_session()
@@ -4259,15 +4473,6 @@ class Hub:
                 await self._do(adev, "rating", id=msg.get("id"),
                                rating=max(0, min(5, int(msg.get("rating", 0)))))
 
-        elif action == "transfer":
-            # Deliberately NOT awaited here. A transfer awaits the old device's
-            # `released` frame, and the overwhelmingly common case is the active
-            # receiver transferring away from itself — same socket, so awaiting
-            # inside its read loop means the hub cannot read the very frame it is
-            # waiting for. That deadlock always ended in a RELEASE_TIMEOUT and a
-            # resume up to one report interval (~1 s) stale.
-            asyncio.create_task(self._transfer_locked(msg.get("target"), msg.get("play")))
-
         elif action == "renameSavedQueue":
             rid = msg.get("id")
             rec = self.saved_queues.get(rid) if rid else None
@@ -4278,8 +4483,7 @@ class Hub:
             else:
                 # The client has already applied the rename locally, so silence would
                 # leave the two permanently disagreeing with nothing to notice it.
-                await self._send(dev, {"t": "error", "code": "unknown_saved_queue",
-                                       "message": f"no saved queue {rid!r}"})
+                await self._refuse(act, "unknown_saved_queue", f"no saved queue {rid!r}")
 
         elif action == "deleteSavedQueue":
             changed, detached = self._delete_saved_queue(_as_str(msg.get("id"), 128))
@@ -4315,15 +4519,13 @@ class Hub:
                 # A recipe with no name, or a `kind` this hub has never heard of.
                 # Answered rather than dropped: the client has already shown the
                 # user a mix it believes it saved.
-                await self._send(dev, {"t": "error", "code": "bad_mix",
-                                       "message": "a mix needs a name and a known kind"})
+                await self._refuse(act, "bad_mix", "a mix needs a name and a known kind")
 
         elif action == "renameMix":
             if self._rename_mix(_as_str(msg.get("id"), 128), _as_str(msg.get("name"))):
                 await self._broadcast_mixes()
             else:
-                await self._send(dev, {"t": "error", "code": "unknown_mix",
-                                       "message": f"no mix {msg.get('id')!r}"})
+                await self._refuse(act, "unknown_mix", f"no mix {msg.get('id')!r}")
 
         elif action == "deleteMix":
             if self._delete_mix(_as_str(msg.get("id"), 128)):
@@ -4359,8 +4561,7 @@ class Hub:
                 await self._broadcast_saved_queues()
 
         else:
-            await self._send(dev, {"t": "error", "code": "bad_action",
-                                   "message": f"unknown action {action!r}"})
+            await self._refuse(act, "bad_action", f"unknown action {action!r}")
 
     async def _on_device_state(self, dev: Device, msg: dict) -> None:
         """A bridge's verdict on the hardware behind it (PROTOCOL §12.2).
@@ -4392,39 +4593,54 @@ class Hub:
                 await self._broadcast_session()
                 await self._broadcast_devices()
 
-    async def _transfer_locked(self, target_id: Optional[str], play: Optional[bool]) -> None:
+    async def _run_transfer(self, act: Act) -> None:
+        """Carry one transfer out and ack it: when the handoff is committed or
+        refused, not when the target has loaded (`load_failed` stays a broadcast,
+        since it changes what everyone sees)."""
+        folded: list[Act] = []      # acts this handoff carried in its load
         try:
-            async with self._transfer_lock:
-                await self._transfer(target_id, play)
+            await self._transfer(act, folded)
         except Exception as e:  # noqa: BLE001 — a detached task's traceback would be lost
             log("transfer error:", e)
+            if not act.committed:
+                reason = f"{type(e).__name__}: {e}"[:200]
+                act.fail("bad_request", reason)
+                for f in folded:
+                    if f.ok:
+                        f.fail("bad_request", "the transfer it was folded into failed: " + reason)
+        finally:
+            # After the commit's broadcasts and the load: `_transfer` has returned.
+            await self._ack(act)
+            for f in folded:
+                await self._ack(f)
 
-    async def _transfer(self, target_id: Optional[str], play: Optional[bool]) -> None:
+    async def _transfer(self, act: Act, folded: list) -> None:
         s = self.session
+        target_id, play = act.msg.get("target"), act.msg.get("play")
         target = self.devices.get(target_id) if target_id else None
         if not target or not target.online:
-            await self._broadcast({"t": "error", "code": "target_offline",
-                                   "message": "target device is not connected"})
+            await self._refuse(act, "target_offline", "target device is not connected",
+                               everyone=True)
             return
         # `online` only means a bridge holds the socket. For a Chromecast the speaker
         # itself can be off, asleep, or on a network this hub can't reach — handing it
         # the session there is exactly the "player says playing, nothing plays" bug.
         if target.effective_reachable() is False:
-            await self._broadcast({"t": "error", "code": "target_unreachable",
-                                   "message": f"{target.name} is not responding"})
+            await self._refuse(act, "target_unreachable", f"{target.name} is not responding",
+                               everyone=True)
             log(f"transfer rejected: {target.name} reported unreachable")
             return
         if "receiver" not in (target.caps or []):
-            await self._send(target, {"t": "error", "code": "not_a_receiver",
-                                      "message": "target device cannot play audio"})
+            # Without a cid this still goes to the TARGET, as it always did.
+            await self._refuse(act, "not_a_receiver", "target device cannot play audio",
+                               to=target)
             log(f"transfer rejected: {target.name} has no 'receiver' cap")
             return
 
         # Default: preserve the play state (Spotify behaviour — transferring a
         # paused session keeps it paused). Captured BEFORE release, because the
         # old device's final report sets is_playing False.
-        if play is None:
-            play = s.is_playing
+        play = s.is_playing if play is None else bool(play)
 
         old_id = s.active_device_id
         if old_id == target_id:
@@ -4461,6 +4677,32 @@ class Hub:
                 old.release_tid = None
         # s.position_ms / s.index now reflect the old device's final report (or last known).
 
+        # Fold in what was pressed while the old device was letting go. A play, a
+        # pause or a seek that arrived then is the user's latest word on exactly
+        # the two things the load carries, so the load carries it: the new device
+        # starts paused, or at the sought position, and never plays what had
+        # already been stopped. Only the LEADING run of such acts, though. Behind
+        # a skip, a new queue or another transfer they mean something else (a seek
+        # after `next` is a position in the next track), so from the first act of
+        # another kind on, everything runs after the load, in arrival order.
+        # No await from here to the commit: what arrives later is not folded.
+        while self._held and self._held[0].action in FOLDED_ACTIONS:
+            h = self._held.popleft()
+            folded.append(h)
+            if h.stale:
+                continue
+            dlog(f"ACT {h.action} from {h.dev.name}/{h.dev.id[:8]} FOLDED into transfer {tid}")
+            if h.action == "seek":
+                try:
+                    sought = max(0, int(h.msg["positionMs"]))
+                except (KeyError, TypeError, ValueError) as e:
+                    h.fail("bad_request", f"{type(e).__name__}: {e}"[:200])
+                    continue
+                self._mark_position_intent()
+                s.position_ms = sought
+            else:
+                play = {"play": True, "pause": False}.get(h.action, not play)
+
         gen = s.set_active(target_id)
         # The load's number is taken HERE, not where the load is written. From this
         # line the target is the active device and its reports are mirrored; until
@@ -4472,6 +4714,7 @@ class Hub:
         s.is_playing = play
         self._mark_play_intent()
         s.bump()
+        act.committed = True
         # Broadcast BEFORE the load so the target learns it is active first —
         # otherwise its do:load side effects (play events) fire while it still
         # believes another device is active, which can misroute them.
@@ -4501,9 +4744,9 @@ class Hub:
                        tracks=s.queue, index=s.index,
                        positionMs=s.position_ms, play=play)
         log(f"transfer {tid} -> {target.name} @ index {s.index}, {s.position_ms}ms")
-        # Awaited off to the side: this runs inside the *controller's* read loop, and
-        # blocking it for LOAD_TIMEOUT would stall every other frame that controller
-        # sends while a slow speaker warms up.
+        # Awaited off to the side: the hold on session acts ends when this returns
+        # (the load is written), and waiting LOAD_TIMEOUT here would keep every
+        # pause and skip queued for ten seconds while a slow speaker warms up.
         if fut is not None:
             asyncio.create_task(self._await_load_ack(target, old_id, fut, tid, gen, load_seq))
 

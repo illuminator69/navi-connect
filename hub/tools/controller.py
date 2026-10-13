@@ -14,6 +14,11 @@ Commands:
     volume <0-100>               set the active device's volume
     transfer <deviceIndex>       hand playback to that device, resume in place
     quit
+
+Every act carries a `cid`, so the hub answers each with an `ack` (PROTOCOL §5.4),
+printed as `-- ack c3 ok rev118` or `!! ack c4 refused: target_offline ...`. Against
+a hub without "actAck" in `welcome.features` no acks come, and refusals arrive as
+`error` frames as before.
 """
 from __future__ import annotations
 
@@ -35,6 +40,13 @@ DEMO_TRACKS = [
 class Ctl:
     def __init__(self) -> None:
         self.devices: list[dict] = []
+        self._acts = 0
+
+    async def act(self, ws, action: str, **fields) -> None:
+        """Send one act with a fresh `cid`, the correlation id its `ack` echoes."""
+        self._acts += 1
+        await ws.send(json.dumps({"t": "act", "action": action,
+                                  "cid": f"c{self._acts}", **fields}))
 
     async def run(self, url: str, token: str) -> None:
         async with websockets.connect(url) as ws:
@@ -59,7 +71,17 @@ class Ctl:
                     on = "online" if d["online"] else "offline"
                     print(f"  [{i}]{star} {d['name']:16} {on:7} {d['caps']}")
             if t == "welcome":
+                print(f"-- hub features: {msg.get('features', [])}")
                 self._print_session(msg["session"])
+            elif t == "ack":
+                # Written after every broadcast the act caused, so the session
+                # printed just above already holds the hub's answer.
+                if msg.get("ok"):
+                    note = f" ({msg['code']})" if msg.get("code") else ""
+                    print(f"\n-- ack {msg.get('cid')} ok rev{msg.get('rev')}{note}")
+                else:
+                    print(f"\n!! ack {msg.get('cid')} refused: {msg.get('code')} "
+                          f"{msg.get('message') or ''}")
             elif t == "session":
                 self._print_session(msg)
             elif t == "progress":
@@ -87,20 +109,17 @@ class Ctl:
             elif cmd == "devices":
                 await ws.send(json.dumps({"t": "ping"}))  # noop; list prints on any device update
             elif cmd == "queue":
-                await ws.send(json.dumps({"t": "act", "action": "setQueue",
-                                          "tracks": DEMO_TRACKS, "index": 0, "play": True}))
+                await self.act(ws, "setQueue", tracks=DEMO_TRACKS, index=0, play=True)
             elif cmd in ("play", "pause", "next", "prev"):
-                action = {"prev": "previous"}.get(cmd, cmd)
-                await ws.send(json.dumps({"t": "act", "action": action}))
+                await self.act(ws, {"prev": "previous"}.get(cmd, cmd))
             elif cmd == "seek" and args:
-                await ws.send(json.dumps({"t": "act", "action": "seek", "positionMs": int(args[0])}))
+                await self.act(ws, "seek", positionMs=int(args[0]))
             elif cmd == "volume" and args:
-                await ws.send(json.dumps({"t": "act", "action": "volume", "level": int(args[0])}))
+                await self.act(ws, "volume", level=int(args[0]))
             elif cmd == "transfer" and args:
                 idx = int(args[0])
                 if 0 <= idx < len(self.devices):
-                    await ws.send(json.dumps({"t": "act", "action": "transfer",
-                                              "target": self.devices[idx]["id"], "play": True}))
+                    await self.act(ws, "transfer", target=self.devices[idx]["id"], play=True)
                 else:
                     print("bad device index; run `devices`")
             else:

@@ -116,6 +116,7 @@ does on a slow link (the hub's HTTP routes are not relayed).
 pip install -r requirements.txt
 python tools/test_transfer.py     # asserts resume at the same index + position
 python tools/test_cmd_echo.py     # do.seq / report.applied, reconnect, the backstop
+python tools/test_act_ack.py      # act.cid / ack, refusals, acts held by a transfer
 ```
 
 Every `tools/test_*.py` is a script that starts its own hub on a free port and exits
@@ -130,6 +131,8 @@ Each client (Feishin fork, Navic fork) is both controller and receiver:
   setVolume/setRepeat/setShuffle/release`) and emit `report` ~1 Hz while playing;
   with the cap `cmdEcho`, echo `do.seq` in `report.applied` (PROTOCOL §5.3);
 - as **controller**: send `act` (`setQueue/play/pause/next/previous/seek/jump/
-  repeat/shuffle/volume/transfer/...`).
+  repeat/shuffle/volume/transfer/...`); with `"actAck"` in `welcome.features`, put a
+  `cid` on an act to get an `ack` for it (PROTOCOL §5.4). `tools/controller.py` does,
+  and prints each ack.
 
 See `tools/fake_receiver.py` for the minimal receiver contract.

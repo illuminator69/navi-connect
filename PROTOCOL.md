@@ -80,7 +80,7 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "platform":"desktop|android", "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
-                 "features": ["cmdEcho"],
+                 "features": ["cmdEcho", "actAck"],
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
@@ -100,6 +100,9 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 - `features` lists what this hub understands beyond the base protocol, so a client
   can tell a hub that honours a cap from an older one that ignores it. Absent means
   none. `"cmdEcho"`: the hub stamps `do.seq` and judges reports by `applied`.
+  `"actAck"`: the hub answers an act that carries a `cid` with an `ack` (§5.1,
+  §5.4) and holds acts during a transfer (§7.3). A controller that does not find
+  it must not wait for acks.
 - `welcome` is the first frame the hub writes on a connection: no `do` precedes it.
   It is the one reset point of the command echo, for both sides (§5.2).
 - A `hello` for a `device.id` whose previous socket is still open **replaces** that
@@ -235,6 +238,24 @@ If there is **no active device** when a controller sends a playback action, the
 hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
 **sending device** to active (it then receives a `do:load`).
 
+**`cid` — asking for an answer.** Any act may carry `"cid"`: a string of at most 64
+characters, minted by the client, unique on its connection. The hub then answers
+that act with exactly one `ack` (§5.4), sent to the sender only:
+
+```jsonc
+{ "t":"act", "action":"seek", "positionMs":91000, "cid":"a42" }
+{ "t":"ack", "cid":"a42", "ok":true, "rev":118 }
+```
+
+An act without `cid` is handled as it always was and gets no `ack`. The field is
+never called `id`: eight actions use `id` for a track, a saved queue or a mix. A
+longer `cid` is cut to 64 characters in the ack; one that is not a string is not a
+`cid`. Needs `"actAck"` in `welcome.features` (§3.1).
+
+The hub reads an act's fields before it changes anything, with or without a `cid`:
+an act it cannot read (`tracks` that is not a list of objects, a missing or
+non-numeric `index`, `positionMs`, `from`, `to`, `level`) changes nothing.
+
 ### 5.2 Hub → active receiver: **directives** (`t:"do"`, field `cmd`)
 
 | `cmd` | Fields | Receiver action |
@@ -302,9 +323,9 @@ Absent means 0. A receiver that takes the cap MUST:
    same way; and none after a **transfer's** load (one with a `transferId`) that it
    answered `loaded{ok:false}`, because the hub rolls that back. Any other load that
    fails is echoed, and the receiver pauses first, so the echo says "not playing".
-5. Give up after a short deadline of its own (about 1.5 s) on a directive whose
-   effect it cannot observe, and move `applied` anyway. From then on its reports are
-   simply the truth.
+5. Give up after a short deadline of its own (well under the hub's 12 s, below) on a
+   directive whose effect it cannot observe, and move `applied` anyway. From then on
+   its reports are simply the truth.
 
 What the hub does with it. Per device, *need* is the `seq` of the last stamped
 directive sent to it since its `welcome`; for a transfer target (§7) it is raised to
@@ -372,10 +393,46 @@ the bridge's own socket stays perfectly healthy. See §3.2 and §12.2.
 | `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `index` | `{ seq, epoch }` | lb-bot's library-index head moved (§15.3). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
 | `lb` | `{ available, routes, webUrl }` — the same object as `welcome.lb` | the hub's verdict on lb-bot's availability **changed** (§15.3). Clients apply it exactly like `welcome.lb` |
-| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17) |
+| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
 own id.
+
+**`t:"ack"` — the answer to an act that carried a `cid`** (to its sender only):
+
+```jsonc
+{ "t":"ack", "cid":"a43", "ok":false, "rev":118,
+  "code":"target_offline", "message":"target device is not connected" }
+```
+
+- **Order.** The ack is written to the sender's socket **after** every `session`,
+  `devices`, `savedQueues` and `mixes` frame the act caused. When it arrives, the
+  sender's mirror already holds the hub's answer. Acks of different acts are not
+  ordered among themselves (a transfer's can follow a later act's).
+- `ok:true`: the hub applied the act and will not undo it. It says nothing about the
+  receiver; whether the device carried the directive out is what `report` says.
+- `ok:false`: **the act changed nothing**, and `code` (with a `message`) says why.
+- `rev`: the `rev` of the newest session this socket had been sent, in `welcome` or
+  a `session` frame, when the ack was written. The act's effect is in it.
+- With a `cid`, a failure is in the ack **only**: no `error` frame is sent to
+  anyone. Without one, the `error` frames go where they always went
+  (`target_offline` and `target_unreachable` to every client, `not_a_receiver` to
+  the target, the rest to the sender).
+- Every act with a `cid` is acked, also one the hub cannot read or that fails
+  inside the hub: `ok:false`, `code:"bad_request"`.
+- A `transfer` is acked when the handoff is committed (the `session` naming the new
+  device is out and its `do:load` written) or refused, not when the target has
+  loaded. A load that then fails is still the broadcast `error{code:"load_failed"}`.
+
+| `code` | `ok` | Meaning |
+|--------|------|---------|
+| — | `true` | applied |
+| `no_active_device` | `true` | applied to the session, but no device is active to hear it (`pause`, `playpause`, `next`, `previous`, `jump`, `seek`) |
+| `no_active_device` | `false` | `volume`: there is no device whose volume to set |
+| `bad_request` | `false` | a field is missing or of the wrong type |
+| `bad_action` | `false` | unknown `action` |
+| `target_offline`, `target_unreachable`, `not_a_receiver` | `false` | a `transfer` was refused (§7) |
+| `unknown_saved_queue`, `unknown_mix`, `bad_mix` | `false` | §8.3, §17 |
 
 ---
 
@@ -543,6 +600,37 @@ that an attempt abandoned on expiry cannot still start playback afterwards.
 Delivery of `do:release` and `do:load` is checked rather than assumed. A send that
 fails immediately ends its phase immediately, instead of the hub sitting the full
 timeout waiting for an answer to a frame that never left the process.
+
+### 7.3 Acts that arrive during a transfer are held
+
+A pause, seek, skip or queue edit that arrived while the hub waited for the old
+device's `released` (step 1, up to 1.5 s) used to be applied at once, sent to the
+device being abandoned, and overwritten when the handoff committed: accepted, then
+undone.
+
+So from the arrival of a `transfer` act until its `do:load` has been written, every
+act that changes the session is **held**, with or without a `cid`: `setQueue`,
+`enqueue`, `clear`, `remove`, `move`, `play`, `pause`, `playpause`, `next`,
+`previous`, `jump`, `seek`, `repeat`, `shuffle`, and a further `transfer`. Then:
+
+- `play`, `pause`, `playpause` and `seek` that arrived **ahead of any other held
+  act** are folded into the handoff: once the old device has released, the hub
+  applies them to the play state and the position that step 3's load carries. The
+  new device loads paused, or at the sought position. They get no directive of
+  their own, and nothing is sent to the old device.
+- Everything else runs after the load has been written, in arrival order, as
+  ordinary acts on the new device. That includes a `seek` or `pause` that arrived
+  behind a skip, a queue change or another transfer: there it refers to what that
+  act produces, so it is not folded.
+- Acks follow: a folded act's after the `session` frame of the commit, the others'
+  as usual (§5.4).
+- A refused transfer, and one to the device that is already active, release what
+  queued behind them at once, in order.
+- An act whose sender's connection ended while it was held is dropped.
+
+`volume`, `favorite`, `rating` and the saved-queue and mix acts are not held. No
+socket is ever blocked by a hold: a device can send `transfer`, further acts and the
+`released` the transfer is waiting for on the same connection.
 
 ---
 
