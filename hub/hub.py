@@ -136,8 +136,21 @@ ECHO_CMDS = frozenset({"load", "play", "pause", "seek", "jump", "queueChanged", 
 ECHO_BACKSTOP = 12.0
 # What this hub understands beyond the base protocol, advertised in `welcome` so a
 # client can tell a hub that will echo, and will ack, from one that silently
-# ignores the cap and the `cid`.
-HUB_FEATURES = ["cmdEcho", "actAck"]
+# ignores the cap and the `cid`. The last two matter the same way: an older hub
+# reads `act:volume` with a `target` as "the ACTIVE device's volume" and answers
+# `act:sleepTimer` with `bad_action`, so a client sends neither without them.
+HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer"]
+# "I apply `do:setVolume` while I am not the playing device." Only a device that
+# says so on its current connection is sent one while idle (PROTOCOL §5.1): to
+# anything else the directive would be a level recorded here and applied nowhere.
+IDLE_VOLUME_CAP = "idleVolume"
+# The sleep timer (PROTOCOL §5.1): one for the whole session, held here, so it is
+# the same timer on every device and runs out whether or not the device that set
+# it is still awake. A day is the most it is set for.
+SLEEP_MINUTES_MAX = 1440
+# How long one of its minutes lasts. 60 everywhere but in a test, which cannot
+# wait a minute per case.
+SLEEP_MINUTE_S = float(os.environ.get("HUB_SLEEP_MINUTE_S", "60") or "60")
 # Acknowledged acts (PROTOCOL §5.1, §5.4). An act carrying `cid` is answered with
 # an `ack` to its sender. Never `id`: eight actions use that for a track, a saved
 # queue or a mix.
@@ -563,6 +576,21 @@ class Device:
             "appRunning": self.app_running,
             "bridgedBy": self.bridged_by,
         }
+
+
+@dataclass
+class SleepTimer:
+    minutes: int                # as asked for; relayed so a client can show "30 min"
+    set_by: Optional[str]       # device id of whoever set it
+    # The end twice over. `ends_at` is wall-clock ms and is what the state file
+    # holds, because only a wall clock means anything to the next process.
+    # `deadline` is monotonic and is what the countdown runs on, so a clock step
+    # on the host neither fires the timer early nor stretches it.
+    ends_at: int
+    deadline: float
+
+    def remaining_ms(self) -> int:
+        return max(0, int((self.deadline - time.monotonic()) * 1000))
 
 
 # --------------------------------------------------------------------------- #
@@ -2591,7 +2619,15 @@ class Hub:
         # Monotonic id for every handoff, carried on do:release/released and
         # do:load/loaded so a reply can be matched to the attempt that asked for it.
         self._transfer_seq = 0
+        # The sleep timer, if one is set, and the pending callback for its end.
+        self._sleep: Optional[SleepTimer] = None
+        self._sleep_handle: Any = None
+        # Who its pause comes from: an `act` needs a sender, and this one has no
+        # socket, so it is never stale, never acked and never sent an `error`.
+        self._sleep_dev = Device(id="sleep-timer", name="sleep timer")
         self._load()
+        # A timer the state file brought back counts down from here.
+        self._sleep_arm()
 
     def _next_transfer_id(self) -> str:
         self._transfer_seq += 1
@@ -2719,6 +2755,78 @@ class Hub:
         if dev.echo_timer is not None:
             dev.echo_timer.cancel()
             dev.echo_timer = None
+
+    # ----- the sleep timer (PROTOCOL §5.1) --------------------------------- #
+    def _session_snapshot(self) -> dict:
+        """The session as a client is sent it: what is stored, plus the sleep
+        timer with the time it has left at this instant.
+
+        Computed per frame because nothing is broadcast while the timer counts
+        down: a client counts from the arrival of the last frame, on its own
+        clock, and a device that connects mid-way gets the right remainder in its
+        `welcome`.
+        """
+        snap = self.session.snapshot()
+        t = self._sleep
+        snap["sleepTimer"] = None if t is None else {
+            "remainingMs": t.remaining_ms(), "minutes": t.minutes, "setBy": t.set_by}
+        return snap
+
+    def _sleep_set(self, timer: Optional[SleepTimer]) -> None:
+        """Make `timer` the sleep timer (None = none) and aim the clock at it."""
+        self._sleep = timer
+        self._sleep_arm()
+
+    def _sleep_arm(self) -> None:
+        if self._sleep_handle is not None:
+            self._sleep_handle.cancel()
+            self._sleep_handle = None
+        timer = self._sleep
+        if timer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop: a Hub built outside one (a test reading a state file)
+        self._sleep_handle = loop.call_later(
+            max(0.0, timer.deadline - time.monotonic()),
+            lambda: self._spawn(self._sleep_expire(timer)))
+
+    async def _sleep_expire(self, timer: SleepTimer) -> None:
+        """The timer ran out: what is playing is paused, and the timer is gone.
+
+        The pause IS a `pause` act, sent through `_on_act` like one from a
+        controller, so it gets everything a controller's pause gets. Above all
+        the hold during a transfer: applied in the middle of one it would go to
+        the device being abandoned and be overwritten by the commit, and the new
+        device would start playing after the timer had run out. Held, it is
+        folded into the load or run right behind it.
+
+        With nothing playing there is nothing to pause, so no directive is sent
+        and only the timer's end is announced. Except while a transfer is under
+        way: what will be playing after it is not decided yet (a `play` may be
+        waiting in the same queue), so the pause is queued behind whatever
+        arrived first, and paused is how the session comes out.
+
+        The timer is cleared before the pause, so the `session` frame the pause
+        broadcasts (or the commit that folded it) is also the one that says the
+        timer is gone: one frame, not a paused session that still shows a timer
+        with no time left.
+        """
+        if self._sleep is not timer:
+            return  # replaced or cleared between the clock firing and this task
+        self._sleep_handle = None
+        self._sleep = None
+        s = self.session
+        who = self._dev(timer.set_by)
+        note = f"sleep timer ({timer.minutes} min, set by {who.name if who else timer.set_by})"
+        if s.is_playing or self._drain_task is not None:
+            log(f"{note} ran out: pausing")
+            await self._on_act(self._sleep_dev, {"t": "act", "action": "pause"})
+        else:
+            log(f"{note} ran out with nothing playing")
+            s.bump()
+            await self._broadcast_session()
 
     # ----- persistence ----------------------------------------------------- #
     def _load(self) -> None:
@@ -2865,9 +2973,32 @@ class Hub:
                 except Exception as e:  # noqa: BLE001
                     log("state: skipped an unreadable device row:", e)
 
+        def sleep_timer() -> None:
+            # Only a timer that is still running comes back. One whose end passed
+            # while the hub was down is dropped and pauses nothing: firing it late
+            # would stop whatever the user has started since.
+            ends_at = data.get("sleepTimerEndsAt")
+            if ends_at is None:
+                return
+            left = (int(ends_at) - time.time() * 1000) / 1000
+            if left <= 0:
+                log("sleep timer ran out while the hub was down: dropped")
+                return
+            minutes = _as_int(data.get("sleepTimerMinutes"),
+                              int(left / SLEEP_MINUTE_S) + 1, 1, SLEEP_MINUTES_MAX)
+            # Never longer than it was set for: a wall clock that was wrong when
+            # the timer was set, or was stepped back since, must not stretch it.
+            left = min(left, minutes * SLEEP_MINUTE_S)
+            self._sleep = SleepTimer(
+                minutes=minutes, set_by=_as_str(data.get("sleepTimerSetBy"), 128),
+                ends_at=int((time.time() + left) * 1000),
+                deadline=time.monotonic() + left)
+            log(f"sleep timer restored: {left:.0f}s left of {minutes} min")
+
         for name, section in (("session", session), ("savedQueues", saved_queues),
                               ("mixes", mixes), ("lbIndex", lb_index),
-                              ("deletedSavedQueues", tombstones), ("devices", devices)):
+                              ("deletedSavedQueues", tombstones), ("devices", devices),
+                              ("sleepTimer", sleep_timer)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
@@ -2932,8 +3063,14 @@ class Hub:
         """state.json's text, serialised once, plus the signature of its
         irreplaceable part (see `_durable_signature`)."""
         mixes = self._mixes_list()
+        timer = self._sleep
         data = {
             "session": self.session.snapshot(),
+            # The sleep timer's wall-clock end (ms), with what a restart needs to
+            # show it again; all null when none is set. See `_apply_state`.
+            "sleepTimerEndsAt": timer.ends_at if timer else None,
+            "sleepTimerMinutes": timer.minutes if timer else None,
+            "sleepTimerSetBy": timer.set_by if timer else None,
             "savedQueues": self._saved_queues_list(),
             "deletedSavedQueues": self.deleted_saved_queues,
             "mixes": mixes,
@@ -3117,7 +3254,7 @@ class Hub:
         # DIAG (echo): the authoritative state every client is about to receive.
         dlog(f"SESSION -> is_playing={self.session.is_playing} pos={self.session.position_ms} "
              f"idx={self.session.index} active={self.session.active_device_id}")
-        frame = {"t": "session", **self.session.snapshot()}
+        frame = {"t": "session", **self._session_snapshot()}
         await asyncio.gather(
             *(self._send_session(d, frame) for d in self.devices.values() if d.online),
             return_exceptions=True,
@@ -3786,7 +3923,7 @@ class Hub:
                 "t": "welcome",
                 "deviceId": dev.id,
                 "features": list(HUB_FEATURES),
-                "session": self.session.snapshot(),
+                "session": self._session_snapshot(),
                 "savedQueues": self._saved_queues_list(),
                 "mixes": self._mixes_list(),
                 "devices": [d.info(self.session.active_device_id) for d in self.devices.values()],
@@ -4262,6 +4399,15 @@ class Hub:
             int(msg["positionMs"])
         elif action == "volume":
             int(msg.get("level", 100))
+            target = msg.get("target")
+            if target is not None and not isinstance(target, str):
+                raise ValueError("target must be a device id")
+        elif action == "sleepTimer":
+            minutes = msg.get("minutes")
+            # An int and nothing that merely converts to one: "30" or 30.5 from a
+            # client is a bug to report, and True would otherwise set one minute.
+            if type(minutes) is not int or not 0 <= minutes <= SLEEP_MINUTES_MAX:
+                raise ValueError(f"minutes must be an integer 0..{SLEEP_MINUTES_MAX}")
         elif action == "rating":
             int(msg.get("rating", 0))
 
@@ -4275,6 +4421,13 @@ class Hub:
              f"play={msg.get('play')} pos={msg.get('positionMs')} idx={msg.get('index')} "
              f"| pre is_playing={s.is_playing}")
         self._check_act(action, msg)
+
+        # A volume for a device other than the playing one is not an act on the
+        # session at all, so none of what follows applies to it: nobody is
+        # promoted, and "no active device" is no reason to refuse.
+        if action == "volume" and msg.get("target") not in (None, active):
+            await self._set_idle_volume(act, msg["target"])
+            return
 
         # Promote the sender to active when there's nothing playing yet.
         promoted = False
@@ -4502,6 +4655,24 @@ class Hub:
             await self._do(adev, "setVolume", level=level)
             await self._broadcast_devices()
 
+        elif action == "sleepTimer":
+            minutes = msg["minutes"]
+            if minutes:
+                # Replaces a running timer: there is one, and the later word wins.
+                length = minutes * SLEEP_MINUTE_S
+                self._sleep_set(SleepTimer(
+                    minutes=minutes, set_by=dev.id,
+                    ends_at=int((time.time() + length) * 1000),
+                    deadline=time.monotonic() + length))
+            elif self._sleep is not None:
+                self._sleep_set(None)
+            else:
+                return  # 0 with no timer set: nothing changed, so nothing to say
+            log(f"sleep timer {f'set to {minutes} min' if minutes else 'cleared'} "
+                f"by {dev.name} ({dev.id[:8]})")
+            s.bump()
+            await self._broadcast_session()
+
         elif action in ("favorite", "rating"):
             # Relay a purpose-built directive with whitelisted fields only — echoing
             # the raw act back would forward the sender's auth token to the receiver.
@@ -4601,6 +4772,32 @@ class Hub:
 
         else:
             await self._refuse(act, "bad_action", f"unknown action {action!r}")
+
+    async def _set_idle_volume(self, act: Act, target_id: str) -> None:
+        """`act:volume` naming a device that is not the playing one (PROTOCOL §5.1):
+        turn a speaker down BEFORE sending it music.
+
+        Refused unless the device can be told now and has said it will listen.
+        Every check comes before anything is recorded, so a refusal leaves the row
+        at its old level, which is what the slider that sent it falls back to.
+        """
+        target = self.devices.get(target_id)
+        if target is None or not target.online or target.ws is None:
+            await self._refuse(act, "target_offline", "target device is not connected")
+            return
+        if target.effective_reachable() is False:
+            await self._refuse(act, "target_unreachable", f"{target.name} is not responding")
+            return
+        if IDLE_VOLUME_CAP not in (target.caps or []):
+            await self._refuse(act, "not_supported",
+                               f"{target.name} cannot set its volume while it is not playing")
+            return
+        target.volume = max(0, min(100, int(act.msg.get("level", 100))))
+        # `setVolume` is not one of ECHO_CMDS, so `_do` gives it no `seq` and the
+        # target's need is untouched: its reports are still not mirrored, and a
+        # volume change is nothing a report could be stale about.
+        await self._do(target, "setVolume", level=target.volume)
+        await self._broadcast_devices()
 
     async def _on_device_state(self, dev: Device, msg: dict) -> None:
         """What a device says about itself between `hello`s (PROTOCOL §5.3).

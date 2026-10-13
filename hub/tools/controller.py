@@ -12,6 +12,10 @@ Commands:
     play | pause | next | prev
     seek <ms>
     volume <0-100>               set the active device's volume
+    volume <0-100> --target <deviceIndex>
+                                 set that device's volume though it is not playing
+                                 (it needs the cap "idleVolume")
+    sleep <minutes>              pause the session in that many minutes; 0 = off
     transfer <deviceIndex>       hand playback to that device, resume in place
     quit
 
@@ -97,6 +101,16 @@ class Ctl:
         print(f"-- session rev{s['rev']} active={s['activeDeviceId']} "
               f"idx={s['index']} pos={s['positionMs']}ms playing={s['isPlaying']} "
               f"queue={len(s['queue'])} repeat={s['repeat']} shuffle={s['shuffle']}")
+        timer = s.get("sleepTimer")
+        if timer:
+            # What is left when the frame was built; the hub sends nothing while it
+            # counts down, so this line appears on set, on replace and with whatever
+            # else changes the session.
+            left = timer["remainingMs"] // 1000
+            by = next((d["name"] for d in self.devices if d["id"] == timer.get("setBy")),
+                      timer.get("setBy"))
+            print(f"-- sleepTimer {left // 60}:{left % 60:02d} left of "
+                  f"{timer['minutes']} min, set by {by}")
 
     async def _stdin_loop(self, ws) -> None:
         loop = asyncio.get_event_loop()
@@ -117,16 +131,30 @@ class Ctl:
             elif cmd == "seek" and args:
                 await self.act(ws, "seek", positionMs=int(args[0]))
             elif cmd == "volume" and args:
-                await self.act(ws, "volume", level=int(args[0]))
+                fields = {"level": int(args[0])}
+                if "--target" in args:
+                    idx = self._device_index(args[args.index("--target") + 1:])
+                    if idx is None:
+                        continue
+                    fields["target"] = self.devices[idx]["id"]
+                await self.act(ws, "volume", **fields)
+            elif cmd == "sleep" and args:
+                await self.act(ws, "sleepTimer", minutes=int(args[0]))
             elif cmd == "transfer" and args:
-                idx = int(args[0])
-                if 0 <= idx < len(self.devices):
+                idx = self._device_index(args)
+                if idx is not None:
                     await self.act(ws, "transfer", target=self.devices[idx]["id"], play=True)
-                else:
-                    print("bad device index; run `devices`")
             else:
                 print("commands: devices | queue | play | pause | next | prev | seek <ms> | "
-                      "volume <0-100> | transfer <idx> | quit")
+                      "volume <0-100> [--target <idx>] | sleep <minutes> | "
+                      "transfer <idx> | quit")
+
+    def _device_index(self, args: list) -> int | None:
+        """The device index a command names, or None (and a hint) if it names none."""
+        if args and args[0].isdigit() and int(args[0]) < len(self.devices):
+            return int(args[0])
+        print("bad device index; run `devices`")
+        return None
 
 
 def main() -> None:

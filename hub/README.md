@@ -37,6 +37,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
 | `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client |
+| `HUB_SLEEP_MINUTE_S` | `60` | how many seconds one minute of the sleep timer lasts. Leave it alone: it exists so the tests can watch a timer run out in seconds |
 
 If the mirror creds are unset the hub still works fully; it just skips the
 Navidrome write.
@@ -108,7 +109,11 @@ the command echo (PROTOCOL §5.3); `--stale-first`, `--settle-ms N`, `--never-se
 and `--playing-after-clear` each break that contract in one way, so the hub's answer
 can be watched. `--kind speaker --volume 35` makes it say what it is and how loud it
 is (PROTOCOL §3.1, §5.3): the row in `controller.py`'s device list shows both, and
-follows the level when the receiver changes it. `lag_proxy.py 4791 ws://127.0.0.1:4790 --delay-ms 300` relays the
+follows the level when the receiver changes it. With `--idle-volume` it also takes
+the cap `idleVolume`, and `controller.py`'s `volume 30 --target <index>` then turns
+it down while another receiver plays (PROTOCOL §5.1). `sleep 30` sets the session's
+sleep timer, `sleep 0` clears it, and the controller prints what is left of it with
+every session it is sent. `lag_proxy.py 4791 ws://127.0.0.1:4790 --delay-ms 300` relays the
 WebSocket with a delay each way: point a client at the proxy to see what a control
 does on a slow link (the hub's HTTP routes are not relayed).
 
@@ -120,6 +125,8 @@ python tools/test_transfer.py     # asserts resume at the same index + position
 python tools/test_cmd_echo.py     # do.seq / report.applied, reconnect, the backstop
 python tools/test_act_ack.py      # act.cid / ack, refusals, acts held by a transfer
 python tools/test_device_rows.py  # hello.device.kind, deviceState.volume, across a restart
+python tools/test_volume_target.py  # act:volume with a target, its refusals, the echo untouched
+python tools/test_sleep_timer.py  # act:sleepTimer, running out, during a transfer, across a restart
 ```
 
 Every `tools/test_*.py` is a script that starts its own hub on a free port and exits
@@ -135,10 +142,11 @@ Each client (Feishin fork, Navic fork) is both controller and receiver:
   change (PROTOCOL §5.3);
 - as **receiver**: obey `do` (`load/play/pause/jump/seek/queueChanged/clear/
   setVolume/setRepeat/setShuffle/release`) and emit `report` ~1 Hz while playing;
-  with the cap `cmdEcho`, echo `do.seq` in `report.applied` (PROTOCOL §5.3);
+  with the cap `cmdEcho`, echo `do.seq` in `report.applied` (PROTOCOL §5.3); with
+  the cap `idleVolume`, apply `do:setVolume` also while not the playing device;
 - as **controller**: send `act` (`setQueue/play/pause/next/previous/seek/jump/
-  repeat/shuffle/volume/transfer/...`); with `"actAck"` in `welcome.features`, put a
-  `cid` on an act to get an `ack` for it (PROTOCOL §5.4). `tools/controller.py` does,
-  and prints each ack.
+  repeat/shuffle/volume/sleepTimer/transfer/...`); with `"actAck"` in
+  `welcome.features`, put a `cid` on an act to get an `ack` for it (PROTOCOL §5.4).
+  `tools/controller.py` does, and prints each ack.
 
 See `tools/fake_receiver.py` for the minimal receiver contract.

@@ -81,7 +81,7 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
-                 "features": ["cmdEcho", "actAck"],
+                 "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer"],
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
@@ -106,12 +106,19 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
   match a reply to the attempt that asked for it (§7.2). `"cmdEcho"` means it echoes
   the number of the last directive it has carried out in every `report` and keeps
   the five duties of §5.3; the hub then numbers its directives for it (§5.2).
+  `"idleVolume"` means it applies a `do:setVolume` whenever one arrives, also while
+  it is not the playing device; only such a device can be the `target` of a `volume`
+  act (§5.1).
 - `features` lists what this hub understands beyond the base protocol, so a client
   can tell a hub that honours a cap from an older one that ignores it. Absent means
   none. `"cmdEcho"`: the hub stamps `do.seq` and judges reports by `applied`.
   `"actAck"`: the hub answers an act that carries a `cid` with an `ack` (§5.1,
   §5.4) and holds acts during a transfer (§7.3). A controller that does not find
-  it must not wait for acks.
+  it must not wait for acks. `"volumeTarget"`: the hub reads `target` on a `volume`
+  act (§5.1). A hub without it ignores the key and sets the **active** device's
+  volume, so a client sends `target` only when it finds this. `"sleepTimer"`: the
+  hub holds the session's sleep timer (§5.1); one without it answers the act with
+  `bad_action`, and a client keeps its local timer.
 - `welcome` is the first frame the hub writes on a connection: no `do` precedes it.
   It is the one reset point of the command echo, for both sides (§5.2).
 - A `hello` for a `device.id` whose previous socket is still open **replaces** that
@@ -188,9 +195,19 @@ on the strength of a report from a bridge that may itself be wedged.
   "updatedAt": 1730000000000,
   "savedQueueId": "q_...|null",  // history record this queue IS (§8.3); null = untracked
   "sourceKind": "album|playlist|radio|moodFlow|journey|manual",
-  "sourceName": "Album One|null" // display name of what was played
+  "sourceName": "Album One|null", // display name of what was played
+  "sleepTimer": null             // or { remainingMs, minutes, setBy } — below, and §5.1
 }
 ```
+
+> **`sleepTimer`** is `null` when no timer is set, else
+> `{ "remainingMs":1799000, "minutes":30, "setBy":"<deviceId>" }` (§5.1).
+> **`remainingMs` is true at the instant the frame was built**, and the hub sends
+> nothing while the timer counts down: a client counts down from the frame's arrival,
+> on its own clock. `minutes` is what was asked for; `setBy` is the device that set
+> it, which may have gone since. The field is in every session snapshot,
+> `welcome.session` included; a hub without `"sleepTimer"` in `welcome.features`
+> sends no such key.
 
 > **`volume` is intentionally NOT in the session** — like Spotify, volume is a
 > per-device property of the receiver, controlled via the `volume` action but
@@ -233,7 +250,8 @@ issues directives to the active receiver (§5.2), then broadcasts the new sessio
 | `move` | `from`, `to` | reorder queue |
 | `repeat` | `mode` | none/all/one |
 | `shuffle` | `on` | toggle shuffle (hub computes `order`) |
-| `volume` | `level`(0–100) | set active device volume |
+| `volume` | `level`(0–100), `target?` | set the active device's volume, or with `target` that of a device that is not playing (below) |
+| `sleepTimer` | `minutes`(0–1440) | pause the session in that many minutes; 0 = off (below) |
 | `transfer` | `target`, `play?`(true) | hand playback to another device (§7) |
 | `favorite` | `id`, `favorite` | star/unstar (passthrough to receiver→Navidrome) |
 | `rating` | `id`, `value` | 0–5 |
@@ -270,7 +288,66 @@ longer `cid` is cut to 64 characters in the ack; one that is not a string is not
 
 The hub reads an act's fields before it changes anything, with or without a `cid`:
 an act it cannot read (`tracks` that is not a list of objects, a missing or
-non-numeric `index`, `positionMs`, `from`, `to`, `level`) changes nothing.
+non-numeric `index`, `positionMs`, `from`, `to`, `level`, a `target` that is not a
+string, `minutes` that is not an integer 0–1440) changes nothing.
+
+**`volume` with a `target` — a device that is not playing.** So that a speaker can
+be turned down *before* music is sent to it. Needs `"volumeTarget"` in
+`welcome.features` (§3.1).
+
+```jsonc
+{ "t":"act", "action":"volume", "level":35, "target":"<deviceId>", "cid":"a44" }
+```
+
+- `target` absent, `null` or naming the active device: the active device, exactly
+  as without the field. It needs no cap.
+- `target` naming another device: the hub records the level on that device's row,
+  sends **that device** `do:setVolume` and broadcasts `devices`. The active device
+  hears nothing and the session is untouched, so it works with nothing playing at
+  all (no `no_active_device`).
+- Refused, with nothing recorded and nothing sent: `target_offline` (no such device,
+  or it has no socket), `target_unreachable` (a bridge says the hardware is gone,
+  §3.2), `not_supported` (the device did not advertise `"idleVolume"`). In the `ack`
+  when the act carried a `cid`, else an `error` frame to the sender alone (§5.4).
+- A receiver takes the cap `"idleVolume"` only if it applies `do:setVolume` whenever
+  it arrives. It must not take that directive for the start of hub-driven playback,
+  and it reports the level it ended up at (`deviceState.volume`, §5.3), so the row
+  says what the device set and not what it was asked.
+- A client offers the control on the row of a device that is online, not
+  `reachable:false`, has the cap, and is neither the playing device nor itself. It
+  commits on release; a refusal leaves the row at its old level.
+
+**`sleepTimer` — one timer for the session, held by the hub.** Set on any device,
+shown on all, and it runs out whether or not the device that set it is still awake.
+Needs `"sleepTimer"` in `welcome.features` (§3.1).
+
+```jsonc
+{ "t":"act", "action":"sleepTimer", "minutes":30, "cid":"a45" }      // 0 = off
+```
+
+- `minutes` 1–1440 sets the timer and replaces a running one. 0 clears it, and
+  changes nothing when none is set. Anything else (a string, a fraction, out of
+  range, missing) is `bad_request`.
+- Setting and clearing bump `rev` and broadcast `session`, whose `sleepTimer` field
+  carries it (§4.2). Nothing is broadcast while it counts down.
+- When it runs out the hub does what a `pause` act does: `do:pause` to the active
+  device, and **one** `session` frame that says both "not playing" and
+  `sleepTimer: null`. With nothing playing it sends no directive, only that frame.
+- That pause is held by a transfer like any other pause (§7.3), so it is never sent
+  to the device being abandoned and never undone by the commit.
+- Only the act and its own end clear it. It survives a pause, a queue change, a
+  `clear`, a transfer, and the device that set it leaving.
+- It survives a hub restart: the state file holds its wall-clock end. If that has
+  passed when the hub comes back, the timer is dropped and pauses nothing.
+- Timed only. Modes that act at a track boundary (end of this song, end of the
+  album, a song count) stay local to the playing device.
+- A client on a hub with the feature sends the act for its timed option, arms no
+  local timer, and shows the session's timer on every device; cancel is
+  `minutes: 0`.
+- The playing device guards it. While it is the active device and the session has a
+  timer, it pauses itself 5 s after the timer's end if it is still playing and no
+  frame has cleared or replaced the timer. That is what stops the music when the
+  link to the hub has dropped.
 
 ### 5.2 Hub → active receiver: **directives** (`t:"do"`, field `cmd`)
 
@@ -282,7 +359,7 @@ non-numeric `index`, `positionMs`, `from`, `to`, `level`) changes nothing.
 | `jump` | `index` | play queue item `index` from 0 |
 | `queueChanged` | `tracks[]`, `index` | reconcile queue edits **without restarting the current track** if its id is unchanged |
 | `clear` | — | empty the queue and stop. Distinct from `queueChanged` because that command carries a track list, and receivers can't tell an empty one from "nothing to apply" |
-| `setVolume` | `level` | set local volume |
+| `setVolume` | `level` | set local volume. Also sent to a device that is **not** active, if it advertised `idleVolume` (§5.1); never the start of playback |
 | `setRepeat` / `setShuffle` | `mode` / `on`, `order?` | apply mode |
 | `release` | — | send one final `report` then stop audio and drop active role (used during transfer / shutdown) |
 
@@ -414,7 +491,7 @@ socket stays perfectly healthy. See §3.2 and §12.2.
 
 | `t` | Payload | When |
 |-----|---------|------|
-| `session` | `<Session>` | any intent change (new queue, index, repeat…) |
+| `session` | `<Session>` | any intent change (new queue, index, repeat…), and the sleep timer being set, cleared or running out |
 | `progress` | `{ positionMs, index, isPlaying }` | throttled live position from active receiver |
 | `devices` | `[<DeviceInfo>...]` | device joins/leaves/goes active, or a row changed (reachability, volume) |
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
@@ -423,7 +500,7 @@ socket stays perfectly healthy. See §3.2 and §12.2.
 | `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `index` | `{ seq, epoch }` | lb-bot's library-index head moved (§15.3). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
 | `lb` | `{ available, routes, webUrl }` — the same object as `welcome.lb` | the hub's verdict on lb-bot's availability **changed** (§15.3). Clients apply it exactly like `welcome.lb` |
-| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
+| `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `not_supported` (§5.1), `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
 own id.
@@ -445,9 +522,10 @@ own id.
 - `rev`: the `rev` of the newest session this socket had been sent, in `welcome` or
   a `session` frame, when the ack was written. The act's effect is in it.
 - With a `cid`, a failure is in the ack **only**: no `error` frame is sent to
-  anyone. Without one, the `error` frames go where they always went
-  (`target_offline` and `target_unreachable` to every client, `not_a_receiver` to
-  the target, the rest to the sender).
+  anyone. Without one, the `error` frames go where they always went (a refused
+  **transfer**'s `target_offline` and `target_unreachable` to every client, its
+  `not_a_receiver` to the target, the rest to the sender, a refused `volume`
+  included).
 - Every act with a `cid` is acked, also one the hub cannot read or that fails
   inside the hub: `ok:false`, `code:"bad_request"`.
 - A `transfer` is acked when the handoff is committed (the `session` naming the new
@@ -462,6 +540,7 @@ own id.
 | `bad_request` | `false` | a field is missing or of the wrong type |
 | `bad_action` | `false` | unknown `action` |
 | `target_offline`, `target_unreachable`, `not_a_receiver` | `false` | a `transfer` was refused (§7) |
+| `target_offline`, `target_unreachable`, `not_supported` | `false` | a `volume` with a `target` was refused (§5.1) |
 | `unknown_saved_queue`, `unknown_mix`, `bad_mix` | `false` | §8.3, §17 |
 
 ---
@@ -658,8 +737,12 @@ act that changes the session is **held**, with or without a `cid`: `setQueue`,
   queued behind them at once, in order.
 - An act whose sender's connection ended while it was held is dropped.
 
-`volume`, `favorite`, `rating` and the saved-queue and mix acts are not held. No
-socket is ever blocked by a hold: a device can send `transfer`, further acts and the
+`volume`, `sleepTimer`, `favorite`, `rating` and the saved-queue and mix acts are
+not held. The pause of a sleep timer that runs out during a transfer **is**: it is a
+`pause` act like a controller's, folded into the handoff or run behind it, and while
+a transfer is under way it is queued even if nothing is playing at that instant,
+because a held `play`, or the transfer's own `play:true`, may be about to start it.
+No socket is ever blocked by a hold: a device can send `transfer`, further acts and the
 `released` the transfer is waiting for on the same connection.
 
 ---

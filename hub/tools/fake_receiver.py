@@ -29,6 +29,9 @@ It also says what it is and how loud it is (PROTOCOL §3.1, §5.3): --kind K goe
 into `hello.device.kind`, and its volume (--volume N to start with, 100 otherwise)
 is reported in `deviceState` after `welcome` and whenever it changes. A
 `do:setVolume` is applied, and so reported, while this receiver holds the session.
+With --idle-volume it also takes the cap "idleVolume" and applies one at any time,
+which is what lets a controller turn it down before sending it music (`act:volume`
+with a `target`, PROTOCOL §5.1).
 """
 from __future__ import annotations
 
@@ -48,7 +51,7 @@ class FakeReceiver:
                  echo: bool = False, stale_first: bool = False, settle_ms: int = 0,
                  never_settle: bool = False, playing_after_clear: bool = False,
                  kind: Optional[str] = None, volume: int = 100,
-                 quiet: bool = False) -> None:
+                 idle_volume: bool = False, quiet: bool = False) -> None:
         self.url, self.token, self.name, self.device_id = url, token, name, device_id
         self.echo = echo
         self.stale_first = stale_first
@@ -57,6 +60,7 @@ class FakeReceiver:
         self.playing_after_clear = playing_after_clear
         self.kind = kind
         self.volume = volume
+        self.idle_volume = idle_volume
         self.quiet = quiet
         self.pos_ms = 0
         self.index = 0
@@ -134,7 +138,9 @@ class FakeReceiver:
     async def _on_do(self, msg: dict) -> None:
         cmd = msg.get("cmd")
         if cmd == "setVolume":
-            if not self.active:
+            # Never the start of playback, and no `seq` to echo: it only moves the
+            # level, whether or not anything is playing here.
+            if not (self.active or self.idle_volume):
                 self.say(f"volume {msg.get('level')} ignored: not the playing device")
                 return
             self.say(f"volume {msg.get('level')}")
@@ -172,7 +178,8 @@ class FakeReceiver:
     async def run(self) -> None:
         async with websockets.connect(self.url, max_size=4 * 1024 * 1024) as ws:
             self.ws = ws
-            caps = ["receiver", "controller"] + (["cmdEcho"] if self.echo else [])
+            caps = (["receiver", "controller"] + (["cmdEcho"] if self.echo else [])
+                    + (["idleVolume"] if self.idle_volume else []))
             device = {"id": self.device_id, "name": self.name, "platform": "fake",
                       "caps": caps}
             if self.kind is not None:
@@ -221,6 +228,9 @@ def main() -> None:
                          "phone, tablet, speaker, tv, group")
     ap.add_argument("--volume", type=int, default=100, metavar="N",
                     help="the level it starts at and reports on connect (0-100)")
+    ap.add_argument("--idle-volume", action="store_true",
+                    help='advertise "idleVolume" and apply do:setVolume also while '
+                         "not the playing device")
     args = ap.parse_args()
     device_id = args.id or ("fake-" + args.name.lower().replace(" ", "-"))
     asyncio.run(FakeReceiver(
@@ -228,7 +238,8 @@ def main() -> None:
         stale_first=args.stale_first, settle_ms=args.settle_ms,
         never_settle=args.never_settle,
         playing_after_clear=args.playing_after_clear,
-        kind=args.kind, volume=max(0, min(100, args.volume))).run())
+        kind=args.kind, volume=max(0, min(100, args.volume)),
+        idle_volume=args.idle_volume).run())
 
 
 if __name__ == "__main__":
