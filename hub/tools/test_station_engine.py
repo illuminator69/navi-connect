@@ -26,6 +26,8 @@ Cases:
      never serve a seed or a C track (Balanced, with alchemy's lures in play);
   3. Close serves within rank 150 while candidates there remain, and C never
      appears on Close or Balanced even after a played-through track and a like;
+     Explore serves no C before a play-through, and drifts (`why: drift`) from
+     the neighbours of a track it served once that track is played through;
   4. a 15-track neighbourhood yields 15 then `exhausted` — and an AudioMuse 500
      on the ladder's deeper ask is `partial`, never `exhausted`;
   5. `after`: a same-device retry replays, another device's stale `after` is
@@ -106,7 +108,7 @@ def build_library():
                                "Echo Song - Live at Wembley", "Echo Song feat. Someone")):
         _add(f"V{i}", title, "Version Band", "Echoes", 0.01 * i, 0.02,
              _feats(rng, indie), "indie:0.55,female vocalists:0.54", "indie", "relaxed")
-    elec = (0.70, 0.60, 0.62, 0.66, 0.55, 0.55)
+    elec = (0.64, 0.57, 0.61, 0.60, 0.64, 0.61)   # compressed, as on the live library
     for a in range(20):
         for t in range(3):
             _add(f"B{a:02d}_{t}", f"Pulse {a}-{t}", f"B Artist {a:02d}", f"B Album {a}",
@@ -550,6 +552,42 @@ async def main_suite(failures):
         if st_ != 400 or sg.get("code") != "bad_character":
             failures.append(f"a bad character value: {st_} {sg}")
 
+        # Explore: nothing beyond the anchor gate until a played-through track
+        # opens its own neighbourhood (two hops, no more).
+        # Seeded at L's far edge, so B is outside the seed's reach: the similar-artist
+        # lures (B01, C00) and the alchemy lures (C) must all stay out.
+        edge = min((t for t in LIB.values() if t["id"].startswith("L")),
+                   key=lambda t: t["x"])["id"]
+        st_, x0 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": [edge]}, "character": "explore",
+            "count": 10, "deviceId": "dev-a"})
+        xsid, xseq, xserved = x0["stationId"], x0["seq"], list(x0["tracks"])
+        for _ in range(3):
+            st_, nx = await acall(port, "POST", "/sonic/station/next", {
+                "stationId": xsid, "after": xseq, "count": 10, "deviceId": "dev-a"})
+            xserved += nx["tracks"]
+            xseq = nx["seq"]
+        if any(t["id"][0] in "BC" for t in xserved):
+            failures.append("Explore served past the seed's reach before anything was "
+                            "played through")
+        if any(t["why"] == "drift" for t in xserved):
+            failures.append("Explore drifted before anything was played through")
+        # Play through the served tracks furthest towards B, then drift appears.
+        towards = sorted(xserved, key=lambda t: -LIB[t["id"]]["x"])[:3]
+        for t in towards:
+            await acall(port, "POST", "/sonic/station/signal", {
+                "stationId": xsid, "trackId": t["id"], "kind": "played"})
+        drift = []
+        for _ in range(4):
+            st_, nx = await acall(port, "POST", "/sonic/station/next", {
+                "stationId": xsid, "after": xseq, "count": 10, "deviceId": "dev-a"})
+            xseq = nx["seq"]
+            drift += [t for t in nx["tracks"] if t["why"] == "drift"]
+            if any(t["why"] == "drift" and t["rank"] > 200 for t in nx["tracks"]):
+                failures.append("a drift track outside the 200 of its played-through track")
+        if not drift:
+            failures.append("Explore never drifted from a played-through track")
+
         # ----- 4. a 15-track neighbourhood, and a 500 on the ladder ---------- #
         st_, n0 = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": ["N00"]}, "character": "close",
@@ -916,6 +954,7 @@ async def main():
           "spacing/no-second-hop-on-close-balanced/rank-ceiling/15-then-exhausted/"
           "500-mid-ladder-partial/after-replay+servedElsewhere/session_bound-409/"
           "unlisted-keys-dropped/your-mix/restart-keeps-station+history/"
+          "explore-drifts-only-after-a-play-through/budget-from-arrival/"
           "tier1-sonic+similarSongs2/unconfigured-503-fallback/largest-under-cap/"
           "no-getRandomSongs/title-key")
 
