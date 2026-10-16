@@ -81,7 +81,7 @@ watching controllers both counting the play.
 
 ### Data/theming philosophy
 Both clients derive dynamic UI color from album art (kmpalette → materialKolor scheme in Navic).
-AudioMuse "Mood Flow" drives an adaptive visualizer.
+The AudioMuse generator chip on the queue names what built it (a radio, Your mix, Auto DJ).
 
 ---
 
@@ -183,8 +183,8 @@ Standard Subsonic auth (salted token). Used for library, streaming, playback, ra
 **Tier 1 — Navidrome plugin, zero config, Subsonic auth** (works today on 0.62.0; sonic endpoints
 require the AudioMuse plugin loaded — probe with `getOpenSubsonicExtensions` advertising
 `sonicSimilarity`):
-- `getSimilarSongs2(id, count)` → Instant Mix / Similar autoplay (works vanilla).
-- `getArtistInfo` → Artist Radio.
+- `getSimilarSongs2(id, count)` / `getSonicSimilarTracks` → each client's no-hub Auto DJ fallback,
+  and the hub's own Tier 1 when the AudioMuse core is down (§18).
 - `getSonicSimilarTracks(id, count)` → scored similar; `findSonicPath(startSongId, endSongId, count)`
   → **Song Journey**.
 
@@ -197,9 +197,9 @@ credentials, caps concurrency and caches results for both clients. Each client k
 `http://host:8000` + `Bearer <API_TOKEN>` config as an explicit fallback for a LAN setup with no hub,
 and demotes itself to it for 10 minutes if the hub reports no AudioMuse configured. Still desktop-only
 in Feishin (routed through the Electron main process to avoid CORS); native Ktor in Navic:
-- `GET /api/sonic_fingerprint/generate?n=` → autoplay seeded from listening habits.
-- `POST /api/alchemy {items:[{op:ADD|SUBTRACT,id,type}], n, temperature?, subtract_distance?}` →
-  centroid + nearest songs (returns `centroid_2d`). This is the engine behind **Adaptive "Mood Flow"**.
+- `GET /api/sonic_fingerprint/generate?n=` and `POST /api/alchemy` → kept for older clients; the
+  station engine (`PROTOCOL.md` §18) now calls `similar_tracks`, `alchemy`, `similar_artists`,
+  `sonic_fingerprint` and `external/get_score` itself, from inside the hub.
 - `POST /api/clap/search` → text→mood search. (`chatPlaylist` intentionally **not** used — no LLM on
   the server.)
 
@@ -457,18 +457,20 @@ settle (`LBBOT_WEB_URL`, else `LBBOT_URL`). An artist the mirror does not hold f
 - Metered/cellular transcode profile (Feishin).
 
 ### AudioMuse recommendation layer
-- **Tier 1** both clients (Instant Mix, Artist Radio, Song Journey) behind a capability probe.
-- **Tier 2** — Navic: Sonic Fingerprint autoplay, Adaptive **Mood Flow** (skip/play-through signals →
-  alchemy centroid), Echo/Steady/Transition **character presets**, adaptive visualizer w/ mood-reactive
-  palette. Feishin: autoplay-source dropdown (Auto DJ / Fingerprint / Mood Flow), Mood Flow signals,
-  blob visualizer palette.
-- **CLAP text→mood search** (both); a scoped **generator chip** naming the active generator + centroid tint.
-- Autoplay modes (one control, four): **Off / Similar / Sonic Fingerprint / Adaptive** — modes needing
-  Tier 2 grey out until configured.
+- **Stations** (2026-10-16, `PROTOCOL.md` §18): track, album and artist radio, Your mix, and
+  autoplay are hub-generated, in both clients. A station is a seed plus a character, **Close /
+  Balanced / Explore**. The hub gates every candidate by AudioMuse's own neighbourhood of the seed,
+  never serves a track twice or one played in the last 14 days, hears skips and play-throughs from
+  the session, and takes likes from the clients. Autoplay is On/Off: a radio keeps going either way,
+  and a queue that ends continues as a station only with it on. No path falls back to random songs.
+- Without stations (no hub, or an older one) each client runs upstream Feishin's **Auto DJ** (Navic a
+  port of it) through Navidrome's similar-songs agent.
+- **Song Journey** (Navidrome's `findSonicPath`) and **CLAP text→mood search** (both); a
+  **generator chip** on the queue naming what built it.
 
 ### Known open items (see `TESTING-SETUP.md` §8)
-- Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow re-splice loop + character-param wiring
-  landed 2026-07-20 — bounded re-centroid passes + Echo/Steady/Transition presets.)*
+- Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow and its presets were retired by the
+  stations of 2026-10-16.)*
 - Navic **native cast lifecycle re-adoption** after a process restart (crash is fixed; lifecycle isn't).
 - Expressive-blur (Haze) expansion beyond NowPlaying.
 - Deferred Navic library QoL (need a compiler in the loop): alphabet fast-scroll jump list, recently-added
@@ -545,9 +547,9 @@ merge playbook. The integration points from this side:
   `androidMain/.../shared/MediaPlayer.android.kt` (a `MediaLibraryService` since alpha59).
 - **Cast:** `androidMain/.../domain/manager/cast/*` — `NsdManager` discovery plus a hand-rolled
   castv2 client. No Cast SDK, no Play Services. Scrobbling in `domain/manager/CastScrobbler.kt`.
-- **AudioMuse/radio:** `domain/manager/{RadioManager,AudioMuseManager}.kt`,
-  `domain/models/settings/{AutoplayMode,MoodCharacter}.kt`,
-  `ui/screens/nowPlaying/components/controls/{AdaptiveMoodBackground,NowPlayingAutoplaySelector}.kt`.
+- **AudioMuse/radio:** `domain/manager/{StationManager,StationModels,RadioManager,AutoDj,AudioMuseManager}.kt`,
+  `domain/models/settings/StationCharacter.kt`,
+  `ui/screens/nowPlaying/components/controls/NowPlayingAutoplaySelector.kt`.
 - **Native API / downloads / saved queues:** `domain/manager/{NativeApiManager,PlaylistDownloadManager}.kt`,
   `ui/screens/settings/DownloadCenterScreen.kt`, `ui/screens/savedqueues/*`.
 - **Theming:** `ui/util/CoverColorScheme.kt`,
