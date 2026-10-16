@@ -37,6 +37,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
 | `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client |
+| `HUB_STATION_HISTORY` | `1` | `0` keeps the stations' play history (PROTOCOL §18.4) in memory only; otherwise it is written to `<HUB_STATE>.history` |
 | `HUB_SLEEP_MINUTE_S` | `60` | how many seconds one minute of the sleep timer lasts. Leave it alone: it exists so the tests can watch a timer run out in seconds |
 
 If the mirror creds are unset the hub still works fully; it just skips the
@@ -47,7 +48,9 @@ when a "Mixed for You" recipe or a saved-queue deletion changes — the two thin
 client can send again. If `state.json` is empty or missing at start, the backup is
 loaded instead. If it cannot be parsed it is first renamed to
 `state.json.corrupt-<UTC timestamp>` and left for you to inspect; nothing reads or
-removes those. To reset the hub, delete all of them, not `state.json` alone.
+removes those. `state.json.history` is the stations' play history: ids, times and a
+hashed title key, no song names. To reset the hub, delete all of them, not
+`state.json` alone.
 
 ### AudioMuse Tier-2 proxy (`/sonic/*`)
 
@@ -61,6 +64,25 @@ an open relay.
 ```bash
 curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/sonic/clap/stats
 ```
+
+### Stations (`/sonic/station/*`)
+
+Radio and autoplay, computed here (`../PROTOCOL.md` §18): a station is a seed plus a
+character (Close, Balanced, Explore), and the hub answers "the next N tracks" from
+AudioMuse's own neighbourhood of the seed, falling back to Navidrome's similar-songs
+agent when AudioMuse is down. It keeps what each station served, the session's skips
+and play-throughs, and a 14-day play history, so a station never repeats itself or
+what you played this fortnight. Enabled with `HUB_TOKEN` and either `AUDIOMUSE_URL`
+or `NAVIDROME_URL` + `HUB_ND_USER` + `HUB_ND_PASS`; otherwise the probe answers
+`configured: false` and the clients run their own fallback.
+
+```bash
+curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/sonic/station/characters
+```
+
+`tools/station_probe.py --env FILE --title "Cinnamon Girl" --artist "Lana Del Rey"` runs
+the engine in-process against a real AudioMuse and Navidrome (read-only routes only)
+and prints every batch with why each track was chosen.
 
 ### lb-bot proxy (`/lb/*`)
 
@@ -127,6 +149,8 @@ python tools/test_act_ack.py      # act.cid / ack, refusals, acts held by a tran
 python tools/test_device_rows.py  # hello.device.kind, deviceState.volume, across a restart
 python tools/test_volume_target.py  # act:volume with a target, its refusals, the echo untouched
 python tools/test_sleep_timer.py  # act:sleepTimer, running out, during a transfer, across a restart
+python tools/test_station_engine.py   # stations against a fake AudioMuse + Navidrome
+python tools/test_station_signals.py  # skips and play-throughs judged from the session
 ```
 
 Every `tools/test_*.py` is a script that starts its own hub on a free port and exits

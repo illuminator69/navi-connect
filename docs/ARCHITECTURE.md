@@ -134,13 +134,22 @@ that cannot reach the sidecar plays silence under a playing bar.
 
 **"Mixed for You" is hub-owned too, and it is a recipe rather than a result.** A saved queue stores
 the tracks; a mix stores `{kind, seedId, moodCharacter, count}` and each client **regenerates** it
-locally with the engine it already has (`RadioManager` / `auto-dj/*`). The hub never generates
-anything — it stores and broadcasts, which keeps it audio-free and AudioMuse-free. So a second play
+locally with the engine it already has (`RadioManager` / `auto-dj/*`); the hub stores and
+broadcasts the recipe, never its result. So a second play
 of the same mix gives a different queue, and that is the whole point: nothing in either client
 persisted a recipe before (`RadioManager` took those values as arguments and dropped them, and
 `playMix` exited into a frozen `SavedQueueEntity`). Capped at 30, evicted by `updatedAt`, and
 deliberately **without** tombstones — unlike a saved queue, a mix is never published concurrently
 by several devices, so there is no race to arbitrate. `PROTOCOL.md` §17.
+
+**Radio and autoplay are hub-owned since 2026-10-16: stations** (`PROTOCOL.md` §18, overturning the
+old "the hub never generates" rule). A station is a seed plus a character (Close / Balanced /
+Explore); the hub answers "the next N tracks" from AudioMuse through the same `/sonic` pool and
+cache, gated by membership in an anchor's own nearest list (the six mood features only order a
+batch: they are too compressed to gate one), and falls back to Navidrome's similar-songs agent.
+It hears skips and play-throughs from the session's own reports, keeps what each station served
+and a 14-day play history, and never fills with random songs: `exhausted` is an answer. The
+clients keep their own Auto DJ only as the fallback for a hub without stations.
 
 **Saved-queue history is hub-owned** (Continue Listening): the hub keeps a rolling, capped list of
 queue records, broadcasts it (`savedQueues`), and marks the current one via `session.savedQueueId`. A
