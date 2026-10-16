@@ -12,14 +12,16 @@ in a temporary file and its play history in memory, and listens on no port.
 
   station_probe.py --env FILE (--seed ID | --title T --artist A | --your-mix)
                    [--character close|balanced|explore|all] [--refills N]
-                   [--count K] [--skip I,J] [--played I,J] [--navidrome URL] [--json]
+                   [--count K] [--skip I,J] [--played I,J] [--navidrome URL]
+                   [--tier1-only] [--json]
 
 --env names a file of KEY=VALUE lines (AUDIOMUSE_URL, AUDIOMUSE_TOKEN,
 HUB_ND_USER, HUB_ND_PASS, optionally NAVIDROME_URL). Its values are put in this
 process's environment and never printed. --skip I,J sends a `skip` signal for
 the I-th and J-th track served (0-based, over the whole run of one character),
 right after the batch that served it; --played does the same with `played`, which
-gives Explore played-through tracks to drift from.
+gives Explore played-through tracks to drift from. --tier1-only drops AUDIOMUSE_URL
+after reading the file, so the engine runs on Navidrome's similar songs alone.
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ ENV_KEYS = ("AUDIOMUSE_URL", "AUDIOMUSE_TOKEN", "HUB_ND_USER", "HUB_ND_PASS",
 HIPHOP = ("hip-hop", "hip hop", "rap", "trap")
 
 
-def load_env(path: str, navidrome: str) -> None:
+def load_env(path: str, navidrome: str, tier1_only: bool = False) -> None:
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -47,6 +49,8 @@ def load_env(path: str, navidrome: str) -> None:
             if k.strip() in ENV_KEYS:
                 os.environ[k.strip()] = v.strip()
     os.environ.setdefault("NAVIDROME_URL", navidrome)
+    if tier1_only:
+        os.environ.pop("AUDIOMUSE_URL", None)
     state_dir = tempfile.mkdtemp(prefix="station-probe-")
     os.environ.update(HUB_STATE=os.path.join(state_dir, "state.json"),
                       HUB_STATION_HISTORY="0", HUB_MIRROR_PLAYQUEUE="false",
@@ -64,6 +68,8 @@ async def capabilities(hub, known_id: str) -> dict:
     await eng.probe()
     caps: dict = {"tier2": eng.tier2_ok, "tier1": eng.tier1_ok,
                   "navidromeSonicSimilarity": eng.sonic}
+    if not hub.AUDIOMUSE_URL:
+        return caps
     for path in ("/external/get_score", "/get_score"):
         spec = {"method": "GET", "path": path, "params": ("id",), "cache": False,
                 "timeout": 8}
@@ -98,8 +104,12 @@ async def resolve(hub, title: str, artist: str) -> str:
 
 async def seed_row(hub, seed: str) -> dict:
     eng = hub.HUB_INSTANCE.stations
-    status, data = await eng._am("score", {"id": seed}, None, None)  # noqa: SLF001
-    row = hub._station_row(data) if status == 200 else None  # noqa: SLF001
+    if hub.AUDIOMUSE_URL:
+        status, data = await eng._am("score", {"id": seed}, None, None)  # noqa: SLF001
+        row = hub._station_row(data) if status == 200 else None  # noqa: SLF001
+    else:
+        outcome, payload = await eng._nd("getSong", {"id": seed}, None)  # noqa: SLF001
+        row = hub._station_row((payload or {}).get("song")) if outcome == "ok" else None
     return row or {"title": "?", "artist": "?", "tag": ""}
 
 
@@ -227,9 +237,10 @@ def main() -> int:
     ap.add_argument("--skip", default="")
     ap.add_argument("--played", default="")
     ap.add_argument("--navidrome", default="http://192.168.129.153:4533")
+    ap.add_argument("--tier1-only", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    load_env(args.env, args.navidrome)
+    load_env(args.env, args.navidrome, args.tier1_only)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     if args.json:
         with contextlib.redirect_stdout(sys.stderr):  # the hub's own log lines
