@@ -2690,7 +2690,8 @@ songs.
 
 Plain HTTP on port `4790` beside §14, same `HUB_TOKEN` bearer, same whitelist rule (unlisted
 body keys are dropped). Enabled when `HUB_TOKEN` is set **and** either `AUDIOMUSE_URL` (Tier 2)
-or `NAVIDROME_URL` + `HUB_ND_USER` + `HUB_ND_PASS` (Tier 1) is configured.
+or `NAVIDROME_URL` + `HUB_ND_USER` + `HUB_ND_PASS` (Tier 1) is configured. Disabled, the probe
+still answers (below, `configured: false`) and every other route answers `503 {fallback: true}`.
 
 **`GET /sonic/station/characters`** is the probe and the shared catalogue. It always answers
 200, so both clients render the same words:
@@ -2737,7 +2738,10 @@ Answers:
 ```
 
 - `tracks` never contains a seed. A radio's queue is the seed track(s), which the client
-  already has, followed by `tracks`.
+  already has, followed by `tracks`. With `bindSession` naming the live session, nothing in that
+  session's queue is answered either, whatever `exclude` says.
+- **Your mix** opens with the fingerprint's own top rows (§18.3) that were not played in the last
+  14 days, then continues as a radio would.
 - `seq` counts every track the station has served.
 - `why` is one of:
   - `near`: the seed's own nearest neighbours.
@@ -2749,7 +2753,8 @@ Answers:
 - Refusals:
   - `400 {code: "bad_seed" | "bad_character"}`.
   - `404 {code: "seed_unknown"}`: AudioMuse holds no seed track.
-  - `503 {fallback: true}`: no tier is usable.
+  - `503 {fallback: true}`: no tier is usable. Also Your mix on a hub whose AudioMuse is unset
+    or down: the fingerprint has no Tier 1 equivalent.
   - `409 {code: "session_bound", stationId}`: `bindSession` was asked and the session already has
     a station. The client then continues that one with `next`. This is how two devices reaching
     the end of one queue together end up on one station, not two.
@@ -2767,7 +2772,9 @@ Answers `{stationId, seq, rev, character, engine, tracks, exhausted, partial, se
   - An `after` below the station's `seq` from another device answers `servedElsewhere: true`
     with no tracks: someone already topped this station up. The caller learns the new `seq` from
     the `station` frame or from this answer.
-  - Only `after == seq` computes a new batch.
+  - Only `after == seq` computes a new batch. An `after` above `seq` (a hub that lost its last
+    write) is answered as a new batch too.
+  - `400 {code: "bad_after"}`: `after` missing, or not a non-negative integer.
 - `count` is 1–25, default 5.
 - `404 {code: "station_unknown"}`: an expired station, or a hub that lost it. The client starts
   again once, from the seed it keeps.
@@ -2788,7 +2795,13 @@ Answers `{rev, applied, ignored?}`.
 - `skip` and `played` are for a station whose queue is **not** the hub session. For a bound
   station the hub derives both itself (§18.3) and answers `ignored: "session"`.
 - A track the station never served or seeded answers `ignored: "unknown_track"`.
-- A signal moves `rev`, and so does a character change.
+- `unlike` takes a like back. `dislike` takes a like back, joins the subtract set and cools the
+  track's artist at once (as that character's skip limit would). `played` on an unbound station
+  also enters the play history (§18.4).
+- `400 {code: "bad_signal"}` for an unknown `kind`, `400 {code: "bad_character"}` for a
+  `character` signal whose `value` is not one of the three.
+- A signal that changes something moves `rev`, and so does a character change; repeating one that
+  is already in effect (a second like) changes nothing and answers `applied: true`.
 
 ### 18.2 Binding to the session, and the `station` frame
 
@@ -2819,15 +2832,20 @@ change. It uses the position of the report **before** the change, because the re
 the index already carries the new track's position.
 
 - **played through:** the track `ended`, or reached 85% of `durationMs`, or was left with under
-  15 s to go.
+  15 s to go (that last only past half the track, so a short track skipped at once is not
+  played). Judged by position, whichever way the move goes. An `ended` report is judged once
+  however many repeat it.
 - **skipped:** a step forward in play order with position under min(30 s, 40% of `durationMs`).
-- **neither:** a jump backwards or to a track that is not the next one, a `setQueue`, a `clear`,
-  or a report dropped as stale.
+- **neither:** a jump backwards or to a track that is not the next one, at a position that is not
+  a play-through; a `setQueue`; a `clear`; a report dropped as stale.
 
-So starting a new queue is never a skip.
+So starting a new queue is never a skip. A `setQueue` or `clear` still enters the track it leaves
+in the play history when that counts as a play (§18.4); it steers nothing.
 
-**Per character.** Starting values; `AUDIT-…` §"Phase 0 results" has the measurements behind
-them.
+**Per character.** `AUDIT-…` §"Phase 0 results" has the measurements behind these values. The
+hub lane measured them again on the live library (2026-10-16, six seeds × three characters × 65
+tracks, and 230 on Close): no repeats, no hip-hop-led track on the Lana Del Rey seed on any
+character, and nothing that called for a change, so they stand as they were.
 
 | | Close | Balanced | Explore |
 |---|---|---|---|
@@ -2836,6 +2854,8 @@ them.
 | Artists: at most / minimum gap | 2 per 10 (the seed's artist 3) / 3 tracks | 2 per 10 / 4 tracks | 1 per 10 / 8 tracks |
 | A like adds an anchor, at most | 2 | 4 | 6 |
 | A skip | joins the subtract set (alchemy); 2 skips of one artist cool it for 2 h | same | 1 skip cools the artist |
+| Lists asked for | nearest-first `similar_tracks` (`radius_similarity=false`, `eliminate_duplicates=false`), the ceiling rounded up to 150 / 200 / 400 / 1000 / 2000 rows, cached 30 min | same | same; a played-through track's list at 200 |
+| Order of a batch | nearest first, a track held back only until its artist is far enough behind | among the next few the gate admits, the one whose six features change least | same as Balanced |
 
 The gate is AudioMuse's own neighbourhood, not the six mood features. Those are compressed (every
 value near 0.6), so a feature gate let Lana Del Rey → OsamaSon through. OsamaSon is not among
@@ -2847,24 +2867,43 @@ Lana's 1,000 nearest of 15,768 songs. The features order a batch so that transit
 - a seed;
 - a track, or the same title by the same primary artist, played in the last 14 days.
 
+"The same title" is the title lowercased, with anything in brackets, a `feat.` tail, a dash tail
+that says remaster or live, and punctuation dropped (a leading "Live", as in "Live Forever", stays).
+The primary artist is the first act of the credit, split on `,` `&` `+` `feat.` `with` `vs` `x`,
+never on `/` (AC/DC). A station never serves two versions of one song either.
+
 A batch that comes up short widens before it gives up: deeper into the lists, the rank ceiling
 ×1.5 (up to 1000, or 2000 for Explore), the history window down to 3 days, played-through
-tracks' neighbours, similar artists, then Tier 1. Only when all of those **answered** and found
-nothing is it `exhausted`. A source that failed (AudioMuse down, a timeout) makes the answer
-`partial`, never `exhausted`.
+tracks' neighbours, similar artists, then Tier 1 (Navidrome, at most 500 per anchor). Only when
+all of those **answered** and the batch is still empty is it `exhausted`. A source that failed
+(AudioMuse down, a timeout) makes the answer `partial`, never `exhausted`.
+
+- Played-through neighbours and similar artists are Explore's sources from the first batch. On
+  Close and Balanced every source is gated to the anchors' own lists, so those two rungs could only
+  offer what the lists already hold, and they add no step of their own.
+- Tier 1's rows carry no features, so its gate is the rank in Navidrome's own answer alone, and its
+  tracks are answered `why: "tier1"`.
+- An AudioMuse the hub could not reach on its last call is skipped: batches go straight to Tier 1,
+  `partial`, until the re-probe (15 s after the failure, and every 10 min) finds it again. A 500
+  from AudioMuse is a failed source but not an unreachable one.
 
 **Your mix** takes its anchors from AudioMuse's Sonic Fingerprint of the hub's Navidrome user
-(`HUB_ND_USER`): its first rows are that user's own most-played tracks, which become the anchors.
-Everything else is as for a radio. It is that user's mix, whoever asks.
+(`HUB_ND_USER`, `n=100`): its first rows, at distance 0, are that user's own most-played tracks,
+and up to 5 of them become the anchors (the first 3 rows when none is at distance 0). Unlike a
+radio's seed they are served, first, when not played in the last 14 days. Everything else is as
+for a radio. It is that user's mix, whoever asks.
 
 ### 18.4 State, history, limits
 
-- **Stations:** at most 8, each expiring after 24 h unused, kept in `state.json["stations"]` so a
-  restart keeps them.
-- **Play history:** the last 2,000 plays from the last 14 days, as ids and times only, in its own
-  file beside `state.json` (`<state>.history`), written at most every 30 s. Fed by the session
-  (a play is ≥50% or ≥4 min). Never in `health`, `welcome` or a log line. `HUB_STATION_HISTORY=0`
-  keeps it in memory only.
+- **Stations:** at most 8 (the least recently used is dropped, never the one the session is bound
+  to), each expiring after 24 h unused, kept in `state.json["stations"]` so a restart keeps them.
+  A queue bound to a station that is dropped is unbound (`session.stationId` → `null`).
+- **Play history:** the last 2,000 plays from the last 14 days, in its own file beside
+  `state.json` (`<state>.history`), written at most every 30 s and on a graceful stop. Each play is
+  an id, a time and a hashed title key (8 bytes of BLAKE2b over the normalised title and primary
+  artist), so the file holds no song names. Fed by every track of the session (a play is ≥50% or
+  ≥4 min, or a play-through), and by `played` signals; the same id again within 30 min is the same
+  play. Never in `health`, `welcome` or a log line. `HUB_STATION_HISTORY=0` keeps it in memory only.
 - **Limits:**
   - A request has 12 s; what is found by then is answered with `partial: true`.
   - One computation per station at a time, two stations computing at once.

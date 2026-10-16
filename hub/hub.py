@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import http
 import json
+import math
 import os
 import random
 import re
@@ -139,7 +140,9 @@ ECHO_BACKSTOP = 12.0
 # ignores the cap and the `cid`. The last two matter the same way: an older hub
 # reads `act:volume` with a `target` as "the ACTIVE device's volume" and answers
 # `act:sleepTimer` with `bad_action`, so a client sends neither without them.
-HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer"]
+# `station` (§18): the station engine, `session.stationId`, `setQueue.stationId`
+# and the `station` frame. Without it a client runs its own radio and autoplay.
+HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station"]
 # "I apply `do:setVolume` while I am not the playing device." Only a device that
 # says so on its current connection is sent one while idle (PROTOCOL §5.1): to
 # anything else the directive would be a level recorded here and applied nowhere.
@@ -278,6 +281,81 @@ LB_PROBE_STARTUP_WAIT = 3.0
 # (every saved queue in it) at that rate. Leading edge, like the position saves;
 # a new epoch is always written at once, and a graceful stop flushes the rest.
 LB_INDEX_SAVE_THROTTLE = 10.0
+
+# --- stations (PROTOCOL §18): radio and autoplay, computed here ---
+# The play history the stations keep (the last STATION_HISTORY_MAX plays from the
+# last STATION_HISTORY_DAYS days) lives in its own file beside state.json. "0"
+# keeps it in memory only: the stations still avoid what was played, until a
+# restart forgets it.
+STATION_HISTORY_ON = os.environ.get("HUB_STATION_HISTORY", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# The characters (§18.1). Their order is the old MoodCharacter order (EchoMatch,
+# SteadyVibes, TransitionMaestro), so a preference stored as an ordinal keeps its
+# meaning, and their words are the catalogue both clients render.
+STATION_CHARACTERS = ("close", "balanced", "explore")
+STATION_DEFAULT_CHARACTER = "balanced"
+STATION_LEGACY = {"close": "EchoMatch", "balanced": "SteadyVibes",
+                  "explore": "TransitionMaestro"}
+STATION_FROM_LEGACY = {v: k for k, v in STATION_LEGACY.items()}
+STATION_CATALOGUE = (
+    {"id": "close", "label": "Close", "legacy": "EchoMatch",
+     "description": "Stays right next to what you started with."},
+    {"id": "balanced", "label": "Balanced", "legacy": "SteadyVibes",
+     "description": "Near what you started with, with room to move."},
+    {"id": "explore", "label": "Explore", "legacy": "TransitionMaestro",
+     "description": "Wanders further, steered by what you skip and like."},
+)
+STATION_MAX = 8                       # stations held at once, least recently used evicted
+STATION_IDLE_MS = 24 * 3600 * 1000    # a station unused this long is dropped
+STATION_SERVED_MAX = 2000             # served ids a station remembers (oldest dropped)
+STATION_TRAIL_MAX = 20                # artist keys kept for the spacing rule
+# One request's budget, end to end. Under Feishin's 15 s IPC timeout and Navic's
+# 20 s; what is found by then is answered with `partial: true`.
+STATION_BUDGET_S = 12.0
+STATION_CALL_TIMEOUT = 8.0            # one AudioMuse or Navidrome call
+STATION_COMPUTING_MAX = 2             # stations computing at once
+STATION_CALLS_PER_REQUEST = 2         # upstream calls in flight for one request
+STATION_PROBE_INTERVAL = 600.0        # the tiers are re-probed this often...
+STATION_PROBE_RETRY = 15.0            # ...and this long after a call failed
+STATION_PROBE_STARTUP_WAIT = 3.0      # a probe route waits this long for the first verdict
+# AudioMuse answers a seed's nearest list the same way every time (it caches per
+# seed), so a list is fetched once and walked by cursor: re-asking never yields new
+# rows. Cached in SONIC's cache for this long.
+STATION_LIST_TTL = 1800.0
+# The depths a nearest list is fetched at. A ceiling is rounded up to one of these,
+# so a station widening from 150 to 225 to 338 asks AudioMuse twice, not three times.
+# 2000 rows measured 810 KB on the live AudioMuse (2026-10-16), under PROXY_MAX_RESPONSE.
+STATION_LIST_DEPTHS = (150, 200, 400, 1000, 2000)
+STATION_WIDEN = 1.5                   # the ladder's rank-ceiling step
+STATION_DRIFT_CEILING = 200           # Explore: rank in a played-through track's own list
+STATION_DRIFT_SOURCES = 5             # the last N played-through tracks drift from
+STATION_TIER1_MAX = 500               # deepest Navidrome similar list asked for
+STATION_ALCHEMY_N = 100
+STATION_SIMILAR_ARTISTS_N = 8
+STATION_SEED_ARTISTS = 2              # seed artists Explore asks similar artists for
+STATION_COOL_MS = 2 * 3600 * 1000     # an artist skipped enough is cooled this long
+STATION_SKIP_TTL_MS = 2 * 3600 * 1000 # a skip stays in the alchemy subtract set this long
+STATION_FINGERPRINT_N = 100
+STATION_MIX_ANCHORS = 5               # Your mix: at most this many of the top rows
+STATION_SEEDS_MAX = 5
+STATION_EXCLUDE_MAX = 1000
+STATION_HISTORY_MAX = 2000
+STATION_HISTORY_DAYS = 14
+STATION_HISTORY_RELAXED_DAYS = 3      # the ladder's history rung
+STATION_HISTORY_FLUSH_S = 30.0        # the history file is written at most this often
+STATION_HISTORY_SUFFIX = ".history"
+STATION_HISTORY_REPEAT_MS = 30 * 60 * 1000  # one id again within this is the same play
+# Judging the track just left (§18.3).
+STATION_PLAYED_FRACTION = 0.85        # played through at 85 % ...
+STATION_PLAYED_TAIL_MS = 15_000       # ... or with under 15 s to go
+STATION_SKIP_MS = 30_000              # a skip: a step forward before min(30 s, 40 %)
+STATION_SKIP_FRACTION = 0.40
+STATION_PLAY_FRACTION = 0.50          # a play, for the history: 50 % ...
+STATION_PLAY_MS = 240_000             # ... or 4 min
+# The six features AudioMuse carries in `other_features`. Compressed (every value
+# sits near 0.6 on the live library), so they ORDER a batch for smooth transitions
+# and never gate one: a feature gate let Lana Del Rey -> OsamaSon through.
+STATION_FEATURES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 
 def log(*a: Any) -> None:
@@ -451,6 +529,10 @@ class Session:
     saved_queue_id: Optional[str] = None
     source_kind: str = "manual"                       # album|playlist|radio|moodFlow|journey|manual
     source_name: Optional[str] = None
+    # The station this queue continues as (PROTOCOL §18.2): set by setQueue's
+    # `stationId` or a station `start` with `bindSession`, cleared by a setQueue
+    # without one and by `clear`. What lets the hub hear the station's skips.
+    station_id: Optional[str] = None
     # Bumped on EVERY assignment to active_device_id, so "is the slot still where I
     # left it" is answerable. The device id alone can't answer it: A -> B -> A leaves
     # the same id with a different meaning, and a timed-out transfer to A that only
@@ -479,6 +561,7 @@ class Session:
             "savedQueueId": self.saved_queue_id,
             "sourceKind": self.source_kind,
             "sourceName": self.source_name,
+            "stationId": self.station_id,
         }
 
     def bump(self) -> None:
@@ -681,6 +764,45 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
         "method": "GET", "path": "/external/get_score", "fallback": "/get_score",
         "params": ("id",), "cache": True,
     },
+}
+
+# The station engine's own way to AudioMuse (PROTOCOL §18). NOT routes: no client
+# can name one, because `HttpProxy.handle` looks a path up in SONIC_ROUTES and
+# nowhere else, and their route keys are not paths. They are called through
+# `SONIC.call`, so a station shares §14's four-slot pool, its cache and its
+# coalescing with every client request instead of opening a second way in.
+#
+# `similar_tracks` with `radius_similarity=false&eliminate_duplicates=false` is a
+# nearest-first list with distances, and the same list every time for a seed
+# (AudioMuse caches per seed), so it is cached long and walked by cursor. Alchemy
+# is stochastic and never cached. `score` is where a seed's own title, artist and
+# features come from; `/get_score` is its path on an AudioMuse older than B-137.
+SONIC_INTERNAL: dict[str, tuple[tuple[str, str], dict]] = {
+    "similar_tracks": (("GET", "station:similar_tracks"), {
+        "method": "GET", "path": "/api/similar_tracks",
+        "params": ("item_id", "n", "eliminate_duplicates", "radius_similarity",
+                   "mood_similarity"),
+        "cache": True, "ttl": STATION_LIST_TTL, "timeout": STATION_CALL_TIMEOUT,
+    }),
+    "alchemy": (("POST", "station:alchemy"), {
+        "method": "POST", "path": "/api/alchemy",
+        "body": ("items", "n", "temperature", "subtract_distance"),
+        "cache": False, "timeout": STATION_CALL_TIMEOUT,
+    }),
+    "fingerprint": (("GET", "station:fingerprint"), {
+        "method": "GET", "path": "/api/sonic_fingerprint/generate",
+        "params": ("n",), "nd": True, "cache": True, "timeout": STATION_CALL_TIMEOUT,
+    }),
+    "similar_artists": (("GET", "station:similar_artists"), {
+        "method": "GET", "path": "/api/similar_artists",
+        "params": ("artist", "artist_id", "n", "include_component_matches"),
+        "cache": True, "ttl": STATION_LIST_TTL, "timeout": STATION_CALL_TIMEOUT,
+    }),
+    "score": (("GET", "station:score"), {
+        "method": "GET", "path": "/external/get_score", "fallback": "/get_score",
+        "params": ("id",), "cache": True, "ttl": PROXY_CACHE_TTL_LONG,
+        "timeout": STATION_CALL_TIMEOUT,
+    }),
 }
 
 # lb-bot's library-gap intelligence. Read-mostly; the writes are all things the
@@ -2236,12 +2358,1574 @@ async def _drain_body(protocol: Any, headers: Any) -> None:
     protocol.body_consumed = True
 
 
+# --------------------------------------------------------------------------- #
+# Stations (PROTOCOL §18): radio and autoplay, generated by the hub
+#
+# A station is a seed plus a character. The hub keeps what it served, what was
+# skipped and liked, and a play history across sessions, and answers "the next N
+# tracks" from AudioMuse (Tier 2) or Navidrome's similar-songs agent (Tier 1). It
+# holds no queue: the clients put what it answers into theirs.
+#
+# The gate is AudioMuse's own neighbourhood. A candidate must sit within a rank
+# ceiling of an anchor's nearest list (an anchor is a seed track, or a liked one).
+# Nothing else admits a track — not alchemy, not a similar artist, not a feature
+# distance — so every source only chooses among what the gate already holds, and a
+# station never walks from what it last played (the walk that took Lana Del Rey to
+# OsamaSon). Explore alone may take a second hop: a track within 200 of the list of
+# a track it served AND that was then played through.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class _StationTuning:
+    """One character's numbers (PROTOCOL §18.3's table)."""
+    ceiling: int          # gate: rank in an anchor's nearest list
+    ceiling_max: int      # where the widening ladder stops raising it
+    alchemy_every: int    # 0 = never, 1 = every batch, 2 = every other batch
+    temperature: float    # alchemy's
+    alchemy_recent: int   # played-through tracks (Explore: or liked) added to alchemy
+    artist_cap: int       # at most this many tracks by one artist in any 10
+    seed_artist_cap: int  # the same for the seed's own artist
+    artist_gap: int       # at least this many other tracks between two by one artist
+    like_anchors: int     # likes that become anchors, at most
+    skips_to_cool: int    # skips of one artist that cool it for STATION_COOL_MS
+    drift: bool           # played-through tracks' neighbours are a source
+    artists: bool         # similar artists' tracks are a source
+
+
+STATION_TUNING: dict[str, _StationTuning] = {
+    "close": _StationTuning(ceiling=150, ceiling_max=1000, alchemy_every=0,
+                            temperature=0.0, alchemy_recent=0, artist_cap=2,
+                            seed_artist_cap=3, artist_gap=3, like_anchors=2,
+                            skips_to_cool=2, drift=False, artists=False),
+    "balanced": _StationTuning(ceiling=400, ceiling_max=1000, alchemy_every=2,
+                               temperature=0.3, alchemy_recent=3, artist_cap=2,
+                               seed_artist_cap=2, artist_gap=4, like_anchors=4,
+                               skips_to_cool=2, drift=False, artists=False),
+    "explore": _StationTuning(ceiling=1000, ceiling_max=2000, alchemy_every=1,
+                              temperature=0.8, alchemy_recent=5, artist_cap=1,
+                              seed_artist_cap=1, artist_gap=8, like_anchors=6,
+                              skips_to_cool=1, drift=True, artists=True),
+}
+
+STATION_ROUTES: dict[tuple[str, str], dict] = {
+    # The probe and the shared catalogue: always 200, so both clients render the
+    # same words whether or not this hub can compute a station.
+    ("GET", "/sonic/station/characters"): {"method": "GET", "params": (), "probe": True},
+    # Every body key a route reads is listed: HttpProxy drops the rest silently.
+    ("POST", "/sonic/station/start"): {
+        "method": "POST",
+        "body": ("seed", "character", "count", "exclude", "bindSession", "deviceId"),
+    },
+    ("POST", "/sonic/station/next"): {
+        "method": "POST",
+        "body": ("stationId", "after", "count", "exclude", "deviceId"),
+    },
+    ("POST", "/sonic/station/signal"): {
+        "method": "POST", "body": ("stationId", "trackId", "kind", "value"),
+    },
+}
+
+_STATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character")
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _station_kv(raw: Any) -> list[tuple[str, float]]:
+    """AudioMuse's `mood_vector` / `other_features`, in their order.
+
+    A "k:v,k:v" STRING on the live server (measured 2026-10-16), an object on
+    some builds. Anything unreadable is skipped rather than failing the row.
+    """
+    out: list[tuple[str, float]] = []
+    if isinstance(raw, dict):
+        items: Any = raw.items()
+    elif isinstance(raw, str):
+        items = (part.rsplit(":", 1) for part in raw.split(",") if ":" in part)
+    else:
+        return out
+    for k, v in items:
+        try:
+            out.append((str(k).strip(), float(v)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _station_features(raw: Any) -> Optional[tuple[float, ...]]:
+    kv = dict(_station_kv(raw))
+    if not all(f in kv for f in STATION_FEATURES):
+        return None
+    return tuple(kv[f] for f in STATION_FEATURES)
+
+
+# An artist credit split into acts, the rule both clients already use for "same
+# artist": `&`, `+`, `,`, `feat.`, `with`, `vs`, `x` — never `/` (AC/DC). The key
+# is the first act, lowercased, punctuation dropped.
+_ARTIST_SEP_RE = re.compile(
+    r"\s*[,&+;]\s*|\s+(?:feat\.?|ft\.?|featuring|with|vs\.?|x)\s+", re.I)
+
+
+def _station_artist_key(name: Any) -> str:
+    if not isinstance(name, str) or not name.strip():
+        return ""
+    first = _ARTIST_SEP_RE.split(name.strip(), maxsplit=1)[0]
+    key = re.sub(r"[^\w]+", " ", first.lower()).strip()
+    return key or name.strip().lower()
+
+
+# A version of a song is the same song for "played in the last 14 days": the
+# remaster, the live take, the one with a guest. Brackets go whole; a dash tail
+# goes when it says remaster or live; a feat. tail goes; punctuation goes. A
+# leading "Live" ("Live Forever") is the title and stays.
+_TITLE_BRACKET_RE = re.compile(r"[(\[{（【][^)\]}）】]*[)\]}）】]")
+_TITLE_FEAT_RE = re.compile(r"\s+(?:feat\.?|ft\.?|featuring)\s.*$", re.I)
+_TITLE_TAIL_RE = re.compile(r"\s+[-–—/|]\s+.*\b(?:remaster(?:ed)?|live)\b.*$", re.I)
+
+
+def _station_title(title: Any) -> str:
+    if not isinstance(title, str):
+        return ""
+    t = title.lower()
+    t = _TITLE_BRACKET_RE.sub(" ", t)
+    t = _TITLE_FEAT_RE.sub("", t)
+    t = _TITLE_TAIL_RE.sub("", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or title.strip().lower()
+
+
+def _station_title_key(title: Any, artist: Any) -> str:
+    """Title + primary artist, hashed: what the history and a station's served set
+    compare, and all they store of a title — a log or a copied state file then
+    holds no song names."""
+    raw = f"{_station_title(title)}\x1f{_station_artist_key(artist)}"
+    return hashlib.blake2b(raw.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _station_row(raw: Any) -> Optional[dict]:
+    """An AudioMuse row (`item_id`, `author`) or a Navidrome song (`id`, `artist`),
+    reduced to what a station decides with."""
+    if not isinstance(raw, dict):
+        return None
+    tid = raw.get("item_id") or raw.get("id")
+    if not isinstance(tid, str) or not _STATION_ID_RE.match(tid):
+        return None
+    title = _as_str(raw.get("title")) or ""
+    artist = _as_str(raw.get("author") or raw.get("artist")) or ""
+    tags = _station_kv(raw.get("mood_vector"))
+    try:
+        dist: Optional[float] = float(raw["distance"])
+    except (KeyError, TypeError, ValueError):
+        dist = None
+    return {
+        "id": tid, "title": title, "artist": artist,
+        "album": _as_str(raw.get("album")) or "",
+        "feats": _station_features(raw.get("other_features")),
+        "tag": (tags[0][0] if tags else
+                (_as_str(raw.get("top_genre")) or _as_str(raw.get("genre")) or "")),
+        "ak": _station_artist_key(artist), "tk": _station_title_key(title, artist),
+        "dist": dist,
+    }
+
+
+def _station_change(a: Optional[Any], b: Optional[Any]) -> float:
+    """Mean change over the six features; 1.0 (the most there is) when either
+    side has none, so a row without features is placed last, never first."""
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def _station_depth(ceiling: int) -> int:
+    for d in STATION_LIST_DEPTHS:
+        if ceiling <= d:
+            return d
+    return STATION_LIST_DEPTHS[-1]
+
+
+def _write_text_atomic(path: str, payload: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(tmp, path)
+
+
+@dataclass
+class Station:
+    """One station. Everything here but the runtime sets is persisted in
+    state.json["stations"] (PROTOCOL §18.4), so a restart keeps it."""
+    id: str
+    seed: dict                       # as answered: {kind, ids?, name?}
+    name: str
+    character: str
+    created_at: int
+    used_at: int
+    engine: str = "tier2"
+    seq: int = 0                     # tracks served, ever
+    rev: int = 0                     # moved by every signal and character change
+    exhausted: bool = False
+    seed_ids: list = field(default_factory=list)    # never served
+    # The anchors' own rows: a seed's (from AudioMuse's score or Navidrome's
+    # getSong), or for Your mix the fingerprint's top rows, which ARE servable.
+    # {id, title, artist, album, ak, tk, feats, mix}
+    anchor_meta: list = field(default_factory=list)
+    likes: list = field(default_factory=list)       # liked ids, oldest first
+    served: list = field(default_factory=list)      # [id, tk, ak, hop], in order
+    trail: list = field(default_factory=list)       # artist keys, oldest first
+    last_feats: Optional[list] = None               # the last track's six features
+    played: list = field(default_factory=list)      # played-through ids, newest last
+    skips: list = field(default_factory=list)       # [id, at]: alchemy's subtract set
+    artist_skips: dict = field(default_factory=dict)  # artist key -> [at, ...]
+    cooldown: dict = field(default_factory=dict)    # artist key -> until (ms)
+    cursors: dict = field(default_factory=dict)     # anchor id -> rows walked past
+    batches: int = 0
+    last_batch: Optional[dict] = None               # {device, after, tracks}
+    # runtime only
+    served_ids: set = field(default_factory=set, repr=False)
+    served_keys: set = field(default_factory=set, repr=False)
+    hops: dict = field(default_factory=dict, repr=False)
+    announced: Optional[tuple] = field(default=None, repr=False)
+
+    def index(self) -> None:
+        self.served_ids = {r[0] for r in self.served}
+        self.served_keys = {r[1] for r in self.served if r[1]}
+        self.hops = {r[0]: r[3] for r in self.served}
+
+    def base_anchors(self) -> list[str]:
+        return [m["id"] for m in self.anchor_meta]
+
+    def anchors(self) -> list[str]:
+        """The seed's (or Your mix's) anchors, then the likes the character allows."""
+        tune = STATION_TUNING[self.character]
+        base = self.base_anchors()
+        extra = [i for i in self.likes if i not in base][:tune.like_anchors]
+        return base + extra
+
+    def knows(self, track_id: str) -> bool:
+        return (track_id in self.served_ids or track_id in self.seed_ids
+                or any(m["id"] == track_id for m in self.anchor_meta))
+
+    def track_key(self, track_id: str) -> str:
+        for r in self.served:
+            if r[0] == track_id:
+                return r[1]
+        for m in self.anchor_meta:
+            if m["id"] == track_id:
+                return m.get("tk") or ""
+        return ""
+
+    def artist_of(self, track_id: str) -> str:
+        for r in reversed(self.served):
+            if r[0] == track_id:
+                return r[2]
+        for m in self.anchor_meta:
+            if m["id"] == track_id:
+                return m.get("ak") or ""
+        return ""
+
+    def frame(self) -> dict:
+        return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
+                "character": self.character, "exhausted": self.exhausted}
+
+    def to_state(self) -> dict:
+        return {
+            "id": self.id, "seed": self.seed, "name": self.name,
+            "character": self.character, "createdAt": self.created_at,
+            "usedAt": self.used_at, "engine": self.engine, "seq": self.seq,
+            "rev": self.rev, "exhausted": self.exhausted, "seedIds": self.seed_ids,
+            "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
+            "trail": self.trail, "lastFeats": self.last_feats, "played": self.played,
+            "skips": self.skips, "artistSkips": self.artist_skips,
+            "cooldown": self.cooldown, "cursors": self.cursors, "batches": self.batches,
+            "lastBatch": self.last_batch,
+        }
+
+    @classmethod
+    def from_state(cls, d: Any) -> Optional["Station"]:
+        """A persisted station, or None if it cannot be trusted. Every field is
+        coerced: this is read back from a file a person may have edited."""
+        if not isinstance(d, dict):
+            return None
+        sid = _as_str(d.get("id"), 64)
+        character = d.get("character")
+        seed = d.get("seed")
+        if not sid or character not in STATION_CHARACTERS or not isinstance(seed, dict):
+            return None
+
+        def strs(v: Any, cap: int) -> list:
+            return [x for x in (v if isinstance(v, list) else [])
+                    if isinstance(x, str) and _STATION_ID_RE.match(x)][-cap:]
+
+        meta = []
+        for m in d.get("anchorMeta") or []:
+            if isinstance(m, dict) and isinstance(m.get("id"), str):
+                feats = m.get("feats")
+                meta.append({
+                    "id": m["id"], "title": _as_str(m.get("title")) or "",
+                    "artist": _as_str(m.get("artist")) or "",
+                    "album": _as_str(m.get("album")) or "",
+                    "ak": _as_str(m.get("ak")) or "", "tk": _as_str(m.get("tk"), 32) or "",
+                    "feats": list(feats) if isinstance(feats, list)
+                    and len(feats) == len(STATION_FEATURES) else None,
+                    "mix": bool(m.get("mix")),
+                })
+        served = []
+        for r in d.get("served") or []:
+            if (isinstance(r, list) and len(r) == 4 and isinstance(r[0], str)
+                    and isinstance(r[1], str) and isinstance(r[2], str)):
+                served.append([r[0], r[1], r[2], 2 if r[3] == 2 else 1])
+        last = d.get("lastBatch")
+        if not (isinstance(last, dict) and isinstance(last.get("tracks"), list)):
+            last = None
+        feats = d.get("lastFeats")
+        st = cls(
+            id=sid, seed=seed, name=_as_str(d.get("name")) or "Radio",
+            character=character, created_at=_as_int(d.get("createdAt"), _now_ms(), 0),
+            used_at=_as_int(d.get("usedAt"), _now_ms(), 0),
+            engine="tier1" if d.get("engine") == "tier1" else "tier2",
+            seq=_as_int(d.get("seq"), 0, 0), rev=_as_int(d.get("rev"), 0, 0),
+            exhausted=bool(d.get("exhausted")),
+            seed_ids=strs(d.get("seedIds"), STATION_SEEDS_MAX), anchor_meta=meta,
+            likes=strs(d.get("likes"), 50), served=served[-STATION_SERVED_MAX:],
+            trail=[a for a in (d.get("trail") or []) if isinstance(a, str)][-STATION_TRAIL_MAX:],
+            last_feats=list(feats) if isinstance(feats, list)
+            and len(feats) == len(STATION_FEATURES) else None,
+            played=strs(d.get("played"), 20),
+            skips=[s for s in (d.get("skips") or []) if isinstance(s, list) and len(s) == 2
+                   and isinstance(s[0], str)][-40:],
+            artist_skips={k: [int(t) for t in v if isinstance(t, (int, float))]
+                          for k, v in (d.get("artistSkips") or {}).items()
+                          if isinstance(k, str) and isinstance(v, list)},
+            cooldown={k: int(v) for k, v in (d.get("cooldown") or {}).items()
+                      if isinstance(k, str) and isinstance(v, (int, float))},
+            cursors={k: _as_int(v, 0, 0) for k, v in (d.get("cursors") or {}).items()
+                     if isinstance(k, str)},
+            batches=_as_int(d.get("batches"), 0, 0), last_batch=last,
+        )
+        st.index()
+        return st
+
+
+class _StationBatch:
+    """One request's working state: its deadline, its share of the upstream calls,
+    what failed, and the lists it has fetched (so the ladder asks for each once)."""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.sem = asyncio.Semaphore(STATION_CALLS_PER_REQUEST)
+        self.failed = False        # a source failed: the answer is partial
+        self.timed_out = False     # the budget ran out: the answer is partial
+        self.lists: dict[tuple[str, int], Optional[list]] = {}
+        self.t1_lists: dict[tuple[str, int], Optional[list]] = {}
+        self.unknown: set[str] = set()   # ids a tier said it does not hold
+        self.found: set[str] = set()     # ids a tier answered rows for
+        self.alchemy: Optional[list] = None
+        self.alchemy_done = False
+        self.artist_ids: Optional[list] = None
+        self.tier2_failed = False        # every anchor list failed at AudioMuse
+        self.tier1_failed = False
+        self.engine = "tier2"
+        self.rungs: list[str] = []
+        # What `_compute` chose, for `_commit` to write into the station.
+        self.picked_meta: list[tuple[dict, int]] = []
+        self.trail: Optional[list] = None
+        self.prev: Optional[list] = None
+        self.levels_done = False   # every rung of the ladder ran
+
+    def left(self) -> float:
+        return self.deadline - time.monotonic()
+
+
+class StationEngine:
+    """The stations, their play history, and the two tiers they are computed from.
+
+    Owned by the Hub (it reads the session and broadcasts through it); reached by
+    clients only through StationProxy.
+    """
+
+    def __init__(self, hub: "Hub") -> None:
+        self.hub = hub
+        self.stations: dict[str, Station] = {}
+        # The play history: [id, title key, at ms], oldest first. Ids and hashed
+        # keys only, never in health, welcome or a log line (§18.4).
+        self.history: list[list] = []
+        self._history_path = STATE_PATH + STATION_HISTORY_SUFFIX
+        self._history_dirty = False
+        self._history_task: Optional[asyncio.Task] = None
+        self._history_written_at = -STATION_HISTORY_FLUSH_S
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._computing = asyncio.Semaphore(STATION_COMPUTING_MAX)
+        self._nd_sem = asyncio.Semaphore(STATION_CALLS_PER_REQUEST)
+        # The tiers' last verdicts (None = never asked) and whether Navidrome
+        # offers AudioMuse's sonic similarity (`getSonicSimilarTracks`).
+        self.tier2_ok: Optional[bool] = None
+        self.tier1_ok: Optional[bool] = None
+        self.sonic: Optional[bool] = None
+        self._probed = asyncio.Event()
+        self._probe_at = 0.0
+        self._probe_soon: Optional[asyncio.TimerHandle] = None
+        self._probe_lock = asyncio.Lock()
+        self._t1_cache: dict[tuple[str, str, int], tuple[float, list]] = {}
+        self._bg: set = set()
+        self._load_history()
+
+    # ----- configuration ---------------------------------------------------- #
+    @staticmethod
+    def tier1_configured() -> bool:
+        return bool(NAVIDROME_URL and ND_USER and ND_PASS)
+
+    @staticmethod
+    def tier2_configured() -> bool:
+        return bool(AUDIOMUSE_URL)
+
+    def engine_name(self) -> Optional[str]:
+        if self.tier2_configured() and self.tier2_ok:
+            return "tier2"
+        if self.tier1_configured() and self.tier1_ok:
+            return "tier1"
+        return None
+
+    # ----- persistence ------------------------------------------------------ #
+    def load_state(self, rows: Any) -> None:
+        """Boot: the persisted stations, minus the expired, the newest STATION_MAX.
+        Runs before the session is validated against them, so it drops nothing
+        through `_drop` (which would announce an unbinding nobody can hear)."""
+        now = _now_ms()
+        loaded = []
+        for raw in rows if isinstance(rows, list) else []:
+            st = Station.from_state(raw)
+            if st is not None and now - st.used_at < STATION_IDLE_MS:
+                loaded.append(st)
+        loaded.sort(key=lambda st: st.used_at, reverse=True)
+        self.stations = {st.id: st for st in loaded[:STATION_MAX]}
+
+    def to_state(self) -> list[dict]:
+        return [st.to_state() for st in self.stations.values()]
+
+    def _load_history(self) -> None:
+        if not STATION_HISTORY_ON:
+            return
+        status, data = _read_state_file(self._history_path)
+        if status != "ok":
+            if status == "corrupt":
+                _set_aside_state_file(self._history_path)
+            return
+        plays = data.get("plays")
+        for p in plays if isinstance(plays, list) else []:
+            if (isinstance(p, list) and len(p) == 3 and isinstance(p[0], str)
+                    and isinstance(p[1], str) and isinstance(p[2], (int, float))):
+                self.history.append([p[0], p[1], int(p[2])])
+        self._prune_history()
+        log(f"station history: {len(self.history)} plays loaded")
+
+    def _prune_history(self) -> None:
+        cutoff = _now_ms() - STATION_HISTORY_DAYS * 86_400_000
+        self.history = [p for p in self.history if p[2] >= cutoff][-STATION_HISTORY_MAX:]
+
+    def _history_add(self, track_id: str, key: str) -> None:
+        now = _now_ms()
+        for p in reversed(self.history[-50:]):
+            if p[0] == track_id and now - p[2] < STATION_HISTORY_REPEAT_MS:
+                p[2] = now     # the same play, heard again or re-judged
+                break
+        else:
+            self.history.append([track_id, key, now])
+        self._prune_history()
+        self._history_touch()
+
+    def _history_sets(self, days: int, now: int) -> tuple[set, set]:
+        cutoff = now - days * 86_400_000
+        ids, keys = set(), set()
+        for tid, key, at in self.history:
+            if at >= cutoff:
+                ids.add(tid)
+                if key:
+                    keys.add(key)
+        return ids, keys
+
+    def _history_touch(self) -> None:
+        if not STATION_HISTORY_ON:
+            return
+        self._history_dirty = True
+        if self._history_task is not None and not self._history_task.done():
+            return
+        try:
+            self._history_task = asyncio.get_running_loop().create_task(
+                self._history_writer())
+        except RuntimeError:
+            self._write_history_now()  # no loop: a tool or a test driving the engine
+
+    async def _history_writer(self) -> None:
+        try:
+            while self._history_dirty:
+                wait = self._history_written_at + STATION_HISTORY_FLUSH_S - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._history_dirty = False
+                payload = json.dumps({"v": 1, "plays": self.history})
+                try:
+                    await asyncio.to_thread(_write_text_atomic, self._history_path, payload)
+                except Exception as e:  # noqa: BLE001 — a lost write is retried on the next play
+                    log("station history: write failed:", e)
+                self._history_written_at = time.monotonic()
+        finally:
+            self._history_task = None
+
+    def _write_history_now(self) -> None:
+        if not STATION_HISTORY_ON:
+            return
+        self._history_dirty = False
+        try:
+            _write_text_atomic(self._history_path, json.dumps({"v": 1, "plays": self.history}))
+        except Exception as e:  # noqa: BLE001
+            log("station history: write failed:", e)
+
+    def close(self) -> None:
+        """Graceful stop: the history is written now, not up to 30 s from now."""
+        if self._history_task is not None and not self._history_task.done():
+            self._history_task.cancel()
+            self._history_dirty = True
+        if self._history_dirty:
+            self._write_history_now()
+        if self._probe_soon is not None:
+            self._probe_soon.cancel()
+
+    # ----- the station set ------------------------------------------------- #
+    def _mint_id(self) -> str:
+        return f"st_{_now_ms()}_{os.urandom(2).hex()}"
+
+    def _lock(self, sid: str) -> asyncio.Lock:
+        lock = self._locks.get(sid)
+        if lock is None:
+            lock = self._locks[sid] = asyncio.Lock()
+        return lock
+
+    def get(self, sid: Any) -> Optional[Station]:
+        self._sweep()
+        return self.stations.get(sid) if isinstance(sid, str) else None
+
+    def bound(self) -> Optional[Station]:
+        sid = self.hub.session.station_id
+        return self.stations.get(sid) if sid else None
+
+    def _drop(self, sid: str, why: str) -> None:
+        self.stations.pop(sid, None)
+        lock = self._locks.get(sid)
+        if lock is not None and not lock.locked():
+            self._locks.pop(sid, None)
+        dlog(f"station {sid} dropped ({why})")
+        if self.hub.session.station_id == sid:
+            # The queue it belonged to no longer continues as anything.
+            self.hub.session.station_id = None
+            self.hub.session.bump()
+            self.hub._spawn(self.hub._broadcast_session())  # noqa: SLF001 — same module
+
+    def _sweep(self) -> None:
+        now = _now_ms()
+        for sid, st in list(self.stations.items()):
+            if now - st.used_at >= STATION_IDLE_MS and not self._lock(sid).locked():
+                self._drop(sid, "idle")
+
+    def _evict(self) -> None:
+        if len(self.stations) <= STATION_MAX:
+            return
+        bound = self.hub.session.station_id
+        victims = sorted((st for st in self.stations.values() if st.id != bound),
+                         key=lambda st: st.used_at)
+        for st in victims[:len(self.stations) - STATION_MAX]:
+            self._drop(st.id, "evicted")
+
+    def welcome_station(self) -> Optional[dict]:
+        st = self.bound()
+        if st is None:
+            return None
+        frame = st.frame()
+        frame.pop("t")
+        frame.update(name=st.name, seed=st.seed)
+        return frame
+
+    async def _announce(self, st: Station) -> None:
+        sig = (st.seq, st.rev, st.character, st.exhausted)
+        if st.announced == sig or st.id not in self.stations:
+            return
+        st.announced = sig
+        await self.hub._broadcast(st.frame())  # noqa: SLF001 — same module
+
+    def _bump(self, st: Station) -> None:
+        st.rev += 1
+        st.exhausted = False   # a signal or a new character: the answer may differ
+        st.used_at = _now_ms()
+
+    # ----- the two tiers --------------------------------------------------- #
+    def _note_tier2(self, ok: bool) -> None:
+        self.tier2_ok = ok
+        if not ok:
+            self._schedule_probe()
+
+    def _note_tier1(self, ok: bool) -> None:
+        self.tier1_ok = ok
+        if not ok:
+            self._schedule_probe()
+
+    def _schedule_probe(self) -> None:
+        if self._probe_soon is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def fire() -> None:
+            self._probe_soon = None
+            self.hub._spawn(self.probe())  # noqa: SLF001 — same module
+        self._probe_soon = loop.call_later(STATION_PROBE_RETRY, fire)
+
+    async def _await_bounded(self, coro: Any, b: Optional[_StationBatch]) -> Optional[Any]:
+        """Run one upstream call inside the request's budget. A call still running
+        when the budget is spent is NOT cancelled: it finishes in the background
+        and lands in SONIC's cache, where the next batch finds it, and a cancel
+        would also fail every other request coalesced onto it."""
+        task = asyncio.ensure_future(coro)
+        if b is None:
+            return await task
+        left = b.left()
+        if left <= 0:
+            task.cancel()
+            b.timed_out = True
+            return None
+        done, _pending = await asyncio.wait({task}, timeout=left)
+        if not done:
+            b.timed_out = True
+            self._bg.add(task)
+            task.add_done_callback(self._bg.discard)
+            return None
+        return task.result()
+
+    async def _am(self, name: str, params: Optional[dict], body: Optional[dict],
+                  b: Optional[_StationBatch]) -> tuple[int, Any]:
+        """One AudioMuse call through SONIC. Returns (status, parsed JSON or None);
+        status 0 = the budget ran out first."""
+        route, spec = SONIC_INTERNAL[name]
+        query = urllib.parse.urlencode(params or {})
+        plist = HttpProxy._filtered_params(spec, query)  # adds the nd creds where the spec says
+        async with (b.sem if b is not None else _NullAsync()):
+            result = await self._await_bounded(SONIC.call(route, spec, plist, body), b)
+        if result is None:
+            return 0, None
+        status, raw, _ctype = result
+        if status >= 500:
+            # A failed source either way. Only the hub's own "could not reach it"
+            # (502 down, 503/504 busy) says AudioMuse is unavailable; a 500 from
+            # AudioMuse itself is AudioMuse answering, about one route.
+            if b is not None:
+                b.failed = True
+            try:
+                own = json.loads(raw or b"{}")
+            except Exception:  # noqa: BLE001
+                own = {}
+            self._note_tier2(not (isinstance(own, dict)
+                                  and (own.get("down") or own.get("busy"))))
+            return status, None
+        self._note_tier2(True)
+        if status != 200:
+            return status, None
+        try:
+            return status, json.loads(raw or b"null")
+        except Exception:  # noqa: BLE001 — a body that is not JSON is a failed source
+            if b is not None:
+                b.failed = True
+            return 502, None
+
+    async def _nd(self, method: str, params: dict,
+                  b: Optional[_StationBatch]) -> tuple[str, Optional[dict]]:
+        """One Navidrome call: ("ok", payload) | ("missing", None) | ("failed", None).
+        Never `getRandomSongs`: no path in the engine fills with random songs."""
+        if not self.tier1_configured():
+            return "failed", None
+        q = {**_nd_auth_params(), **params}
+        url = f"{NAVIDROME_URL}/rest/{method}?" + urllib.parse.urlencode(q)
+        async with (b.sem if b is not None else _NullAsync()):
+            async with self._nd_sem:
+                result = await self._await_bounded(asyncio.to_thread(
+                    _proxy_upstream_blocking, "GET", url, None, "",
+                    STATION_CALL_TIMEOUT, "navidrome"), b)
+        if result is None:
+            return "failed", None
+        status, raw, _ctype = result
+        resp = None
+        if status == 200:
+            try:
+                resp = (json.loads(raw) or {}).get("subsonic-response")
+            except Exception:  # noqa: BLE001
+                resp = None
+        if not isinstance(resp, dict):
+            self._note_tier1(False)
+            if b is not None:
+                b.failed = True
+            return "failed", None
+        self._note_tier1(True)
+        if resp.get("status") == "ok":
+            return "ok", resp
+        err = resp.get("error") or {}
+        if isinstance(err, dict) and err.get("code") == 70:   # "data not found"
+            return "missing", None
+        if b is not None:
+            b.failed = True
+        return "failed", None
+
+    async def probe(self) -> None:
+        """Ask each configured tier whether it answers. Any answer below 500 is
+        one: a probe id AudioMuse does not hold is answered 404, which is AudioMuse
+        answering."""
+        async with self._probe_lock:
+            self._probe_at = time.monotonic()
+            if self.tier2_configured():
+                status, _ = await self._am("score", {"id": "station-probe"}, None, None)
+                self.tier2_ok = 0 < status < 500
+            if self.tier1_configured():
+                outcome, payload = await self._nd("getOpenSubsonicExtensions", {}, None)
+                self.tier1_ok = outcome == "ok"
+                if outcome == "ok":
+                    names = [e.get("name") for e in payload.get("openSubsonicExtensions") or []
+                             if isinstance(e, dict)]
+                    self.sonic = "sonicSimilarity" in names
+            self._probed.set()
+
+    async def probe_loop(self) -> None:
+        while True:
+            try:
+                await self.probe()
+            except Exception as e:  # noqa: BLE001 — a probe must never kill its loop
+                log("station probe failed:", e)
+                self._probed.set()
+            await asyncio.sleep(STATION_PROBE_INTERVAL)
+
+    # ----- the lists -------------------------------------------------------- #
+    async def _nearest(self, item_id: str, depth: int, b: _StationBatch) -> Optional[list]:
+        """An item's nearest list at `depth`: rows nearest first. None = the call
+        failed; [] = AudioMuse holds no such item (or has nothing near it)."""
+        for (iid, d), rows in b.lists.items():   # a deeper list already in hand
+            if iid == item_id and d >= depth and rows is not None:
+                return rows[:depth]
+        key = (item_id, depth)
+        if key in b.lists:
+            return b.lists[key]
+        status, data = await self._am("similar_tracks", {
+            "item_id": item_id, "n": depth, "radius_similarity": "false",
+            "eliminate_duplicates": "false"}, None, b)
+        rows: Optional[list]
+        if status == 200 and isinstance(data, list):
+            rows = [r for r in (_station_row(x) for x in data) if r is not None]
+            b.found.add(item_id)
+        elif status in (400, 404):
+            rows = []
+            b.unknown.add(item_id)
+        else:
+            rows = None
+        b.lists[key] = rows
+        return rows
+
+    async def _tier1_list(self, item_id: str, n: int, b: _StationBatch) -> Optional[list]:
+        n = max(1, min(n, STATION_TIER1_MAX))
+        key = (item_id, n)
+        if key in b.t1_lists:
+            return b.t1_lists[key]
+        if self.sonic is None:
+            outcome, payload = await self._nd("getOpenSubsonicExtensions", {}, b)
+            if outcome == "ok":
+                self.sonic = "sonicSimilarity" in [
+                    e.get("name") for e in payload.get("openSubsonicExtensions") or []
+                    if isinstance(e, dict)]
+        method = "getSonicSimilarTracks" if self.sonic else "getSimilarSongs2"
+        ck = (method, item_id, n)
+        hit = self._t1_cache.get(ck)
+        if hit is not None and hit[0] > time.monotonic():
+            b.t1_lists[key] = hit[1]
+            b.found.add(item_id)
+            return hit[1]
+        outcome, payload = await self._nd(method, {"id": item_id, "count": n}, b)
+        rows: Optional[list]
+        if outcome == "ok":
+            if self.sonic:
+                entries = [m.get("entry") for m in payload.get("sonicMatch") or []
+                           if isinstance(m, dict)]
+            else:
+                entries = (payload.get("similarSongs2") or {}).get("song") or []
+            rows = [r for r in (_station_row(x) for x in entries) if r is not None]
+            b.found.add(item_id)
+            if len(self._t1_cache) >= 64:
+                for old in sorted(self._t1_cache, key=lambda k: self._t1_cache[k][0])[:16]:
+                    del self._t1_cache[old]
+            self._t1_cache[ck] = (time.monotonic() + STATION_LIST_TTL, rows)
+        elif outcome == "missing":
+            rows = []
+            b.unknown.add(item_id)
+        else:
+            rows = None
+            b.tier1_failed = True
+        b.t1_lists[key] = rows
+        return rows
+
+    async def _gather(self, coros: list) -> list:
+        """Run calls together; each already takes a slot of the request's two."""
+        return list(await asyncio.gather(*coros)) if coros else []
+
+    # ----- candidates ------------------------------------------------------- #
+    @staticmethod
+    def _round_robin(lists: list[list]) -> list:
+        out, i = [], 0
+        while True:
+            moved = False
+            for lst in lists:
+                if i < len(lst):
+                    out.append(lst[i])
+                    moved = True
+            if not moved:
+                return out
+            i += 1
+
+    @staticmethod
+    def _interleave(sources: list[list]) -> list:
+        """One stream from several sources, one from each in turn, first sighting
+        of an id kept."""
+        seen, out = set(), []
+        for c in StationEngine._round_robin(sources):
+            if c[0]["id"] not in seen:
+                seen.add(c[0]["id"])
+                out.append(c)
+        return out
+
+    async def _tier2_stream(self, st: Station, tune: _StationTuning, ceiling: int,
+                            b: _StationBatch) -> Optional[list]:
+        """Every candidate the gate admits at this ceiling, best first, as
+        (row, why, rank, hop). None = every anchor list failed."""
+        depth = _station_depth(ceiling)
+        anchors = st.anchors()
+        lists = await self._gather([self._nearest(a, depth, b) for a in anchors])
+        answered = [(a, rows) for a, rows in zip(anchors, lists) if rows is not None]
+        if not answered:
+            return None
+        gate: dict[str, tuple[int, dict]] = {}
+        near_lists = []
+        for a, rows in answered:
+            start = min(st.cursors.get(a, 0), len(rows))
+            near = []
+            for i, r in enumerate(rows[:ceiling]):
+                rank = i + 1
+                if r["id"] not in gate or rank < gate[r["id"]][0]:
+                    gate[r["id"]] = (rank, r)
+                if i >= start:
+                    near.append((r, "near", rank, 1))
+            near_lists.append(near)
+        near_stream = self._round_robin(near_lists)
+        # Your mix: the fingerprint's own top rows are tracks to play, first.
+        mix = [({**m, "dist": 0.0}, "near", 0, 1) for m in st.anchor_meta if m.get("mix")]
+        sources: list[list] = [mix + near_stream]
+
+        drift_gate: dict[str, tuple[int, dict]] = {}
+        drift_stream: list = []
+        if tune.drift:
+            src = [p for p in reversed(st.played) if st.hops.get(p) == 1]
+            src = src[:STATION_DRIFT_SOURCES]
+            dl = await self._gather([self._nearest(p, STATION_DRIFT_CEILING, b) for p in src])
+            per = []
+            for rows in dl:
+                one = []
+                for i, r in enumerate((rows or [])[:STATION_DRIFT_CEILING]):
+                    if r["id"] not in drift_gate or i + 1 < drift_gate[r["id"]][0]:
+                        drift_gate[r["id"]] = (i + 1, r)
+                    one.append((r, "drift", i + 1, 2))
+                per.append(one)
+            drift_stream = self._round_robin(per)
+
+        def admit(tid: str, why: str) -> Optional[tuple]:
+            if tid in gate:
+                rank, row = gate[tid]
+                return (row, why, rank, 1)
+            if tid in drift_gate:
+                rank, row = drift_gate[tid]
+                return (row, why, rank, 2)
+            return None
+
+        use_alchemy = tune.alchemy_every == 1 or (
+            tune.alchemy_every == 2 and st.batches % 2 == 1)
+        if use_alchemy and not b.alchemy_done:
+            b.alchemy_done = True
+            b.alchemy = await self._alchemy(st, tune, b)
+        blend = []
+        for r in b.alchemy or []:
+            c = admit(r["id"], "blend")
+            if c is not None:
+                blend.append(c)
+        if blend:
+            sources.append(blend)
+        if drift_stream:
+            sources.append(drift_stream)
+        if tune.artists:
+            if b.artist_ids is None:
+                b.artist_ids = await self._similar_artist_ids(st, b)
+            arts = [c for c in (admit(t, "artist") for t in b.artist_ids) if c is not None]
+            if arts:
+                sources.append(arts)
+        return self._interleave(sources)
+
+    async def _alchemy(self, st: Station, tune: _StationTuning,
+                       b: _StationBatch) -> list:
+        recent = [p for p in reversed(st.played)]
+        if st.character == "explore":
+            recent = [i for i in reversed(st.likes)] + recent
+        adds, seen = [], set()
+        for i in st.anchors() + recent[:tune.alchemy_recent]:
+            if i not in seen:
+                seen.add(i)
+                adds.append({"op": "add", "id": i, "type": "song"})
+        now = _now_ms()
+        subs = [{"op": "subtract", "id": s[0], "type": "song"} for s in st.skips
+                if now - _as_int(s[1]) < STATION_SKIP_TTL_MS and s[0] not in seen][-10:]
+        status, data = await self._am("alchemy", None, {
+            "items": adds + subs, "n": STATION_ALCHEMY_N,
+            "temperature": tune.temperature}, b)
+        rows = (data or {}).get("results") if isinstance(data, dict) else None
+        return [r for r in (_station_row(x) for x in rows or []) if r is not None]
+
+    async def _similar_artist_ids(self, st: Station, b: _StationBatch) -> list:
+        names = []
+        for m in st.anchor_meta:
+            name = m.get("artist") or ""
+            if name and name not in names:
+                names.append(name)
+        out: list[str] = []
+        for name in names[:STATION_SEED_ARTISTS]:
+            status, data = await self._am("similar_artists", {
+                "artist": name, "n": STATION_SIMILAR_ARTISTS_N,
+                "include_component_matches": "true"}, None, b)
+            for a in data if isinstance(data, list) else []:
+                for cm in (a.get("component_matches") or []) if isinstance(a, dict) else []:
+                    for song in (cm.get("artist2_representative_songs") or []) \
+                            if isinstance(cm, dict) else []:
+                        tid = song.get("item_id") if isinstance(song, dict) else None
+                        if isinstance(tid, str) and tid not in out:
+                            out.append(tid)
+        return out
+
+    async def _tier1_stream(self, st: Station, ceiling: int,
+                            b: _StationBatch) -> Optional[list]:
+        """Navidrome's similar songs per anchor, gated by rank alone (no features
+        to compare): None = every anchor failed."""
+        n = min(ceiling, STATION_TIER1_MAX)
+        anchors = st.anchors()
+        lists = await self._gather([self._tier1_list(a, n, b) for a in anchors])
+        answered = [rows for rows in lists if rows is not None]
+        if not answered:
+            return None
+        per = [[(r, "tier1", i + 1, 1) for i, r in enumerate(rows[:n])] for rows in answered]
+        mix = [({**m, "dist": 0.0}, "tier1", 0, 1) for m in st.anchor_meta if m.get("mix")]
+        return self._interleave([mix + self._round_robin(per)])
+
+    # ----- one batch --------------------------------------------------------- #
+    def _levels(self, st: Station, tier1_primary: bool) -> list[tuple[str, int, int]]:
+        """The widening ladder (§18.3) as (rung, ceiling, history days). The first
+        is the lists walked to the character's ceiling; then the ceiling ×1.5 up to
+        its maximum; then the history window down to 3 days; then Tier 1. The
+        played-through-neighbours and similar-artists rungs are Explore's sources
+        from the first rung on; on Close and Balanced they could only offer what
+        the anchor gate already holds, so they add no rung of their own."""
+        tune = STATION_TUNING[st.character]
+        top = tune.ceiling_max if not tier1_primary else min(tune.ceiling_max,
+                                                             STATION_TIER1_MAX)
+        ceiling = min(tune.ceiling, top)
+        out = [("lists", ceiling, STATION_HISTORY_DAYS)]
+        while ceiling < top:
+            ceiling = min(top, int(math.ceil(ceiling * STATION_WIDEN)))
+            out.append((f"ceiling {ceiling}", ceiling, STATION_HISTORY_DAYS))
+        out.append(("history 3d", ceiling, STATION_HISTORY_RELAXED_DAYS))
+        if not tier1_primary and self.tier1_configured():
+            out.append(("tier1", ceiling, STATION_HISTORY_RELAXED_DAYS))
+        return out
+
+    async def _compute(self, st: Station, count: int, exclude: set,
+                       b: _StationBatch, debug: bool = False) -> list[dict]:
+        """Choose up to `count` tracks. Writes nothing to the station: `_commit`
+        does, once the request is sure to be answered."""
+        tune = STATION_TUNING[st.character]
+        now = _now_ms()
+        hard_ids = set(exclude) | st.served_ids | set(st.seed_ids) | self._bound_queue_ids(st)
+        seed_keys = {m["tk"] for m in st.anchor_meta if not m.get("mix") and m.get("tk")}
+        hard_keys = st.served_keys | seed_keys
+        cooled = {ak for ak, until in st.cooldown.items() if until > now}
+        seed_aks = {m["ak"] for m in st.anchor_meta if m.get("ak") and not m.get("mix")}
+        trail = list(st.trail)
+        prev = st.last_feats
+        picked: list[tuple] = []
+        picked_ids: set = set()
+        picked_keys: set = set()
+
+        def artist_ok(ak: str) -> bool:
+            if not ak:
+                return True
+            if ak in trail[-tune.artist_gap:]:
+                return False
+            cap = tune.seed_artist_cap if ak in seed_aks else tune.artist_cap
+            return trail[-9:].count(ak) < cap
+
+        # AudioMuse unset, or known unreachable since its last call: Navidrome
+        # answers this batch. The latter is a failed source, so `partial`; the
+        # re-probe that follows a failure brings Tier 2 back.
+        tier1_primary = not self.tier2_configured() or (
+            self.tier2_ok is False and self.tier1_configured())
+        if self.tier2_configured() and tier1_primary:
+            b.failed = True
+            b.tier2_failed = True
+        b.engine = "tier1" if tier1_primary else "tier2"
+        levels = self._levels(st, tier1_primary)
+        li = 0
+        while li < len(levels) and len(picked) < count and b.left() > 0:
+            rung, ceiling, days = levels[li]
+            li += 1
+            tier1 = rung == "tier1" or tier1_primary
+            if not tier1 and li > 1 and all(a in b.unknown for a in st.anchors()):
+                continue  # AudioMuse holds none of the anchors: deeper asks the same
+            b.rungs.append(rung)
+            if tier1:
+                stream = await self._tier1_stream(st, ceiling, b)
+            else:
+                stream = await self._tier2_stream(st, tune, ceiling, b)
+            if stream is None:
+                b.failed = True
+                if tier1:
+                    b.tier1_failed = True
+                    if tier1_primary:
+                        break   # nothing is left to ask
+                    continue
+                if li == 1:
+                    # Every anchor list failed at AudioMuse: this batch comes from
+                    # Navidrome, and the answer says so (engine tier1, partial).
+                    b.tier2_failed = True
+                    if not self.tier1_configured():
+                        break
+                    tier1_primary = True
+                    b.engine = "tier1"
+                    levels, li = self._levels(st, True), 0
+                continue
+            hist_ids, hist_keys = self._history_sets(days, now)
+
+            def passes(c: tuple) -> bool:
+                r = c[0]
+                return (r["id"] not in hard_ids and r["id"] not in picked_ids
+                        and r["id"] not in hist_ids
+                        and not (r["tk"] and (r["tk"] in hard_keys or r["tk"] in picked_keys
+                                              or r["tk"] in hist_keys))
+                        and r["ak"] not in cooled)
+
+            def take(c: tuple) -> None:
+                nonlocal prev
+                r = c[0]
+                picked.append(c + (rung,))
+                picked_ids.add(r["id"])
+                if r["tk"]:
+                    picked_keys.add(r["tk"])
+                trail.append(r["ak"])
+                if r["feats"]:
+                    prev = list(r["feats"])
+
+            eligible = (c for c in stream if passes(c))
+            if st.character == "close":
+                # Nearest first: the stream's own order, a track held back only
+                # until its artist is far enough behind.
+                waiting: list[tuple] = []
+                while len(picked) < count:
+                    ready = next((w for w in waiting if artist_ok(w[0]["ak"])), None)
+                    if ready is not None:
+                        waiting.remove(ready)
+                        take(ready)
+                        continue
+                    c = next(eligible, None)
+                    if c is None:
+                        break
+                    if artist_ok(c[0]["ak"]):
+                        take(c)
+                    else:
+                        waiting.append(c)
+            else:
+                # Smooth: among the next few the gate admits, the one whose six
+                # features change least from the track before it.
+                window: list[tuple] = []
+                spent = False
+                width = max(6, 2 * (count - len(picked)))
+                while len(picked) < count:
+                    while not spent and len(window) < width:
+                        c = next(eligible, None)
+                        if c is None:
+                            spent = True
+                        else:
+                            window.append(c)
+                    ok = [c for c in window if artist_ok(c[0]["ak"])]
+                    if not ok:
+                        if spent or width > 400:
+                            break
+                        width += 8
+                        continue
+                    # Your mix's own top rows (rank 0) lead, as a radio's seed does.
+                    best = next((c for c in ok if c[2] == 0), None) or min(
+                        ok, key=lambda c: _station_change(prev, c[0]["feats"]))
+                    window.remove(best)
+                    take(best)
+        out = []
+        for row, why, rank, hop, rung in picked:
+            t = {"id": row["id"], "title": row["title"], "artist": row["artist"],
+                 "album": row["album"], "why": why, "rank": rank}
+            if debug:
+                t["_debug"] = {"tag": row.get("tag"), "hop": hop, "rung": rung,
+                               "dist": row.get("dist"), "ak": row["ak"], "tk": row["tk"],
+                               "feats": row.get("feats")}
+            out.append(t)
+        b.picked_meta = [(c[0], c[3]) for c in picked]
+        b.trail = trail
+        b.prev = prev
+        b.levels_done = li >= len(levels)
+        return out
+
+    def _bound_queue_ids(self, st: Station) -> set:
+        s = self.hub.session
+        if s.station_id != st.id:
+            return set()
+        return {t.get("id") for t in s.queue if isinstance(t, dict) and t.get("id")}
+
+    def _commit(self, st: Station, tracks: list[dict], b: _StationBatch,
+                device: Optional[str], after: int, rev_at_start: int) -> tuple[bool, bool]:
+        """Write a computed batch into the station. Returns (exhausted, partial)."""
+        for row, hop in b.picked_meta:
+            st.served.append([row["id"], row["tk"], row["ak"], hop])
+        st.served = st.served[-STATION_SERVED_MAX:]
+        st.index()
+        if b.trail is not None:
+            st.trail = b.trail[-STATION_TRAIL_MAX:]
+        if b.prev:
+            st.last_feats = list(b.prev)
+        st.seq += len(tracks)
+        st.batches += 1
+        st.engine = b.engine
+        st.used_at = _now_ms()
+        partial = b.failed or b.timed_out
+        # `exhausted` is an answer, not a failure: every rung answered and none had
+        # anything left that fits. A rung that failed, or a budget that ran out, is
+        # `partial` and never this.
+        exhausted = not tracks and not partial and b.levels_done
+        if st.rev == rev_at_start:
+            st.exhausted = exhausted
+        st.last_batch = {"device": device, "after": after, "tracks": tracks}
+        # The cursors: past every row at the front of an anchor's list that can
+        # never be served again (served, or a seed), so the next walk starts there.
+        done = st.served_ids | set(st.seed_ids)
+        for (iid, _depth), rows in b.lists.items():
+            if rows is None or iid not in st.anchors():
+                continue
+            i = st.cursors.get(iid, 0)
+            while i < len(rows) and rows[i]["id"] in done:
+                i += 1
+            st.cursors[iid] = i
+        return exhausted, partial
+
+    # ----- routes ------------------------------------------------------------ #
+    async def route(self, path: str, body: dict) -> tuple[int, dict]:
+        if path == "/sonic/station/characters":
+            return 200, await self.characters()
+        if path == "/sonic/station/start":
+            return await self.start(body)
+        if path == "/sonic/station/next":
+            return await self.next(body)
+        if path == "/sonic/station/signal":
+            return await self.signal(body)
+        return 404, {"error": "unknown route"}
+
+    async def characters(self) -> dict:
+        if not self._probed.is_set():
+            try:
+                await asyncio.wait_for(self._probed.wait(), STATION_PROBE_STARTUP_WAIT)
+            except asyncio.TimeoutError:
+                pass
+        engine = self.engine_name()
+        return {"configured": True, "available": engine is not None, "engine": engine,
+                "default": STATION_DEFAULT_CHARACTER,
+                "characters": [dict(c) for c in STATION_CATALOGUE]}
+
+    @staticmethod
+    def _parse_seed(raw: Any) -> Optional[dict]:
+        if not isinstance(raw, dict):
+            return None
+        kind = raw.get("kind")
+        if kind == "yourMix":
+            return {"kind": "yourMix"}
+        if kind not in ("track", "tracks"):
+            return None
+        ids = raw.get("ids")
+        if not isinstance(ids, list):
+            return None
+        clean = []
+        for i in ids:
+            if not isinstance(i, str) or not _STATION_ID_RE.match(i):
+                return None
+            if i not in clean:
+                clean.append(i)
+        if not clean or len(clean) > (1 if kind == "track" else STATION_SEEDS_MAX):
+            return None
+        seed = {"kind": kind, "ids": clean}
+        name = _as_str(raw.get("name"), 200)
+        if name and name.strip():
+            seed["name"] = name.strip()
+        return seed
+
+    @staticmethod
+    def _parse_exclude(raw: Any) -> set:
+        if not isinstance(raw, list):
+            return set()
+        return {i for i in raw[:STATION_EXCLUDE_MAX] if isinstance(i, str)}
+
+    async def _seed_meta(self, ids: list, b: _StationBatch) -> list[dict]:
+        """Each seed's own row, for its title key, its artist and its features."""
+        async def one(i: str) -> dict:
+            row = None
+            if self.tier2_configured() and self.tier2_ok is not False:
+                status, data = await self._am("score", {"id": i}, None, b)
+                row = _station_row(data) if status == 200 else None
+            if row is None and self.tier1_configured() and (
+                    not self.tier2_configured() or self.tier2_ok is False):
+                outcome, payload = await self._nd("getSong", {"id": i}, b)
+                if outcome == "ok":
+                    row = _station_row(payload.get("song"))
+                elif outcome == "missing":
+                    b.unknown.add(i)
+            row = row or {"id": i, "title": "", "artist": "", "album": "", "ak": "",
+                          "tk": "", "feats": None}
+            return {"id": i, "title": row["title"], "artist": row["artist"],
+                    "album": row["album"], "ak": row["ak"],
+                    "tk": row["tk"] if row["title"] else "",
+                    "feats": list(row["feats"]) if row.get("feats") else None,
+                    "mix": False}
+        return list(await asyncio.gather(*(one(i) for i in ids)))
+
+    async def _mix_anchors(self, b: _StationBatch) -> tuple[str, list]:
+        """Your mix: the Sonic Fingerprint of HUB_ND_USER. Its first rows, at
+        distance 0, are that user's own most-played tracks."""
+        if not self.tier2_configured():
+            return "unavailable", []
+        status, data = await self._am("fingerprint", {"n": STATION_FINGERPRINT_N}, None, b)
+        if status != 200 or not isinstance(data, list):
+            return ("unavailable" if status == 0 or status >= 500 else "empty"), []
+        rows = [r for r in (_station_row(x) for x in data) if r is not None]
+        top = [r for r in rows if r["dist"] is not None and r["dist"] <= 1e-9]
+        top = (top or rows[:3])[:STATION_MIX_ANCHORS]
+        return "ok", [{"id": r["id"], "title": r["title"], "artist": r["artist"],
+                       "album": r["album"], "ak": r["ak"], "tk": r["tk"],
+                       "feats": list(r["feats"]) if r["feats"] else None, "mix": True}
+                      for r in top]
+
+    def _answer(self, st: Station, tracks: list, exhausted: bool, partial: bool) -> dict:
+        return {"stationId": st.id, "seq": st.seq, "rev": st.rev,
+                "character": st.character, "engine": st.engine, "tracks": tracks,
+                "exhausted": exhausted, "partial": partial}
+
+    async def start(self, body: dict, debug: bool = False) -> tuple[int, dict]:
+        seed = self._parse_seed(body.get("seed"))
+        if seed is None:
+            return 400, {"code": "bad_seed", "error": "seed must be track, tracks or yourMix"}
+        character = body.get("character")
+        if character is None:
+            character = STATION_DEFAULT_CHARACTER
+        if character not in STATION_CHARACTERS:
+            return 400, {"code": "bad_character",
+                         "error": f"character must be one of {list(STATION_CHARACTERS)}"}
+        count = _as_int(body.get("count"), 20, 1, 50)
+        exclude = self._parse_exclude(body.get("exclude"))
+        device = _as_str(body.get("deviceId"), 128)
+        bind = _as_str(body.get("bindSession"), 128)
+        self._sweep()
+
+        def bound_conflict() -> Optional[tuple[int, dict]]:
+            s = self.hub.session
+            if bind and bind == s.saved_queue_id and s.station_id in self.stations:
+                return 409, {"code": "session_bound", "stationId": s.station_id}
+            return None
+
+        conflict = bound_conflict()
+        if conflict is not None:
+            return conflict
+        if bind and bind == self.hub.session.saved_queue_id:
+            # The queue this station is about to continue: nothing in it is new.
+            exclude |= {t.get("id") for t in self.hub.session.queue
+                        if isinstance(t, dict) and isinstance(t.get("id"), str)}
+        now = _now_ms()
+        st = Station(id=self._mint_id(), seed=seed, name="", character=character,
+                     created_at=now, used_at=now)
+        async with self._computing:
+            b = _StationBatch(time.monotonic() + STATION_BUDGET_S)
+            if seed["kind"] == "yourMix":
+                outcome, anchors = await self._mix_anchors(b)
+                if outcome == "unavailable":
+                    return 503, {"fallback": True, "error": "no tier can compute Your mix"}
+                if not anchors:
+                    return 404, {"code": "seed_unknown",
+                                 "error": "AudioMuse has no fingerprint for this user"}
+                st.anchor_meta = anchors
+            else:
+                st.seed_ids = list(seed["ids"])
+                st.anchor_meta = await self._seed_meta(st.seed_ids, b)
+                st.trail = [m["ak"] for m in st.anchor_meta if m["ak"]][-STATION_TRAIL_MAX:]
+                feats = [m["feats"] for m in st.anchor_meta if m["feats"]]
+                st.last_feats = feats[-1] if feats else None
+            st.index()
+            tracks = await self._compute(st, count, exclude, b, debug)
+            if seed["kind"] != "yourMix":
+                if all(i in b.unknown and i not in b.found for i in st.seed_ids):
+                    return 404, {"code": "seed_unknown",
+                                 "error": "no tier holds the seed track"}
+            no_tier2 = not self.tier2_configured() or b.tier2_failed
+            no_tier1 = not self.tier1_configured() or b.tier1_failed
+            if not tracks and no_tier2 and no_tier1:
+                return 503, {"fallback": True, "error": "no tier answered"}
+            st.name = self._name(st)
+            exhausted, partial = self._commit(st, tracks, b, device, 0, st.rev)
+        conflict = bound_conflict()
+        if conflict is not None:
+            # Another device's start bound the session while this one computed:
+            # both continue that station, so this one is never stored.
+            return conflict
+        self.stations[st.id] = st
+        self._evict()
+        s = self.hub.session
+        if bind and bind == s.saved_queue_id and st.id in self.stations:
+            s.station_id = st.id
+            s.bump()
+            await self.hub._broadcast_session()  # noqa: SLF001 — same module
+        else:
+            self.hub._save()  # noqa: SLF001 — same module
+        await self._announce(st)
+        dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
+             f"engine {st.engine}, rungs {b.rungs}")
+        answer = {**self._answer(st, tracks, exhausted, partial), "name": st.name,
+                  "seed": st.seed}
+        if debug:
+            answer["_debug"] = {"rungs": b.rungs, "failed": b.failed,
+                                "timedOut": b.timed_out}
+        return 200, answer
+
+    def _name(self, st: Station) -> str:
+        if st.seed.get("kind") == "yourMix":
+            return "Your mix"
+        name = st.seed.get("name") or next(
+            (m["title"] for m in st.anchor_meta if m.get("title")), "")
+        return f"{name} radio" if name else "Radio"
+
+    async def next(self, body: dict, debug: bool = False) -> tuple[int, dict]:
+        st = self.get(body.get("stationId"))
+        if st is None:
+            return 404, {"code": "station_unknown", "error": "no such station"}
+        after = body.get("after")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            return 400, {"code": "bad_after", "error": "after must be the seq last applied"}
+        count = _as_int(body.get("count"), 5, 1, 25)
+        exclude = self._parse_exclude(body.get("exclude"))
+        device = _as_str(body.get("deviceId"), 128)
+        async with self._lock(st.id):
+            if st.id not in self.stations:
+                return 404, {"code": "station_unknown", "error": "no such station"}
+            st.used_at = _now_ms()
+            last = st.last_batch or {}
+            if after != st.seq and after == last.get("after") and device == last.get("device"):
+                # A retry of the batch this device was last given.
+                return 200, {**self._answer(st, list(last.get("tracks") or []),
+                                            st.exhausted, False),
+                             "servedElsewhere": False}
+            if after < st.seq:
+                # Someone already topped this station up past `after`.
+                return 200, {**self._answer(st, [], st.exhausted, False),
+                             "servedElsewhere": True}
+            if after > st.seq:
+                log(f"station {st.id}: after {after} is past seq {st.seq}; "
+                    "answered as a new batch")
+            rev = st.rev
+            async with self._computing:
+                b = _StationBatch(time.monotonic() + STATION_BUDGET_S)
+                tracks = await self._compute(st, count, exclude, b, debug)
+                exhausted, partial = self._commit(st, tracks, b, device, st.seq, rev)
+        self.hub._save()  # noqa: SLF001 — same module
+        await self._announce(st)
+        answer = {**self._answer(st, tracks, exhausted, partial), "servedElsewhere": False}
+        if debug:
+            answer["_debug"] = {"rungs": b.rungs, "failed": b.failed,
+                                "timedOut": b.timed_out}
+        return 200, answer
+
+    async def signal(self, body: dict) -> tuple[int, dict]:
+        st = self.get(body.get("stationId"))
+        if st is None:
+            return 404, {"code": "station_unknown", "error": "no such station"}
+        kind = body.get("kind")
+        if kind not in _STATION_SIGNALS:
+            return 400, {"code": "bad_signal",
+                         "error": f"kind must be one of {list(_STATION_SIGNALS)}"}
+        if kind == "character":
+            value = body.get("value")
+            if value not in STATION_CHARACTERS:
+                return 400, {"code": "bad_character",
+                             "error": f"value must be one of {list(STATION_CHARACTERS)}"}
+            if value != st.character:
+                st.character = value
+                self._bump(st)
+                self._changed(st)
+            return 200, {"rev": st.rev, "applied": True}
+        tid = body.get("trackId")
+        if kind in ("skip", "played") and self.hub.session.station_id == st.id:
+            # The hub hears this station's queue itself (§18.3).
+            return 200, {"rev": st.rev, "applied": False, "ignored": "session"}
+        if not isinstance(tid, str) or not st.knows(tid):
+            return 200, {"rev": st.rev, "applied": False, "ignored": "unknown_track"}
+        changed = False
+        if kind == "like":
+            if tid not in st.likes:
+                st.likes.append(tid)
+                changed = True
+        elif kind == "unlike":
+            if tid in st.likes:
+                st.likes.remove(tid)
+                changed = True
+        elif kind == "dislike":
+            if tid in st.likes:
+                st.likes.remove(tid)
+            self._skip(st, tid, weight=STATION_TUNING[st.character].skips_to_cool)
+            changed = True
+        elif kind == "skip":
+            self._skip(st, tid)
+            changed = True
+        elif kind == "played":
+            self._played(st, tid)
+            key = st.track_key(tid)
+            self._history_add(tid, key)
+            changed = True
+        if changed:
+            self._bump(st)
+            self._changed(st)
+        return 200, {"rev": st.rev, "applied": True}
+
+    def _changed(self, st: Station) -> None:
+        self.hub._save()  # noqa: SLF001 — same module
+        self.hub._spawn(self._announce(st))  # noqa: SLF001 — same module
+
+    def _skip(self, st: Station, tid: str, weight: int = 1) -> None:
+        now = _now_ms()
+        st.skips = [s for s in st.skips if now - _as_int(s[1]) < STATION_SKIP_TTL_MS]
+        st.skips.append([tid, now])
+        ak = st.artist_of(tid)
+        if not ak:
+            return
+        times = [t for t in st.artist_skips.get(ak, []) if now - t < STATION_COOL_MS]
+        times += [now] * weight
+        st.artist_skips[ak] = times[-10:]
+        if len(times) >= STATION_TUNING[st.character].skips_to_cool:
+            st.cooldown[ak] = now + STATION_COOL_MS
+        st.cooldown = {k: v for k, v in st.cooldown.items() if v > now}
+
+    @staticmethod
+    def _played(st: Station, tid: str) -> None:
+        if tid in st.played:
+            st.played.remove(tid)
+        st.played.append(tid)
+        st.played = st.played[-20:]
+
+    # ----- the session's half (§18.3) ---------------------------------------- #
+    def departure(self, track: Any, verdict: Optional[str], is_play: bool,
+                  steer: bool) -> None:
+        """The hub judged the track the session just left. Every play feeds the
+        history; a skip or a play-through steers the bound station, when it is a
+        track that station served or seeded."""
+        if not isinstance(track, dict):
+            return
+        tid = track.get("id")
+        if not isinstance(tid, str) or not tid:
+            return
+        if is_play:
+            self._history_add(tid, _station_title_key(track.get("title"),
+                                                      track.get("artist")))
+        if not steer or verdict not in ("played", "skip"):
+            return
+        st = self.bound()
+        if st is None or not st.knows(tid):
+            return
+        if verdict == "played":
+            self._played(st, tid)
+        else:
+            self._skip(st, tid)
+        self._bump(st)
+        self._changed(st)
+
+
+class _NullAsync:
+    """`async with` that holds nothing."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
+class StationProxy(HttpProxy):
+    """`/sonic/station/*` (PROTOCOL §18.1). Uses the base class for auth, the body
+    read and the body-key whitelist; answers from the hub's StationEngine instead
+    of forwarding. Must sit BEFORE SonicProxy in PROXIES: SonicProxy claims every
+    `/sonic/*` path and answers 404 for the ones it does not know."""
+
+    prefix = "/sonic/station"
+    label = "station"
+    routes = STATION_ROUTES
+
+    @property
+    def upstream(self) -> str:
+        return AUDIOMUSE_URL or NAVIDROME_URL
+
+    @property
+    def enabled(self) -> bool:
+        return bool(TOKEN and (AUDIOMUSE_URL or StationEngine.tier1_configured()))
+
+    @property
+    def disabled_reason(self) -> str:
+        if not TOKEN:
+            return "HUB_TOKEN is empty (refusing to run as an open relay)"
+        return "neither AUDIOMUSE_URL nor NAVIDROME_URL + HUB_ND_USER + HUB_ND_PASS is set"
+
+    def disabled_probe(self, route: tuple[str, str]) -> Optional[tuple]:
+        spec = self.routes.get(route)
+        if spec is None:
+            return None
+        if spec.get("probe"):
+            return _http_json(200, {"configured": False, "available": False,
+                                    "engine": None, "default": STATION_DEFAULT_CHARACTER,
+                                    "characters": [dict(c) for c in STATION_CATALOGUE]})
+        # The client's own fallback runs; nothing here is an error to show.
+        return _http_json(503, {"fallback": True,
+                                "error": f"stations disabled: {self.disabled_reason}"})
+
+    async def call(self, route: tuple[str, str], spec: dict,
+                   params: list[tuple[str, str]],
+                   body: Optional[dict]) -> tuple[int, bytes, str]:
+        hub = HUB_INSTANCE
+        if hub is None:
+            return 503, json.dumps({"fallback": True, "error": "hub starting"}).encode(), \
+                "application/json"
+        status, payload = await hub.stations.route(route[1], body or {})
+        return status, json.dumps(payload).encode(), "application/json"
+
+
 SONIC = SonicProxy()
 LB = LbProxy()
 PREVIEW = PreviewProxy()
-# Order matters only in that each returns None for paths outside its own prefix;
-# the first one that claims the path answers it.
-PROXIES: tuple[HttpProxy, ...] = (SONIC, LB, PREVIEW)
+STATION = StationProxy()
+# Each returns None for paths outside its own prefix, and the first one that
+# claims a path answers it. So STATION goes before SONIC: SonicProxy claims every
+# `/sonic/*` path, `/sonic/station/*` included, and 404s the ones it does not list.
+PROXIES: tuple[HttpProxy, ...] = (STATION, SONIC, LB, PREVIEW)
 
 # Set once main() builds the hub, so the inbound notify handler below can reach
 # the connected devices. The proxy protocol class is constructed by `websockets`
@@ -2637,6 +4321,12 @@ class Hub:
         # Who its pause comes from: an `act` needs a sender, and this one has no
         # socket, so it is never stale, never acked and never sent an `error`.
         self._sleep_dev = Device(id="sleep-timer", name="sleep timer")
+        # The stations and their play history (PROTOCOL §18). Built before _load,
+        # which hands it the persisted stations.
+        self.stations = StationEngine(self)
+        # The queue position an `ended` report was last judged at, so a receiver
+        # repeating the flag does not count one play-through twice.
+        self._ended_judged: Optional[tuple] = None
         self._load()
         # A timer the state file brought back counts down from here.
         self._sleep_arm()
@@ -2667,6 +4357,57 @@ class Hub:
         if new_index != self.session.index:
             self._index_intent_at = time.monotonic()
             self._pre_intent_index = self.session.index
+            # A skip, a play-through, or neither, for the track being left (§18.3).
+            self._judge_departure(self.session.index, new_index, self.session.position_ms)
+
+    def _next_in_order(self, index: int) -> Optional[int]:
+        """The index play order takes after `index` (None: the queue ends there)."""
+        order = self._play_order()
+        try:
+            pos = order.index(index)
+        except ValueError:
+            return None
+        if pos + 1 < len(order):
+            return order[pos + 1]
+        return order[0] if self.session.repeat == "all" and order else None
+
+    def _judge_departure(self, left: int, new: Optional[int], pos_ms: int, *,
+                         ended: bool = False, steer: bool = True) -> None:
+        """Judge the track at `left`, which playback is leaving (PROTOCOL §18.3).
+
+        `pos_ms` is where it was left: for a report, the position of the report
+        BEFORE the one that moves the index, which already carries the new
+        track's position. Played through: `ended`, 85 %, or under 15 s to go
+        (that last only past half the track, so a short track skipped at once is
+        not "played"). Skipped: a step forward in play order before min(30 s,
+        40 %). Anything else is neither: a backward or non-adjacent move at a
+        position that is not a play-through. `steer=False` (a setQueue or clear)
+        feeds the play history only, so a new queue is never a skip.
+        """
+        s = self.session
+        if not 0 <= left < len(s.queue) or not isinstance(s.queue[left], dict):
+            return
+        if not ended:
+            self._ended_judged = None
+        track = s.queue[left]
+        dur = _as_int(track.get("durationMs"), 0, 0)
+        pos = max(0, _as_int(pos_ms, 0))
+        played = ended or (dur > 0 and (
+            pos >= STATION_PLAYED_FRACTION * dur
+            or (dur - pos < STATION_PLAYED_TAIL_MS and pos >= 0.5 * dur)))
+        skip_below = min(STATION_SKIP_MS, STATION_SKIP_FRACTION * dur) if dur else STATION_SKIP_MS
+        skipped = (not played and new is not None and new == self._next_in_order(left)
+                   and pos < skip_below)
+        is_play = played or pos >= STATION_PLAY_MS or (
+            dur > 0 and pos >= STATION_PLAY_FRACTION * dur)
+        verdict = "played" if played else "skip" if skipped else None
+        dlog(f"STATION judged index {left} -> {new}: {verdict or 'neither'} "
+             f"at {pos}/{dur} ms{' (ended)' if ended else ''}"
+             f"{'' if steer else ' (history only)'}")
+        try:
+            self.stations.departure(track, verdict, is_play, steer)
+        except Exception as e:  # noqa: BLE001 — steering must never break playback
+            log("station departure failed:", e)
 
     def _spawn(self, coro: Any) -> None:
         """Run `coro` in the background, holding a reference until it is done."""
@@ -2930,6 +4671,7 @@ class Hub:
                 saved_queue_id=s.get("savedQueueId"),
                 source_kind=s.get("sourceKind", "manual"),
                 source_name=s.get("sourceName"),
+                station_id=_as_str(s.get("stationId"), 64),
             )
 
         def saved_queues() -> None:
@@ -2951,6 +4693,11 @@ class Hub:
                 clean = self._sanitize_mix(raw_mix)
                 if clean is not None:
                     self.mixes[clean["id"]] = clean
+
+        def stations() -> None:
+            # Additive like `mixes`: a state.json from before stations loads with
+            # none, and an older hub reading this one drops the key.
+            self.stations.load_state(data.get("stations", []))
 
         def lb_index() -> None:
             # Additive like `mixes`: a state.json from before the index mirror
@@ -3008,13 +4755,17 @@ class Hub:
             log(f"sleep timer restored: {left:.0f}s left of {minutes} min")
 
         for name, section in (("session", session), ("savedQueues", saved_queues),
-                              ("mixes", mixes), ("lbIndex", lb_index),
+                              ("mixes", mixes), ("stations", stations),
+                              ("lbIndex", lb_index),
                               ("deletedSavedQueues", tombstones), ("devices", devices),
                               ("sleepTimer", sleep_timer)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
                 log(f"state: skipped unreadable {name}:", e)
+        # A queue bound to a station the file no longer holds continues as nothing.
+        if self.session.station_id not in self.stations.stations:
+            self.session.station_id = None
         try:
             self._prune_devices()
         except Exception as e:  # noqa: BLE001
@@ -3048,6 +4799,7 @@ class Hub:
                 if self._prune_devices():
                     self._save()
                     await self._broadcast_devices()
+                self.stations._sweep()  # noqa: SLF001 — same module
             except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
                 log("device sweep error:", e)
 
@@ -3086,6 +4838,9 @@ class Hub:
             "savedQueues": self._saved_queues_list(),
             "deletedSavedQueues": self.deleted_saved_queues,
             "mixes": mixes,
+            # The stations (PROTOCOL §18.4), so a restart keeps them. Their play
+            # history is NOT here: it has its own file (StationEngine).
+            "stations": self.stations.to_state(),
             "lbIndex": self.lb_index,
             "devices": [
                 {"id": d.id, "name": d.name, "platform": d.platform, "kind": d.kind,
@@ -3942,6 +5697,9 @@ class Hub:
                 # lb-bot's availability and the routes this hub proxies — the
                 # `/lb/status` answer, delivered without a client awaiting it.
                 "lb": LB.welcome_info(),
+                # The station the session is bound to (§18.2), or null: a device
+                # joining mid-station learns `after` without a round trip.
+                "station": self.stations.welcome_station(),
             }
             if self.lb_index is not None:
                 welcome["lbIndex"] = dict(self.lb_index)
@@ -4192,6 +5950,9 @@ class Hub:
             # without the cap until `applied` reaches `need`.
         changed = False
         now = time.monotonic()
+        # Where the track was before this report: a report that moves the index
+        # already carries the NEW track's position (PROTOCOL §18.3).
+        left_at = s.position_ms
         if "positionMs" in msg:
             # Right after a seek/jump/skip the receiver may still emit an in-flight
             # 1 Hz report carrying the OLD position, which would rewind the scrubber.
@@ -4229,6 +5990,7 @@ class Hub:
                     dlog(f"REPORT idx={idx} from {who} "
                          f"IGNORED(index-grace; session is at {s.index})")
                 else:
+                    self._judge_departure(s.index, idx, left_at)
                     s.index = idx; changed = True
         if "isPlaying" in msg and msg["isPlaying"] != s.is_playing:
             playing = bool(msg["isPlaying"])
@@ -4254,6 +6016,12 @@ class Hub:
                  f"| is_playing was {not playing} {verdict}")
 
         if msg.get("ended"):
+            # The whole queue finished: its last track was played through. Judged
+            # once per position, however many reports repeat the flag.
+            mark = (s.saved_queue_id, s.index)
+            if self._ended_judged != mark:
+                self._judge_departure(s.index, None, s.position_ms, ended=True)
+                self._ended_judged = mark
             self.session.is_playing = False
             changed = True
 
@@ -4474,6 +6242,9 @@ class Hub:
         if action == "setQueue":
             # Flush where we left the OUTGOING queue before it becomes "previous".
             self._touch_saved_queue_progress()
+            # The track it was on may have been heard: the play history hears it,
+            # the station does not (a new queue is never a skip, §18.3).
+            self._judge_departure(s.index, None, s.position_ms, steer=False)
             s.queue = msg.get("tracks", [])
             s.index = self._clamp_index(int(msg.get("index", 0)))
             s.position_ms = max(0, int(msg.get("positionMs", 0)))
@@ -4503,6 +6274,11 @@ class Hub:
                 s.saved_queue_id = None
                 s.source_kind = "manual"
                 s.source_name = None
+            # §18.2: the new queue continues as the station it names, and a
+            # setQueue naming none (or one this hub does not hold) unbinds.
+            sid = _as_str(msg.get("stationId"), 64)
+            s.station_id = (sid if sid and s.queue and self.stations.get(sid) is not None
+                            else None)
             s.bump()
             # Only push a load to the active receiver if it ISN'T the device that
             # sent the queue. When a device publishes the queue it's already
@@ -4536,6 +6312,7 @@ class Hub:
             # Flush where we left off BEFORE detaching, so the cleared queue stays
             # resumable from the history, then stop pointing the live session at it.
             self._touch_saved_queue_progress()
+            self._judge_departure(s.index, None, s.position_ms, steer=False)
             s.queue = []
             s.index = 0
             s.position_ms = 0
@@ -4543,6 +6320,7 @@ class Hub:
             s.saved_queue_id = None
             s.source_kind = "manual"
             s.source_name = None
+            s.station_id = None
             self._mark_play_intent()
             self._rebuild_order()
             s.bump()
@@ -5275,6 +7053,10 @@ async def main() -> None:
         serve_kwargs["create_protocol"] = proxy_protocol
 
     sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
+    # The station engine's tier probe (PROTOCOL §18.1: every 10 min, and after a
+    # failure), for the characters route's `available` and `engine`.
+    station_probe = (asyncio.create_task(hub.stations.probe_loop())
+                     if STATION.enabled else None)
     # The hub's own lb-bot probe, for `welcome.lb` (see LB_PROBE_STARTUP_WAIT).
     lb_probe = asyncio.create_task(LB.probe_loop()) if LB.enabled else None
     # `open_timeout` is the WebSocket *handshake* deadline, and it defaults to 10s
@@ -5290,7 +7072,7 @@ async def main() -> None:
     # and the MusicBrainz-backed routes were on the same cliff. The deadline has
     # to clear the slowest thing the proxy is allowed to wait for.
     handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT,
-                            PROXY_SEARCH_TIMEOUT) + 15
+                            PROXY_SEARCH_TIMEOUT, STATION_BUDGET_S) + 15
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
                                 open_timeout=handshake_timeout,
@@ -5300,6 +7082,9 @@ async def main() -> None:
     sweep.cancel()
     if lb_probe is not None:
         lb_probe.cancel()
+    if station_probe is not None:
+        station_probe.cancel()
+    hub.stations.close()   # the play history, written now rather than in 30 s
 
     health_server.close()
     await health_server.wait_closed()
