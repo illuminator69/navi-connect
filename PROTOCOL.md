@@ -81,7 +81,7 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
-                 "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer"],
+                 "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station"],
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
@@ -196,7 +196,8 @@ on the strength of a report from a bridge that may itself be wedged.
   "savedQueueId": "q_...|null",  // history record this queue IS (§8.3); null = untracked
   "sourceKind": "album|playlist|radio|moodFlow|journey|manual",
   "sourceName": "Album One|null", // display name of what was played
-  "sleepTimer": null             // or { remainingMs, minutes, setBy } — below, and §5.1
+  "sleepTimer": null,            // or { remainingMs, minutes, setBy } — below, and §5.1
+  "stationId": null              // the station this queue continues as (§18.2); hub with "station" only
 }
 ```
 
@@ -259,14 +260,15 @@ issues directives to the active receiver (§5.2), then broadcasts the new sessio
 | `deleteSavedQueue` | `id` | delete a saved-queue history record (§8.3) |
 | `deleteSavedQueues` | `ids[]` | delete several records in one act — one broadcast (§8.3) |
 | `syncSavedQueues` | `queues[]`, `deleted[]?` | push a client's local/offline history **and its offline deletions** up (§8.3) |
-| `saveMix` | `id?`, `name`, `kind`, `seedId?`, `seedName?`, `moodCharacter?`, `count?`, `coverArtId?` | create (no `id`) or update one "Mixed for You" recipe (§17) |
+| `saveMix` | `id?`, `name`, `kind`, `seedId?`, `seedName?`, `moodCharacter?`, `character?`, `count?`, `coverArtId?` | create (no `id`) or update one "Mixed for You" recipe (§17) |
 | `renameMix` | `id`, `name` | rename a recipe (§17) |
 | `deleteMix` | `id` | delete a recipe (§17) |
 | `touchMix` | `id` | record that a recipe was just played — bumps `lastPlayedAt` only (§17) |
 
 `setQueue` additionally accepts optional `savedQueueId`, `sourceKind`
 (`album|playlist|radio|moodFlow|journey|manual`), `sourceName`, `coverImageUrl`, `serverId`
-— see §8.3.
+— see §8.3. With `"station"` in `welcome.features` it also takes `stationId`, which binds the new
+queue to a station (§18.2); a `setQueue` without one unbinds it.
 
 If there is **no active device** when a controller sends a playback action, the
 hub applies it to the session and, for `play`/`setQueue`, auto-promotes the
@@ -499,6 +501,7 @@ socket stays perfectly healthy. See §3.2 and §12.2.
 | `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
 | `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `index` | `{ seq, epoch }` | lb-bot's library-index head moved (§15.3). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
+| `station` | `{ stationId, seq, rev, character, exhausted }` | a station's cursor, steering, character or exhaustion changed (§18.2). Only with `"station"` in `welcome.features` |
 | `lb` | `{ available, routes, webUrl }` — the same object as `welcome.lb` | the hub's verdict on lb-bot's availability **changed** (§15.3). Clients apply it exactly like `welcome.lb` |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `not_supported` (§5.1), `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
 
@@ -2575,7 +2578,9 @@ took `{mode, seedId, moodCharacter, count}` as arguments and dropped them,
 `mixSig` and the Mood Flow centroid were in-memory only, and `playMix` exited
 into a frozen `SavedQueueEntity` that replays rather than regenerates.
 
-**The hub never generates anything.** It stores and broadcasts the recipe; each
+**The hub never generated anything — until §18.** Since 2026-10-16 radio and autoplay are
+stations the hub computes (§18), and a `station` recipe plays through one. The other kinds below
+are unchanged. The hub stores and broadcasts the recipe; each
 client regenerates locally with the engine it already has (`RadioManager` /
 `auto-dj/*`). That keeps the hub audio-free and AudioMuse-free, which is the
 standing rule — and it is also why a second play of the same mix yields a
@@ -2592,9 +2597,10 @@ what these are not.
 
 ```jsonc
 { "id": "mx_<ms>_<hex>", "name": "Your Mix",
-  "kind": "similar|fingerprint|adaptive|genre|artist",
+  "kind": "similar|fingerprint|adaptive|genre|artist|station",
   "seedId": "", "seedName": "",
-  "moodCharacter": "EchoMatch|SteadyVibes|TransitionMaestro",
+  "moodCharacter": "EchoMatch|SteadyVibes|TransitionMaestro",   // legacy; kept beside `character`
+  "character": "close|balanced|explore",                         // §18
   "count": 50, "coverArtId": "",
   "createdAt": 0, "updatedAt": 0, "lastPlayedAt": 0 }
 ```
@@ -2612,6 +2618,16 @@ guaranteed to change. The hub has always stored and fanned this field out
 (`_sanitize_mix` copies it), and for a while no client wrote it, so every mix
 rendered as bare text. A recipe with no seed — `fingerprint`, `adaptive` — has
 none, and a client draws something from the `kind` instead.
+
+**`station` and `character` (2026-10-16, §18).** A `station` recipe is a radio: `seedId` a
+track (empty for Your mix), `character` its character, and a play starts a station from it
+(§18.1). `character` is accepted on every kind; when a record arrives without one the hub
+derives it from a legacy `moodCharacter` (EchoMatch → close, SteadyVibes → balanced,
+TransitionMaestro → explore), and it writes the legacy name beside a new `character`, so a client
+from before §18 still reads `moodCharacter`. Such a client hides `station` rows, as it hides any
+kind it does not know. Without the engine a client plays `similar`, `fingerprint` and `adaptive`
+the old way; with it, `similar` is a track radio on Balanced and `fingerprint` / `adaptive` are
+Your mix.
 
 ### 17.2 Acts
 
@@ -2644,3 +2660,208 @@ every receiver stamps the one it is playing — so a delete races a re-publish a
 needs a tombstone to win. A mix is only ever written by the user, on one device,
 through an explicit act; nothing republishes it, so there is no race to arbitrate
 and union-merge has nothing to merge.
+
+---
+
+## 18. Stations — radio and autoplay, generated by the hub
+
+**This overturns §17's "the hub never generates anything"** (ruled 2026-10-16, I-040). Each client had
+written its own radio and autoplay twice over, and the copies had drifted: different counts,
+different fallbacks, different seeds. Each, after a radio's first batch, handed the queue to a
+global autoplay mode that never saw the radio's seed, and filled any short answer with
+whole-library random songs. The audit is `AUDIT-audiomuse-radio-2026-10-16.md`.
+
+A **station** is a seed plus a *character*. The hub keeps what it served, what you skipped and
+liked, and a play history across sessions, and answers "the next N tracks" from AudioMuse. It
+holds no queue of its own. The clients put what it answers into theirs.
+
+**Words.** In the UI a seeded station is a *radio* ("Cinnamon Girl radio") and the seedless one is
+*Your mix*. `station` is the noun in code and on the wire only. "Station" already names Subsonic
+internet radio in both clients, and "Mood Flow" is retired.
+
+**Without the engine.** A hub without `"station"` in `welcome.features`, a probe that answers
+`available: false`, or a `start` that answers 503 all mean the client uses its own fallback:
+Feishin's upstream Auto DJ, or Navic's port of it, through Navidrome's similar-songs agent.
+`exhausted` is **not** a failure. It is an answer: the station has nothing left that fits, so
+autoplay stops and the client may offer Explore. No path in the engine falls back to random
+songs.
+
+### 18.1 Routes
+
+Plain HTTP on port `4790` beside §14, same `HUB_TOKEN` bearer, same whitelist rule (unlisted
+body keys are dropped). Enabled when `HUB_TOKEN` is set **and** either `AUDIOMUSE_URL` (Tier 2)
+or `NAVIDROME_URL` + `HUB_ND_USER` + `HUB_ND_PASS` (Tier 1) is configured.
+
+**`GET /sonic/station/characters`** is the probe and the shared catalogue. It always answers
+200, so both clients render the same words:
+
+```jsonc
+{ "configured": true, "available": true, "engine": "tier2",   // tier2 | tier1 | null
+  "default": "balanced",
+  "characters": [
+    { "id": "close",    "label": "Close",    "legacy": "EchoMatch",
+      "description": "Stays right next to what you started with." },
+    { "id": "balanced", "label": "Balanced", "legacy": "SteadyVibes",
+      "description": "Near what you started with, with room to move." },
+    { "id": "explore",  "label": "Explore",  "legacy": "TransitionMaestro",
+      "description": "Wanders further, steered by what you skip and like." } ] }
+```
+
+- `configured` is false when the engine is disabled. `available` is false when no tier answered
+  its last probe (re-probed every 10 min, and after a failure).
+- `legacy` maps the old `MoodCharacter` names, so a stored preference or recipe migrates.
+
+**`POST /sonic/station/start`**
+
+```jsonc
+{ "seed": { "kind": "track",   "ids": ["<songId>"],         "name": "Cinnamon Girl" }
+       // | { "kind": "tracks",  "ids": ["…", "…"] (1–5),   "name": "Norman Fucking Rockwell!" }
+       // | { "kind": "yourMix" }
+  "character": "balanced",   // close | balanced | explore; absent = default
+  "count": 20,               // 1–50, default 20
+  "exclude": ["<songId>", …],// what is already queued (≤1000 ids)
+  "bindSession": "<savedQueueId>",  // optional: bind this station to the live session (below)
+  "deviceId": "<deviceId>" }
+```
+
+Answers:
+
+```jsonc
+{ "stationId": "st_1760650000000_9f2c", "name": "Cinnamon Girl radio",
+  "character": "balanced", "engine": "tier2",
+  "seed": { "kind": "track", "ids": ["…"], "name": "Cinnamon Girl" },
+  "seq": 20, "rev": 0,
+  "tracks": [ { "id": "…", "title": "…", "artist": "…", "album": "…",
+                "why": "near", "rank": 3 } ],
+  "exhausted": false, "partial": false }
+```
+
+- `tracks` never contains a seed. A radio's queue is the seed track(s), which the client
+  already has, followed by `tracks`.
+- `seq` counts every track the station has served.
+- `why` is one of:
+  - `near`: the seed's own nearest neighbours.
+  - `blend`: AudioMuse alchemy over the anchors.
+  - `drift`: a played-through track's neighbours, still inside the seed's neighbourhood.
+  - `artist`: a similar artist's track, likewise gated.
+  - `tier1`: Navidrome.
+- `rank` is the track's place in the nearest list of the anchor that admitted it.
+- Refusals:
+  - `400 {code: "bad_seed" | "bad_character"}`.
+  - `404 {code: "seed_unknown"}`: AudioMuse holds no seed track.
+  - `503 {fallback: true}`: no tier is usable.
+  - `409 {code: "session_bound", stationId}`: `bindSession` was asked and the session already has
+    a station. The client then continues that one with `next`. This is how two devices reaching
+    the end of one queue together end up on one station, not two.
+
+**`POST /sonic/station/next`**
+
+```jsonc
+{ "stationId": "st_…", "after": 20, "count": 5, "exclude": [ … ], "deviceId": "…" }
+```
+
+Answers `{stationId, seq, rev, character, engine, tracks, exhausted, partial, servedElsewhere}`.
+
+- **`after` is the `seq` the caller last applied.**
+  - The same `after` from the same device as the last batch replays that batch (a retry).
+  - An `after` below the station's `seq` from another device answers `servedElsewhere: true`
+    with no tracks: someone already topped this station up. The caller learns the new `seq` from
+    the `station` frame or from this answer.
+  - Only `after == seq` computes a new batch.
+- `count` is 1–25, default 5.
+- `404 {code: "station_unknown"}`: an expired station, or a hub that lost it. The client starts
+  again once, from the seed it keeps.
+
+**`POST /sonic/station/signal`**
+
+```jsonc
+{ "stationId": "st_…", "trackId": "…",
+  "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character",
+  "value": "explore" }       // only for `character`
+```
+
+Answers `{rev, applied, ignored?}`.
+
+- **Likes come only from here:** a star goes from the client straight to Navidrome, and the hub
+  never sees it.
+- `character` changes the station's character from its next batch.
+- `skip` and `played` are for a station whose queue is **not** the hub session. For a bound
+  station the hub derives both itself (§18.3) and answers `ignored: "session"`.
+- A track the station never served or seeded answers `ignored: "unknown_track"`.
+- A signal moves `rev`, and so does a character change.
+
+### 18.2 Binding to the session, and the `station` frame
+
+`setQueue` takes an optional `stationId` (§5.1), and `start` takes `bindSession`. Either way
+`session.stationId` (§4.2) names the station the live queue belongs to. It is cleared by the next
+`setQueue` without one, and by `clear`.
+
+- **Binding is what lets the hub hear the station.** Skips and play-throughs of that queue's
+  tracks steer it (§18.3).
+- A queue the user started from an album or a playlist has no station. When it runs out, the
+  device driving autoplay calls `start` with `seed: {kind: "tracks", ids: <the last 1–3 tracks
+  played through>}` and `bindSession`. The queue then continues as that station.
+
+`{ "t": "station", "stationId": "st_…", "seq": 25, "rev": 2, "character": "balanced",
+"exhausted": false }` is broadcast to every client whenever a station's `seq`, `rev`,
+`character` or `exhausted` changes. That is how a second device learns `after`. Only a hub with
+`"station"` in `welcome.features` sends it.
+
+### 18.3 What steers a station
+
+**From the session, for the bound station.** The hub judges the track just left at every index
+change. It uses the position of the report **before** the change, because the report that moves
+the index already carries the new track's position.
+
+- **played through:** the track `ended`, or reached 85% of `durationMs`, or was left with under
+  15 s to go.
+- **skipped:** a step forward in play order with position under min(30 s, 40% of `durationMs`).
+- **neither:** a jump backwards or to a track that is not the next one, a `setQueue`, a `clear`,
+  or a report dropped as stale.
+
+So starting a new queue is never a skip.
+
+**Per character.** Starting values; `AUDIT-…` §"Phase 0 results" has the measurements behind
+them.
+
+| | Close | Balanced | Explore |
+|---|---|---|---|
+| Gate: a candidate must be within this rank of an anchor's nearest list | 150 | 400 | 1000, or 200 of a played-through track's list when that track itself passed |
+| Sources | the anchors' nearest lists, in order | the same, and alchemy over anchors + the last 3 played through (temperature 0.3) every other batch | the same, alchemy every batch (temperature 0.8, anchors + the last 5 played through or liked), played-through neighbours, similar artists |
+| Artists: at most / minimum gap | 2 per 10 (the seed's artist 3) / 3 tracks | 2 per 10 / 4 tracks | 1 per 10 / 8 tracks |
+| A like adds an anchor, at most | 2 | 4 | 6 |
+| A skip | joins the subtract set (alchemy); 2 skips of one artist cool it for 2 h | same | 1 skip cools the artist |
+
+The gate is AudioMuse's own neighbourhood, not the six mood features. Those are compressed (every
+value near 0.6), so a feature gate let Lana Del Rey → OsamaSon through. OsamaSon is not among
+Lana's 1,000 nearest of 15,768 songs. The features order a batch so that transitions are smooth.
+
+**Every character never serves:**
+- a track this station served;
+- a track in `exclude` or in the bound session's queue;
+- a seed;
+- a track, or the same title by the same primary artist, played in the last 14 days.
+
+A batch that comes up short widens before it gives up: deeper into the lists, the rank ceiling
+×1.5 (up to 1000, or 2000 for Explore), the history window down to 3 days, played-through
+tracks' neighbours, similar artists, then Tier 1. Only when all of those **answered** and found
+nothing is it `exhausted`. A source that failed (AudioMuse down, a timeout) makes the answer
+`partial`, never `exhausted`.
+
+**Your mix** takes its anchors from AudioMuse's Sonic Fingerprint of the hub's Navidrome user
+(`HUB_ND_USER`): its first rows are that user's own most-played tracks, which become the anchors.
+Everything else is as for a radio. It is that user's mix, whoever asks.
+
+### 18.4 State, history, limits
+
+- **Stations:** at most 8, each expiring after 24 h unused, kept in `state.json["stations"]` so a
+  restart keeps them.
+- **Play history:** the last 2,000 plays from the last 14 days, as ids and times only, in its own
+  file beside `state.json` (`<state>.history`), written at most every 30 s. Fed by the session
+  (a play is ≥50% or ≥4 min). Never in `health`, `welcome` or a log line. `HUB_STATION_HISTORY=0`
+  keeps it in memory only.
+- **Limits:**
+  - A request has 12 s; what is found by then is answered with `partial: true`.
+  - One computation per station at a time, two stations computing at once.
+  - At most two AudioMuse calls in flight per request, inside §14's pool.
+- **Unchanged:** §14's `/sonic/alchemy` and `/sonic/fingerprint` stay for older clients.
