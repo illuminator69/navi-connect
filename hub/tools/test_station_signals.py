@@ -131,8 +131,10 @@ async def session_suite(failures, log_path):
         sid = a["stationId"]
         await settle()
         if not any(f.get("stationId") == sid and f.get("seq") == 6
+                   and f.get("name") == "Indie Song 12-0 radio" and f.get("origin") == "radio"
                    for f in c.station_frames):
-            failures.append(f"no station frame after start: {c.station_frames}")
+            failures.append(f"no station frame (with name and origin) after start: "
+                            f"{c.station_frames}")
         queue = [{"id": seed, "title": LIB[seed]["title"], "artist": LIB[seed]["artist"],
                   "durationMs": DUR}] + [
             {"id": t["id"], "title": t["title"], "artist": t["artist"], "durationMs": DUR}
@@ -147,7 +149,8 @@ async def session_suite(failures, log_path):
         ws_ = d.welcome.get("station") or {}
         if ws_.get("stationId") != sid or ws_.get("seq") != 6 or ws_.get("name") != \
                 "Indie Song 12-0 radio" or ws_.get("seed", {}).get("ids") != [seed] \
-                or ws_.get("character") != "balanced" or "exhausted" not in ws_:
+                or ws_.get("character") != "balanced" or "exhausted" not in ws_ \
+                or ws_.get("origin") != "radio":
             failures.append(f"welcome.station: {ws_}")
         await d.ws.close()
         rev0 = c.rev(sid)

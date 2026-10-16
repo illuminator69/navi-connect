@@ -2415,7 +2415,8 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
     # Every body key a route reads is listed: HttpProxy drops the rest silently.
     ("POST", "/sonic/station/start"): {
         "method": "POST",
-        "body": ("seed", "character", "count", "exclude", "bindSession", "deviceId"),
+        "body": ("seed", "character", "count", "exclude", "bindSession", "deviceId",
+                 "origin"),
     },
     ("POST", "/sonic/station/next"): {
         "method": "POST",
@@ -2428,6 +2429,10 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
 
 _STATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character")
+# Why a station was started (§18.1): "radio" — the user asked for it, and it keeps
+# going with autoplay off — or "continue" — autoplay continued a queue, and it stops
+# when autoplay is turned off. Anything else is "radio".
+_STATION_ORIGINS = ("radio", "continue")
 
 
 def _now_ms() -> int:
@@ -2565,6 +2570,7 @@ class Station:
     created_at: int
     used_at: int
     engine: str = "tier2"
+    origin: str = "radio"            # radio | continue (_STATION_ORIGINS)
     seq: int = 0                     # tracks served, ever
     rev: int = 0                     # moved by every signal and character change
     exhausted: bool = False
@@ -2629,13 +2635,15 @@ class Station:
 
     def frame(self) -> dict:
         return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
-                "character": self.character, "exhausted": self.exhausted}
+                "character": self.character, "exhausted": self.exhausted,
+                "name": self.name, "origin": self.origin}
 
     def to_state(self) -> dict:
         return {
             "id": self.id, "seed": self.seed, "name": self.name,
             "character": self.character, "createdAt": self.created_at,
-            "usedAt": self.used_at, "engine": self.engine, "seq": self.seq,
+            "usedAt": self.used_at, "engine": self.engine, "origin": self.origin,
+            "seq": self.seq,
             "rev": self.rev, "exhausted": self.exhausted, "seedIds": self.seed_ids,
             "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
             "trail": self.trail, "lastFeats": self.last_feats, "played": self.played,
@@ -2687,6 +2695,7 @@ class Station:
             character=character, created_at=_as_int(d.get("createdAt"), _now_ms(), 0),
             used_at=_as_int(d.get("usedAt"), _now_ms(), 0),
             engine="tier1" if d.get("engine") == "tier1" else "tier2",
+            origin="continue" if d.get("origin") == "continue" else "radio",
             seq=_as_int(d.get("seq"), 0, 0), rev=_as_int(d.get("rev"), 0, 0),
             exhausted=bool(d.get("exhausted")),
             seed_ids=strs(d.get("seedIds"), STATION_SEEDS_MAX), anchor_meta=meta,
@@ -3641,8 +3650,8 @@ class StationEngine:
 
     def _answer(self, st: Station, tracks: list, exhausted: bool, partial: bool) -> dict:
         return {"stationId": st.id, "seq": st.seq, "rev": st.rev,
-                "character": st.character, "engine": st.engine, "tracks": tracks,
-                "exhausted": exhausted, "partial": partial}
+                "character": st.character, "engine": st.engine, "origin": st.origin,
+                "tracks": tracks, "exhausted": exhausted, "partial": partial}
 
     async def start(self, body: dict, debug: bool = False) -> tuple[int, dict]:
         seed = self._parse_seed(body.get("seed"))
@@ -3658,6 +3667,7 @@ class StationEngine:
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
         bind = _as_str(body.get("bindSession"), 128)
+        origin = body.get("origin") if body.get("origin") in _STATION_ORIGINS else "radio"
         self._sweep()
 
         def bound_conflict() -> Optional[tuple[int, dict]]:
@@ -3675,7 +3685,7 @@ class StationEngine:
                         if isinstance(t, dict) and isinstance(t.get("id"), str)}
         now = _now_ms()
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
-                     created_at=now, used_at=now)
+                     created_at=now, used_at=now, origin=origin)
         deadline = time.monotonic() + STATION_BUDGET_S
         if not await self._acquire(self._computing, deadline):
             return 503, {"fallback": True, "busy": True,
@@ -3718,17 +3728,19 @@ class StationEngine:
         self.stations[st.id] = st
         self._evict()
         s = self.hub.session
-        if bind and bind == s.saved_queue_id and st.id in self.stations:
+        bound = bool(bind and bind == s.saved_queue_id and st.id in self.stations)
+        if bound:
             s.station_id = st.id
             s.bump()
             await self.hub._broadcast_session()  # noqa: SLF001 — same module
         else:
+            # A bindSession naming another queue is not an error: `bound: false`.
             self.hub._save()  # noqa: SLF001 — same module
         await self._announce(st)
         dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
              f"engine {st.engine}, rungs {b.rungs}")
         answer = {**self._answer(st, tracks, exhausted, partial), "name": st.name,
-                  "seed": st.seed}
+                  "seed": st.seed, "bound": bound}
         if debug:
             answer["_debug"] = {"rungs": b.rungs, "failed": b.failed,
                                 "timedOut": b.timed_out}

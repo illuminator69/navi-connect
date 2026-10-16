@@ -473,6 +473,9 @@ async def main_suite(failures):
             failures.append(f"stationId shape: {sid}")
         if a.get("name") != "Indie Song 3-0 radio" or a.get("seed", {}).get("ids") != [seed]:
             failures.append(f"name/seed echo: {a.get('name')} {a.get('seed')}")
+        if a.get("origin") != "radio" or a.get("bound") is not False:
+            failures.append(f"a start without origin or bindSession: origin={a.get('origin')} "
+                            f"bound={a.get('bound')}")
         served = list(a["tracks"])
         seq = a["seq"]
         for _ in range(30):
@@ -663,8 +666,8 @@ async def main_suite(failures):
         st_, b1 = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "tracks", "ids": ["L30_0", "L31_0"]},
             "bindSession": "q_bind_test", "count": 5, "deviceId": "binder"})
-        if st_ != 200:
-            failures.append(f"a bound start failed: {st_} {b1}")
+        if st_ != 200 or b1.get("bound") is not True:
+            failures.append(f"a bound start failed: {st_} {b1.get('bound')}")
         st_, b2 = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": ["L32_0"]},
             "bindSession": "q_bind_test", "count": 5, "deviceId": "other"})
@@ -673,9 +676,20 @@ async def main_suite(failures):
             failures.append(f"a second bound start must be 409 session_bound: {st_} {b2}")
         st_, b3 = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": ["L32_0"]},
-            "bindSession": "q_some_other", "count": 5})
-        if st_ != 200:
-            failures.append(f"a bindSession naming another queue must still start: {st_}")
+            "bindSession": "q_some_other", "count": 5, "origin": "continue"})
+        if st_ != 200 or b3.get("bound") is not False:
+            failures.append(f"a bindSession naming another queue must still start, "
+                            f"bound:false: {st_} {b3.get('bound')}")
+        if b3.get("origin") != "continue":
+            failures.append(f"origin continue not echoed by start: {b3.get('origin')}")
+        st_, b3n = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": b3["stationId"], "after": b3["seq"], "count": 2})
+        if b3n.get("origin") != "continue":
+            failures.append(f"origin continue not echoed by next: {b3n.get('origin')}")
+        st_, b4 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L34_0"]}, "count": 2, "origin": "sideways"})
+        if b4.get("origin") != "radio":
+            failures.append(f"an unknown origin must read as radio: {b4.get('origin')}")
         st_, sg = await acall(port, "POST", "/sonic/station/signal", {
             "stationId": b1["stationId"], "trackId": b1["tracks"][0]["id"],
             "kind": "skip"})
@@ -750,7 +764,7 @@ async def main_suite(failures):
         # session bound to it.
         st_, p0 = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": [seed]}, "character": "balanced",
-            "count": 10, "deviceId": "dev-a"})
+            "count": 10, "deviceId": "dev-a", "origin": "continue"})
         sid, seq = p0["stationId"], p0["seq"]
         ids = [t["id"] for t in p0["tracks"]]
         rx = Client("Player", device_id="player")
@@ -800,6 +814,8 @@ async def main_suite(failures):
             failures.append(f"the station did not survive the restart: {st_} {nx}")
         elif {t["id"] for t in nx["tracks"]} & set(ids):
             failures.append("the restarted station served a track it had served")
+        if nx.get("origin") != "continue":
+            failures.append(f"origin did not survive the restart: {nx.get('origin')}")
         st_, again = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": [seed]}, "character": "balanced",
             "count": 50, "deviceId": "dev-a"})
