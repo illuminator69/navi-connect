@@ -2807,6 +2807,11 @@ Answers `{rev, applied, ignored?}`.
 `character` or `exhausted` changes. That is how a second device learns `after`. Only a hub with
 `"station"` in `welcome.features` sends it.
 
+`welcome.station` carries the same object, plus `name` and `seed`, for the station the session is
+bound to (`null` when none), so a device that connects mid-station knows `after` without a
+round trip. The station is the session's: whichever device drives autoplay continues it with
+`next`, and the `seq` cursor is what keeps two such devices from both adding a batch.
+
 ### 18.3 What steers a station
 
 **From the session, for the bound station.** The hub judges the track just left at every index
