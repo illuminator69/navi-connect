@@ -1092,7 +1092,7 @@ call, and unlisted parameters/body keys are dropped rather than relayed):
 | `POST /sonic/alchemy` | `POST /api/alchemy` | `items[] {op,id,type}`, `n`, `temperature`, `subtract_distance` |
 | `POST /sonic/clap/search` | `POST /api/clap/search` | `query`, `limit` |
 | `GET /sonic/clap/stats` | `GET /api/clap/stats` | — |
-| `GET /sonic/score` | `GET /get_score` | `id` |
+| `GET /sonic/score` | `GET /external/get_score` (retried at `/get_score` on a 404, for an older AudioMuse) | `id` |
 
 The hub injects `Authorization: Bearer $AUDIOMUSE_TOKEN` and, on the fingerprint
 route, `navidrome_user` / `navidrome_password` from `HUB_ND_USER` / `HUB_ND_PASS`.

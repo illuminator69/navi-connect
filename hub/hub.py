@@ -675,7 +675,10 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
         "params": (), "cache": True, "probe": True,
     },
     ("GET", "/sonic/score"): {
-        "method": "GET", "path": "/get_score",
+        # B-137: current AudioMuse serves the score at /external/get_score and
+        # answers /get_score 404 (measured 2026-10-16); the old path stays as the
+        # fallback for an AudioMuse older than the move.
+        "method": "GET", "path": "/external/get_score", "fallback": "/get_score",
         "params": ("id",), "cache": True,
     },
 }
