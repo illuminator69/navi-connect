@@ -2906,7 +2906,10 @@ for a radio. It is that user's mix, whoever asks.
   ≥4 min, or a play-through), and by `played` signals; the same id again within 30 min is the same
   play. Never in `health`, `welcome` or a log line. `HUB_STATION_HISTORY=0` keeps it in memory only.
 - **Limits:**
-  - A request has 12 s; what is found by then is answered with `partial: true`.
-  - One computation per station at a time, two stations computing at once.
+  - A request has 12 s from its arrival; what is found by then is answered with
+    `partial: true`.
+  - One computation per station at a time, two stations computing at once. A request that waits
+    out its 12 s for either is answered without computing: `next` with no tracks and
+    `partial: true`, `start` with `503 {fallback: true, busy: true}`.
   - At most two AudioMuse calls in flight per request, inside §14's pool.
 - **Unchanged:** §14's `/sonic/alchemy` and `/sonic/fingerprint` stay for older clients.

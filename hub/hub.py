@@ -2955,6 +2955,17 @@ class StationEngine:
         st.announced = sig
         await self.hub._broadcast(st.frame())  # noqa: SLF001 — same module
 
+    @staticmethod
+    async def _acquire(lock: Any, deadline: float) -> bool:
+        """Wait for a lock or a slot, but not past the request's budget, which runs
+        from the request's arrival: two stations computing must not make a third
+        request outlast the clients' own timeout (Feishin 15 s) while it queues."""
+        try:
+            await asyncio.wait_for(lock.acquire(), max(0.0, deadline - time.monotonic()))
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     def _bump(self, st: Station) -> None:
         st.rev += 1
         st.exhausted = False   # a signal or a new character: the answer may differ
@@ -3084,7 +3095,11 @@ class StationEngine:
         async with self._probe_lock:
             self._probe_at = time.monotonic()
             if self.tier2_configured():
-                status, _ = await self._am("score", {"id": "station-probe"}, None, None)
+                # An id AudioMuse cannot hold: answered 404 at once, and on a route
+                # with no 404 fallback, so one probe is one call.
+                status, _ = await self._am("similar_tracks", {
+                    "item_id": "station-probe", "n": 1, "radius_similarity": "false",
+                    "eliminate_duplicates": "false"}, None, None)
                 self.tier2_ok = 0 < status < 500
             if self.tier1_configured():
                 outcome, payload = await self._nd("getOpenSubsonicExtensions", {}, None)
@@ -3661,8 +3676,12 @@ class StationEngine:
         now = _now_ms()
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
                      created_at=now, used_at=now)
-        async with self._computing:
-            b = _StationBatch(time.monotonic() + STATION_BUDGET_S)
+        deadline = time.monotonic() + STATION_BUDGET_S
+        if not await self._acquire(self._computing, deadline):
+            return 503, {"fallback": True, "busy": True,
+                         "error": "the hub is computing two stations already"}
+        try:
+            b = _StationBatch(deadline)
             if seed["kind"] == "yourMix":
                 outcome, anchors = await self._mix_anchors(b)
                 if outcome == "unavailable":
@@ -3689,6 +3708,8 @@ class StationEngine:
                 return 503, {"fallback": True, "error": "no tier answered"}
             st.name = self._name(st)
             exhausted, partial = self._commit(st, tracks, b, device, 0, st.rev)
+        finally:
+            self._computing.release()
         conflict = bound_conflict()
         if conflict is not None:
             # Another device's start bound the session while this one computed:
@@ -3730,7 +3751,13 @@ class StationEngine:
         count = _as_int(body.get("count"), 5, 1, 25)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
-        async with self._lock(st.id):
+        deadline = time.monotonic() + STATION_BUDGET_S
+        lock = self._lock(st.id)
+        if not await self._acquire(lock, deadline):
+            # Another request's batch for this station is still being computed.
+            return 200, {**self._answer(st, [], st.exhausted, True),
+                         "servedElsewhere": False}
+        try:
             if st.id not in self.stations:
                 return 404, {"code": "station_unknown", "error": "no such station"}
             st.used_at = _now_ms()
@@ -3748,10 +3775,17 @@ class StationEngine:
                 log(f"station {st.id}: after {after} is past seq {st.seq}; "
                     "answered as a new batch")
             rev = st.rev
-            async with self._computing:
-                b = _StationBatch(time.monotonic() + STATION_BUDGET_S)
+            if not await self._acquire(self._computing, deadline):
+                return 200, {**self._answer(st, [], st.exhausted, True),
+                             "servedElsewhere": False}
+            try:
+                b = _StationBatch(deadline)
                 tracks = await self._compute(st, count, exclude, b, debug)
                 exhausted, partial = self._commit(st, tracks, b, device, st.seq, rev)
+            finally:
+                self._computing.release()
+        finally:
+            lock.release()
         self.hub._save()  # noqa: SLF001 — same module
         await self._announce(st)
         answer = {**self._answer(st, tracks, exhausted, partial), "servedElsewhere": False}

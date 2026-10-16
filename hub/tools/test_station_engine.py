@@ -37,7 +37,9 @@ Cases:
   9. AudioMuse down: engine tier1 through getSonicSimilarTracks, and through
      getSimilarSongs2 when Navidrome has no sonicSimilarity;
  10. nothing configured: the probe answers configured:false, start 503 fallback;
- 11. the deepest list asked for stays under PROXY_MAX_RESPONSE.
+ 11. the deepest list asked for stays under PROXY_MAX_RESPONSE;
+ 12. the 12 s budget runs from a request's arrival: a third start queued behind
+     two slow ones still answers inside it, `partial`.
 
 Exits non-zero on failure.
 """
@@ -151,7 +153,7 @@ def _near(item, n, radius=NEIGHBOURHOOD):
 # Fake AudioMuse
 # --------------------------------------------------------------------------- #
 AM = {"calls": [], "fail_min_n": None, "max_body": 0, "max_n": 0, "creds_seen": 0,
-      "lock": threading.Lock()}
+      "slow": {}, "lock": threading.Lock()}
 
 
 class AudioMuse(http.server.BaseHTTPRequestHandler):
@@ -176,6 +178,8 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
             return self._send(401, {"error": "token"})
         if path == "/api/similar_tracks":
             item, n = q.get("item_id", ""), int(q.get("n", "10"))
+            if item in AM["slow"]:
+                time.sleep(AM["slow"][item])
             with AM["lock"]:
                 AM["max_n"] = max(AM["max_n"], n)
             if AM["fail_min_n"] is not None and n >= AM["fail_min_n"]:
@@ -685,6 +689,23 @@ async def main_suite(failures):
             "stationId": sid, "after": seq, "count": 5, "deviceId": "dev-a"})
         if st_ != 404 or ev.get("code") != "station_unknown":
             failures.append(f"the least recently used station should be evicted: {st_}")
+
+        # ----- 12. the budget runs from arrival ------------------------------ #
+        AM["slow"].update({"L35_0": 7.0, "L36_0": 7.0, "L37_0": 7.0})
+        t0 = time.monotonic()
+        res = await asyncio.gather(*(
+            acall(port, "POST", "/sonic/station/start", {
+                "seed": {"kind": "track", "ids": [i]}, "count": 5})
+            for i in ("L35_0", "L36_0", "L37_0")))
+        took = time.monotonic() - t0
+        AM["slow"].clear()
+        if took > 13.5:
+            failures.append(f"three starts behind a slow AudioMuse took {took:.1f}s: the "
+                            "12 s budget must run from arrival, not from a computing slot")
+        late = [b for st_, b in res if st_ != 200 or b.get("partial")]
+        if not late:
+            failures.append(f"one of three slow starts should have run out of budget: "
+                            f"{[(st_, b.get('partial')) for st_, b in res]}")
 
         # ----- 8. a restart keeps the station and the history --------------- #
         # A fresh station from the same seed; play five of its tracks through, on a
