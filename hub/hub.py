@@ -1337,6 +1337,14 @@ for _alb in (("POST", "/lb/album/override"), ("POST", "/lb/album/cover"),
 _PATH_ARG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
+def _url_for_log(url: str) -> str:
+    """An upstream URL as a log line may show it: scheme, host and path, never the
+    query (B-136). The query is where the credentials go — `navidrome_password` on
+    the fingerprint route, Subsonic's `t`/`s` token pair on every Navidrome call —
+    and a timeout line used to print all of it."""
+    return url.split("?", 1)[0]
+
+
 def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
                              token: str, timeout: float,
                              label: str) -> tuple[int, bytes, str]:
@@ -1382,7 +1390,7 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
         reason = getattr(e, "reason", e)
         if (isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
                 or "timed out" in str(e).lower()):
-            log(f"{label} proxy: upstream timed out after {timeout}s: {url}")
+            log(f"{label} proxy: upstream timed out after {timeout}s: {_url_for_log(url)}")
             return (504, json.dumps({"error": f"{label} timed out", "busy": True}).encode(),
                     "application/json")
         log(f"{label} proxy: upstream failed:", e)
@@ -1666,7 +1674,8 @@ class HttpProxy:
         try:
             await asyncio.wait_for(sem.acquire(), timeout=queue_timeout)
         except asyncio.TimeoutError:
-            log(f"{self.label} proxy: no {pool} slot within {queue_timeout}s for {url}")
+            log(f"{self.label} proxy: no {pool} slot within {queue_timeout}s for "
+                f"{_url_for_log(url)}")
             return (503, json.dumps({"error": f"{self.label} proxy busy",
                                      "busy": True}).encode(), "application/json")
         try:
