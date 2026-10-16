@@ -171,14 +171,16 @@ FOLDED_ACTIONS = frozenset({"play", "pause", "playpause", "seek"})
 MIRROR_DEBOUNCE = 2.5  # seconds to coalesce rapid savePlayQueue mirror writes
 SAVED_QUEUES_MAX = 20  # rolling saved-queue history cap (matches both clients)
 # "Mixed for You" — persistent regenerating recipes (PROTOCOL §17). A saved queue
-# stores a RESULT; a mix stores a RECIPE, and the hub never generates anything from
-# it: each client regenerates locally with the engine it already has. That keeps
-# this process audio-free and AudioMuse-free, which is the standing rule.
+# stores a RESULT; a mix stores a RECIPE, and each client regenerates it with the
+# engine it has. Since §18 (2026-10-16) the hub has one: a `station` recipe, and on
+# a client with stations `similar`/`fingerprint`/`adaptive` too, play through a
+# station computed here. The hub still stores the recipe only, never its result.
 MIXES_MAX = 30  # cap, evicted by updatedAt exactly like saved queues
 # The generator each recipe names. A client that meets an unknown kind hides the
 # row rather than guessing, so this list is additive-only.
-MIX_KINDS = ("similar", "fingerprint", "adaptive", "genre", "artist")
-# AudioMuse's three Mood Flow characters. Only meaningful for `adaptive`.
+MIX_KINDS = ("similar", "fingerprint", "adaptive", "genre", "artist", "station")
+# AudioMuse's three Mood Flow characters, the legacy names of the station
+# characters (§17.1, §18): a mix carries `character` and this name beside it.
 MIX_MOODS = ("EchoMatch", "SteadyVibes", "TransitionMaestro")
 MIX_COUNT_MAX = 500  # a recipe asks for a queue, not a library dump
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
@@ -5460,9 +5462,17 @@ class Hub:
             v = _as_str(raw.get(k))
             if v:
                 rec[k] = v
+        # `character` (§18) is the station character; a record without one (a
+        # client from before stations) has it derived from `moodCharacter`, and a
+        # record with one has the legacy name written beside it, so that client
+        # still reads `moodCharacter`. When both arrive, `character` wins.
         mood = _as_str(raw.get("moodCharacter"), 32)
-        if mood in MIX_MOODS:
-            rec["moodCharacter"] = mood
+        character = _as_str(raw.get("character"), 16)
+        if character not in STATION_CHARACTERS:
+            character = STATION_FROM_LEGACY.get(mood) if mood in MIX_MOODS else None
+        if character:
+            rec["character"] = character
+            rec["moodCharacter"] = STATION_LEGACY[character]
         return rec
 
     def _mixes_list(self) -> list[dict]:

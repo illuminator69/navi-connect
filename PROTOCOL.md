@@ -2624,7 +2624,8 @@ track (empty for Your mix), `character` its character, and a play starts a stati
 (§18.1). `character` is accepted on every kind; when a record arrives without one the hub
 derives it from a legacy `moodCharacter` (EchoMatch → close, SteadyVibes → balanced,
 TransitionMaestro → explore), and it writes the legacy name beside a new `character`, so a client
-from before §18 still reads `moodCharacter`. Such a client hides `station` rows, as it hides any
+from before §18 still reads `moodCharacter`. When both arrive, `character` wins and `moodCharacter`
+is rewritten to match; an unknown `character` is dropped and derived again from `moodCharacter`. Such a client hides `station` rows, as it hides any
 kind it does not know. Without the engine a client plays `similar`, `fingerprint` and `adaptive`
 the old way; with it, `similar` is a track radio on Balanced and `fingerprint` / `adaptive` are
 Your mix.
