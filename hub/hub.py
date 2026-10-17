@@ -318,6 +318,9 @@ STATION_BUDGET_S = 12.0
 STATION_CALL_TIMEOUT = 8.0            # one AudioMuse or Navidrome call
 STATION_COMPUTING_MAX = 2             # stations computing at once
 STATION_CALLS_PER_REQUEST = 2         # upstream calls in flight for one request
+# The stations' own slots at AudioMuse, apart from SONIC's four: however busy the
+# stations are, an older client's /sonic/* call never queues behind them.
+STATION_UPSTREAM_INFLIGHT = 2
 STATION_PROBE_INTERVAL = 600.0        # the tiers are re-probed this often...
 STATION_PROBE_RETRY = 15.0            # ...and this long after a call failed
 STATION_PROBE_STARTUP_WAIT = 3.0      # a probe route waits this long for the first verdict
@@ -325,6 +328,10 @@ STATION_PROBE_STARTUP_WAIT = 3.0      # a probe route waits this long for the fi
 # seed), so a list is fetched once and walked by cursor: re-asking never yields new
 # rows. Cached in SONIC's cache for this long.
 STATION_LIST_TTL = 1800.0
+# Those lists are cached by the engine, parsed, and NOT in SONIC's shared cache,
+# which is bounded by entries rather than bytes (a 2000-row list is ~860 KB raw).
+# This bounds the rows held across every list.
+STATION_LIST_CACHE_ROWS = 20_000
 # The depths a nearest list is fetched at. A ceiling is rounded up to one of these,
 # so a station widening from 150 to 225 to 338 asks AudioMuse twice, not three times.
 # 2000 rows measured 810 KB on the live AudioMuse (2026-10-16), under PROXY_MAX_RESPONSE.
@@ -778,8 +785,9 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
 # The station engine's own way to AudioMuse (PROTOCOL §18). NOT routes: no client
 # can name one, because `HttpProxy.handle` looks a path up in SONIC_ROUTES and
 # nowhere else, and their route keys are not paths. They are called through
-# `SONIC.call`, so a station shares §14's four-slot pool, its cache and its
-# coalescing with every client request instead of opening a second way in.
+# `SONIC.call`, so a station uses §14's coalescing, cache and status handling
+# instead of opening a second way in — but in a pool of its own ("station",
+# STATION_UPSTREAM_INFLIGHT slots), so station load cannot starve older clients.
 #
 # `similar_tracks` with `radius_similarity=false&eliminate_duplicates=false` is a
 # nearest-first list with distances, and the same list every time for a seed
@@ -788,29 +796,33 @@ SONIC_ROUTES: dict[tuple[str, str], dict] = {
 # features come from; `/get_score` is its path on an AudioMuse older than B-137.
 SONIC_INTERNAL: dict[str, tuple[tuple[str, str], dict]] = {
     "similar_tracks": (("GET", "station:similar_tracks"), {
+        # Not cached here: the engine keeps the parsed rows (STATION_LIST_CACHE_ROWS).
+        # Still coalesced, so two stations on one anchor cost one call.
         "method": "GET", "path": "/api/similar_tracks",
         "params": ("item_id", "n", "eliminate_duplicates", "radius_similarity",
                    "mood_similarity"),
-        "cache": True, "ttl": STATION_LIST_TTL, "timeout": STATION_CALL_TIMEOUT,
+        "cache": False, "timeout": STATION_CALL_TIMEOUT, "pool": "station",
     }),
     "alchemy": (("POST", "station:alchemy"), {
         "method": "POST", "path": "/api/alchemy",
         "body": ("items", "n", "temperature", "subtract_distance"),
-        "cache": False, "timeout": STATION_CALL_TIMEOUT,
+        "cache": False, "timeout": STATION_CALL_TIMEOUT, "pool": "station",
     }),
     "fingerprint": (("GET", "station:fingerprint"), {
         "method": "GET", "path": "/api/sonic_fingerprint/generate",
         "params": ("n",), "nd": True, "cache": True, "timeout": STATION_CALL_TIMEOUT,
+        "pool": "station",
     }),
     "similar_artists": (("GET", "station:similar_artists"), {
         "method": "GET", "path": "/api/similar_artists",
         "params": ("artist", "artist_id", "n", "include_component_matches"),
         "cache": True, "ttl": STATION_LIST_TTL, "timeout": STATION_CALL_TIMEOUT,
+        "pool": "station",
     }),
     "score": (("GET", "station:score"), {
         "method": "GET", "path": "/external/get_score", "fallback": "/get_score",
         "params": ("id",), "cache": True, "ttl": PROXY_CACHE_TTL_LONG,
-        "timeout": STATION_CALL_TIMEOUT,
+        "timeout": STATION_CALL_TIMEOUT, "pool": "station",
     }),
 }
 
@@ -1917,6 +1929,11 @@ class SonicProxy(HttpProxy):
     prefix = "/sonic"
     label = "audiomuse"
     routes = SONIC_ROUTES
+
+    def __init__(self) -> None:
+        super().__init__()
+        # The station engine's calls (SONIC_INTERNAL), kept off the default pool.
+        self._pools["station"] = asyncio.Semaphore(STATION_UPSTREAM_INFLIGHT)
 
     @property
     def upstream(self) -> str:
@@ -3117,10 +3134,43 @@ class StationEngine:
             return None
         return task.result()
 
+    @staticmethod
+    def _tier2_verdict(status: int, raw: bytes) -> Optional[bool]:
+        """What one AudioMuse answer says about AudioMuse: True reachable, False
+        not, None nothing.
+
+        - None: no answer at all (status 0, the request's budget ran out first), or
+          the hub's OWN 503 `busy` — no slot free in the station pool. That is this
+          hub being busy, a failed source for one request, and says nothing about
+          AudioMuse: read as "unreachable" it sent every station to Tier 1.
+        - False: the hub could not reach it (502 `down`), or it did not answer in
+          time (504 `busy`, a timed-out call); or it refused the hub's token (401,
+          403), which no retry mends.
+        - True: anything else, a 500 from AudioMuse included: AudioMuse answering,
+          about one route.
+        """
+        if status == 0:
+            return None
+        try:
+            own = json.loads(raw or b"{}")
+        except Exception:  # noqa: BLE001
+            own = {}
+        own = own if isinstance(own, dict) else {}
+        if status == 503 and own.get("busy"):
+            return None
+        if status in (502, 504) and (own.get("down") or own.get("busy")):
+            return False
+        if status in (401, 403):
+            return False
+        return True
+
     async def _am(self, name: str, params: Optional[dict], body: Optional[dict],
                   b: Optional[_StationBatch]) -> tuple[int, Any]:
         """One AudioMuse call through SONIC. Returns (status, parsed JSON or None);
-        status 0 = the budget ran out first."""
+        status 0 = the budget ran out first. Anything but a 200 whose body parses
+        is a failed source for the batch; whether it also says AudioMuse is
+        unreachable is `_tier2_verdict`'s question. A 404 is an answer (the item is
+        not in AudioMuse's index), and the callers that expect one clear it."""
         route, spec = SONIC_INTERNAL[name]
         query = urllib.parse.urlencode(params or {})
         plist = HttpProxy._filtered_params(spec, query)  # adds the nd creds where the spec says
@@ -3129,28 +3179,26 @@ class StationEngine:
         if result is None:
             return 0, None
         status, raw, _ctype = result
-        if status >= 500:
-            # A failed source either way. Only the hub's own "could not reach it"
-            # (502 down, 503/504 busy) says AudioMuse is unavailable; a 500 from
-            # AudioMuse itself is AudioMuse answering, about one route.
-            if b is not None:
-                b.failed = True
+        verdict = self._tier2_verdict(status, raw)
+        if status in (401, 403):
+            if not self._auth_logged:
+                # Once per spell, and never the token itself.
+                self._auth_logged = True
+                log(f"station: AudioMuse refused the hub's AUDIOMUSE_TOKEN ({status}); "
+                    "stations use Tier 1 (Navidrome) until it is accepted")
+        elif verdict:
+            self._auth_logged = False
+        if verdict is not None:
+            self._note_tier2(verdict)
+        data = None
+        if status == 200:
             try:
-                own = json.loads(raw or b"{}")
-            except Exception:  # noqa: BLE001
-                own = {}
-            self._note_tier2(not (isinstance(own, dict)
-                                  and (own.get("down") or own.get("busy"))))
-            return status, None
-        self._note_tier2(True)
-        if status != 200:
-            return status, None
-        try:
-            return status, json.loads(raw or b"null")
-        except Exception:  # noqa: BLE001 — a body that is not JSON is a failed source
-            if b is not None:
-                b.failed = True
-            return 502, None
+                data = json.loads(raw or b"null")
+            except Exception:  # noqa: BLE001 — a body that is not JSON is a failed source
+                status = 502
+        if status != 200 and status != 404 and b is not None:
+            b.failed = True
+        return status, data
 
     async def _nd(self, method: str, params: dict,
                   b: Optional[_StationBatch]) -> tuple[str, Optional[dict]]:
@@ -3197,11 +3245,12 @@ class StationEngine:
             self._probe_at = time.monotonic()
             if self.tier2_configured():
                 # An id AudioMuse cannot hold: answered 404 at once, and on a route
-                # with no 404 fallback, so one probe is one call.
-                status, _ = await self._am("similar_tracks", {
+                # with no 404 fallback, so one probe is one call. Its verdict is
+                # `_am`'s, like any call's: a 500 is AudioMuse answering, a refused
+                # connection or a timeout is not, and that schedules the re-probe.
+                await self._am("similar_tracks", {
                     "item_id": "station-probe", "n": 1, "radius_similarity": "false",
                     "eliminate_duplicates": "false"}, None, None)
-                self.tier2_ok = 0 < status < 500
             if self.tier1_configured():
                 outcome, payload = await self._nd("getOpenSubsonicExtensions", {}, None)
                 self.tier1_ok = outcome == "ok"
@@ -3221,35 +3270,62 @@ class StationEngine:
             await asyncio.sleep(STATION_PROBE_INTERVAL)
 
     # ----- the lists -------------------------------------------------------- #
+    def _list_cached(self, item_id: str, depth: int) -> Optional[list]:
+        now = time.monotonic()
+        for d in STATION_LIST_DEPTHS:          # this depth, or a deeper list's prefix
+            if d < depth:
+                continue
+            hit = self._lists.get((item_id, d))
+            if hit is not None and hit[0] > now:
+                return hit[1][:depth]
+        return None
+
+    def _list_put(self, item_id: str, depth: int, rows: list) -> None:
+        now = time.monotonic()
+        for k in [k for k, v in self._lists.items() if v[0] <= now]:
+            del self._lists[k]
+        total = sum(len(v[1]) for v in self._lists.values())
+        for k in sorted(self._lists, key=lambda k: self._lists[k][0]):
+            if total + len(rows) <= STATION_LIST_CACHE_ROWS:
+                break
+            total -= len(self._lists.pop(k)[1])
+        self._lists[(item_id, depth)] = (now + STATION_LIST_TTL, rows)
+
     async def _nearest(self, item_id: str, depth: int, b: _StationBatch) -> Optional[list]:
         """An item's nearest list at `depth`: rows nearest first. None = the call
-        failed; [] = AudioMuse holds no such item (or has nothing near it)."""
+        failed (and the batch is partial); [] = AudioMuse holds no such item, or has
+        nothing near it, which is what makes a seed unknown."""
         for (iid, d), rows in b.lists.items():   # a deeper list already in hand
             if iid == item_id and d >= depth and rows is not None:
                 return rows[:depth]
         key = (item_id, depth)
         if key in b.lists:
             return b.lists[key]
-        status, data = await self._am("similar_tracks", {
-            "item_id": item_id, "n": depth, "radius_similarity": "false",
-            "eliminate_duplicates": "false"}, None, b)
-        rows: Optional[list]
-        if status == 200 and isinstance(data, list):
-            rows = [r for r in (_station_row(x) for x in data) if r is not None]
-            b.found.add(item_id)
-        elif status in (400, 404):
-            rows = []
-            b.unknown.add(item_id)
-        else:
-            rows = None
+        rows: Optional[list] = self._list_cached(item_id, depth)
+        if rows is None:
+            status, data = await self._am("similar_tracks", {
+                "item_id": item_id, "n": depth, "radius_similarity": "false",
+                "eliminate_duplicates": "false"}, None, b)
+            if status == 200 and isinstance(data, list):
+                rows = [r for r in (_station_row(x) for x in data) if r is not None]
+                self._list_put(item_id, depth, rows)
+            elif status == 404:
+                rows = []
+            else:
+                b.failed = True   # 401, 429, a 200 that is not a list, a 5xx, a timeout
+        if rows is not None:
+            (b.found if rows else b.unknown).add(item_id)
         b.lists[key] = rows
         return rows
 
     async def _tier1_list(self, item_id: str, n: int, b: _StationBatch) -> Optional[list]:
+        """Navidrome's similar songs for an item, asked once at STATION_TIER1_MAX and
+        cut to `n` for each rung, so the ladder never asks again for a longer list."""
         n = max(1, min(n, STATION_TIER1_MAX))
-        key = (item_id, n)
+        key = (item_id, STATION_TIER1_MAX)
         if key in b.t1_lists:
-            return b.t1_lists[key]
+            rows = b.t1_lists[key]
+            return rows[:n] if rows is not None else None
         if self.sonic is None:
             outcome, payload = await self._nd("getOpenSubsonicExtensions", {}, b)
             if outcome == "ok":
@@ -3257,34 +3333,38 @@ class StationEngine:
                     e.get("name") for e in payload.get("openSubsonicExtensions") or []
                     if isinstance(e, dict)]
         method = "getSonicSimilarTracks" if self.sonic else "getSimilarSongs2"
-        ck = (method, item_id, n)
+        ck = (method, item_id)
         hit = self._t1_cache.get(ck)
-        if hit is not None and hit[0] > time.monotonic():
-            b.t1_lists[key] = hit[1]
-            b.found.add(item_id)
-            return hit[1]
-        outcome, payload = await self._nd(method, {"id": item_id, "count": n}, b)
         rows: Optional[list]
-        if outcome == "ok":
-            if self.sonic:
-                entries = [m.get("entry") for m in payload.get("sonicMatch") or []
-                           if isinstance(m, dict)]
-            else:
-                entries = (payload.get("similarSongs2") or {}).get("song") or []
-            rows = [r for r in (_station_row(x) for x in entries) if r is not None]
-            b.found.add(item_id)
-            if len(self._t1_cache) >= 64:
-                for old in sorted(self._t1_cache, key=lambda k: self._t1_cache[k][0])[:16]:
-                    del self._t1_cache[old]
-            self._t1_cache[ck] = (time.monotonic() + STATION_LIST_TTL, rows)
-        elif outcome == "missing":
-            rows = []
-            b.unknown.add(item_id)
+        if hit is not None and hit[0] > time.monotonic():
+            rows = hit[1]
         else:
-            rows = None
-            b.tier1_failed = True
+            outcome, payload = await self._nd(method, {"id": item_id,
+                                                       "count": STATION_TIER1_MAX}, b)
+            if outcome == "ok":
+                if self.sonic:
+                    entries = [m.get("entry") for m in payload.get("sonicMatch") or []
+                               if isinstance(m, dict)]
+                else:
+                    entries = (payload.get("similarSongs2") or {}).get("song") or []
+                rows = [r for r in (_station_row(x) for x in entries if isinstance(x, dict))
+                        if r is not None]
+                if len(self._t1_cache) >= 64:
+                    for old in sorted(self._t1_cache,
+                                      key=lambda k: self._t1_cache[k][0])[:16]:
+                        del self._t1_cache[old]
+                self._t1_cache[ck] = (time.monotonic() + STATION_LIST_TTL, rows)
+            elif outcome == "missing":
+                rows = []
+            else:
+                rows = None
+                b.tier1_failed = True
+        if rows is not None:
+            # An empty answer is "no neighbours": with AudioMuse's 404 it makes a
+            # seed unknown, so the client falls back instead of an empty station.
+            (b.found if rows else b.unknown).add(item_id)
         b.t1_lists[key] = rows
-        return rows
+        return rows[:n] if rows is not None else None
 
     async def _gather(self, coros: list) -> list:
         """Run calls together; each already takes a slot of the request's two."""
@@ -3406,6 +3486,8 @@ class StationEngine:
             "items": adds + subs, "n": STATION_ALCHEMY_N,
             "temperature": tune.temperature}, b)
         rows = (data or {}).get("results") if isinstance(data, dict) else None
+        if status != 200 or not isinstance(rows, list):
+            b.failed = True   # alchemy answers every add set; anything else failed
         return [r for r in (_station_row(x) for x in rows or []) if r is not None]
 
     async def _similar_artist_ids(self, st: Station, b: _StationBatch) -> list:
@@ -3419,6 +3501,8 @@ class StationEngine:
             status, data = await self._am("similar_artists", {
                 "artist": name, "n": STATION_SIMILAR_ARTISTS_N,
                 "include_component_matches": "true"}, None, b)
+            if status == 200 and not isinstance(data, list):
+                b.failed = True
             for a in data if isinstance(data, list) else []:
                 for cm in (a.get("component_matches") or []) if isinstance(a, dict) else []:
                     for song in (cm.get("artist2_representative_songs") or []) \
@@ -3603,6 +3687,9 @@ class StationEngine:
         b.trail = trail
         b.prev = prev
         b.levels_done = li >= len(levels)
+        if len(picked) < count and not b.levels_done and b.left() <= 0:
+            # The ladder stopped for the budget, not for want of tracks.
+            b.timed_out = True
         return out
 
     def _bound_queue_ids(self, st: Station) -> set:
@@ -3733,7 +3820,9 @@ class StationEngine:
             return "unavailable", []
         status, data = await self._am("fingerprint", {"n": STATION_FINGERPRINT_N}, None, b)
         if status != 200 or not isinstance(data, list):
-            return ("unavailable" if status == 0 or status >= 500 else "empty"), []
+            # Only "AudioMuse has nothing for this user" is an answer; a refused
+            # token, a timeout or a 5xx means Your mix cannot be computed now.
+            return ("empty" if status == 404 else "unavailable"), []
         rows = [r for r in (_station_row(x) for x in data) if r is not None]
         top = [r for r in rows if r["dist"] is not None and r["dist"] <= 1e-9]
         top = (top or rows[:3])[:STATION_MIX_ANCHORS]
