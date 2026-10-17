@@ -48,8 +48,9 @@ when a "Mixed for You" recipe or a saved-queue deletion changes — the two thin
 client can send again. If `state.json` is empty or missing at start, the backup is
 loaded instead. If it cannot be parsed it is first renamed to
 `state.json.corrupt-<UTC timestamp>` and left for you to inspect; nothing reads or
-removes those. `state.json.history` is the stations' play history: ids, times and a
-hashed title key, no song names. To reset the hub, delete all of them, not
+removes those. `state.json.history` is the stations' play history (ids, times and a
+hashed title key, no song names) and `state.json.stations` the stations themselves,
+each written at most every 30 s. To reset the hub, delete all of them, not
 `state.json` alone.
 
 ### AudioMuse Tier-2 proxy (`/sonic/*`)

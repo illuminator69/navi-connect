@@ -2761,7 +2761,8 @@ Answers:
 - `rank` is the track's place in the nearest list of the anchor that admitted it.
 - Refusals:
   - `400 {code: "bad_seed" | "bad_character"}`.
-  - `404 {code: "seed_unknown"}`: AudioMuse holds no seed track.
+  - `404 {code: "seed_unknown"}`: no tier knows a seed track or has anything near it: AudioMuse
+    answers 404 (or an empty list) for every seed and Navidrome has no similar songs for it.
   - `503 {fallback: true}`: no tier is usable. Also Your mix on a hub whose AudioMuse is unset
     or down: the fingerprint has no Tier 1 equivalent.
   - `409 {code: "session_bound", stationId}`: `bindSession` was asked and the session already has
@@ -2854,6 +2855,13 @@ the index already carries the new track's position.
 So starting a new queue is never a skip. A `setQueue` or `clear` still enters the track it leaves
 in the play history when that counts as a play (§18.4); it steers nothing.
 
+- Only a session that was **playing on an active device** is judged at all. A `next` pressed on
+  a paused or restored session carries a position nobody was listening at.
+- A queue position is judged once: a skip or a play-through of the same `savedQueueId` and index
+  steers the station once, so an index flipping back and forth (a stale report after the grace
+  window) counts once. Signals are idempotent the same way: a retried `skip`, `played` or
+  `dislike` for one track counts once.
+
 **Per character.** `AUDIT-…` §"Phase 0 results" has the measurements behind these values. The
 hub lane measured them again on the live library (2026-10-16, six seeds × three characters × 65
 tracks, and 230 on Close): no repeats, no hip-hop-led track on the Lana Del Rey seed on any
@@ -2894,10 +2902,18 @@ all of those **answered** and the batch is still empty is it `exhausted`. A sour
   Close and Balanced every source is gated to the anchors' own lists, so those two rungs could only
   offer what the lists already hold, and they add no step of their own.
 - Tier 1's rows carry no features, so its gate is the rank in Navidrome's own answer alone, and its
-  tracks are answered `why: "tier1"`.
+  tracks are answered `why: "tier1"`. Navidrome is asked once per anchor, at 500, and each rung
+  cuts that list.
+- Any source that does not answer (a 5xx, a 429, a refused token, a body that is not a list, a
+  timeout) makes the batch `partial`. A batch the 12 s budget stopped is `partial` too.
 - An AudioMuse the hub could not reach on its last call is skipped: batches go straight to Tier 1,
-  `partial`, until the re-probe (15 s after the failure, and every 10 min) finds it again. A 500
-  from AudioMuse is a failed source but not an unreachable one.
+  `partial`, until the re-probe (15 s after the failure, and every 10 min) finds it again.
+  "Could not reach" is a refused connection, a timed-out call, or a 401/403 (the hub's
+  `AUDIOMUSE_TOKEN` is wrong, logged once, without the token). A 500 from AudioMuse is a failed
+  source but not an unreachable one, and the hub's own "no slot free" is neither: it fails one
+  request only.
+- The stations call AudioMuse through §14's proxy but in a pool of their own (2 slots), so station
+  load never makes an older client's `/sonic/*` call wait.
 
 **Your mix** takes its anchors from AudioMuse's Sonic Fingerprint of the hub's Navidrome user
 (`HUB_ND_USER`, `n=100`): its first rows, at distance 0, are that user's own most-played tracks,
@@ -2908,14 +2924,18 @@ for a radio. It is that user's mix, whoever asks.
 ### 18.4 State, history, limits
 
 - **Stations:** at most 8 (the least recently used is dropped, never the one the session is bound
-  to), each expiring after 24 h unused, kept in `state.json["stations"]` so a restart keeps them.
-  A queue bound to a station that is dropped is unbound (`session.stationId` → `null`).
+  to), each expiring after 24 h unused, kept in a file of their own beside `state.json`
+  (`<state>.stations`, written at most every 30 s and on a graceful stop) so a restart keeps them.
+  `state.json` is rewritten on every session broadcast and no longer carries them. A queue bound
+  to a station that is dropped is unbound (`session.stationId` → `null`).
 - **Play history:** the last 2,000 plays from the last 14 days, in its own file beside
   `state.json` (`<state>.history`), written at most every 30 s and on a graceful stop. Each play is
   an id, a time and a hashed title key (8 bytes of BLAKE2b over the normalised title and primary
   artist), so the file holds no song names. Fed by every track of the session (a play is ≥50% or
   ≥4 min, or a play-through), and by `played` signals; the same id again within 30 min is the same
   play. Never in `health`, `welcome` or a log line. `HUB_STATION_HISTORY=0` keeps it in memory only.
+  An entry that is not a finite time, a song-shaped id and a hex key is dropped on reading; a
+  bad file never stops the hub.
 - **Limits:**
   - A request has 12 s from its arrival; what is found by then is answered with
     `partial: true`.
