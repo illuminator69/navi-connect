@@ -259,7 +259,8 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 # Fake Navidrome
 # --------------------------------------------------------------------------- #
-ND = {"methods": {}, "calls": [], "sonic": True, "lock": threading.Lock()}
+ND = {"methods": {}, "calls": [], "sonic": True, "slow_song": 0.0,
+      "lock": threading.Lock()}
 # Known to Navidrome, unknown to AudioMuse, and with no similar songs at all.
 ND_ONLY = {"ND_EMPTY_1": {"id": "ND_EMPTY_1", "title": "Lonely", "artist": "Nobody",
                           "album": "None", "duration": 200, "genre": "x"}}
@@ -267,7 +268,8 @@ ND_ONLY = {"ND_EMPTY_1": {"id": "ND_EMPTY_1", "title": "Lonely", "artist": "Nobo
 
 def _song(t):
     return {"id": t["id"], "title": t["title"], "artist": t["artist"],
-            "album": t["album"], "duration": t["duration"], "genre": t["genre"],
+            "album": t["album"], "albumId": "al-" + t["album"].replace(" ", "-"),
+            "coverArt": "mf-" + t["id"], "duration": t["duration"], "genre": t["genre"],
             "path": f"/music/{t['artist']}/{t['title']}.flac"}
 
 
@@ -310,6 +312,8 @@ class Navidrome(http.server.BaseHTTPRequestHandler):
                 ext.append({"name": "sonicSimilarity", "versions": [1]})
             return self._send({"openSubsonicExtensions": ext})
         tid = q.get("id", "")
+        if method == "getSong" and ND["slow_song"]:
+            time.sleep(ND["slow_song"])
         if tid in ND_ONLY:
             if method == "getSong":
                 return self._send({"song": ND_ONLY[tid]})
