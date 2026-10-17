@@ -2612,6 +2612,10 @@ class Station:
     artist_skips: dict = field(default_factory=dict)  # artist key -> [at, ...]
     cooldown: dict = field(default_factory=dict)    # artist key -> until (ms)
     cursors: dict = field(default_factory=dict)     # anchor id -> rows walked past
+    # The occurrences already counted as a skip or a play-through, so a retried
+    # signal or an index flipping back and forth counts once: "q:<savedQueueId>:
+    # <index>:<id>" for the session's, "<kind>:<id>" for a signal's.
+    judged: list = field(default_factory=list)
     batches: int = 0
     last_batch: Optional[dict] = None               # {device, after, tracks}
     # runtime only
@@ -2672,7 +2676,8 @@ class Station:
             "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
             "trail": self.trail, "lastFeats": self.last_feats, "played": self.played,
             "skips": self.skips, "artistSkips": self.artist_skips,
-            "cooldown": self.cooldown, "cursors": self.cursors, "batches": self.batches,
+            "cooldown": self.cooldown, "cursors": self.cursors, "judged": self.judged,
+            "batches": self.batches,
             "lastBatch": self.last_batch,
         }
 
@@ -2730,11 +2735,12 @@ class Station:
             played=strs(d.get("played"), 20),
             skips=[s for s in (d.get("skips") or []) if isinstance(s, list) and len(s) == 2
                    and isinstance(s[0], str)][-40:],
-            artist_skips={k: [int(t) for t in v if isinstance(t, (int, float))]
+            artist_skips={k: [_as_int(t) for t in v if isinstance(t, (int, float))]
                           for k, v in (d.get("artistSkips") or {}).items()
                           if isinstance(k, str) and isinstance(v, list)},
-            cooldown={k: int(v) for k, v in (d.get("cooldown") or {}).items()
+            cooldown={k: _as_int(v) for k, v in (d.get("cooldown") or {}).items()
                       if isinstance(k, str) and isinstance(v, (int, float))},
+            judged=[k for k in (d.get("judged") or []) if isinstance(k, str)][-400:],
             cursors={k: _as_int(v, 0, 0) for k, v in (d.get("cursors") or {}).items()
                      if isinstance(k, str)},
             batches=_as_int(d.get("batches"), 0, 0), last_batch=last,
@@ -4024,24 +4030,36 @@ class StationEngine:
         elif kind == "dislike":
             if tid in st.likes:
                 st.likes.remove(tid)
-            self._skip(st, tid, weight=STATION_TUNING[st.character].skips_to_cool)
-            changed = True
+                changed = True
+            if self._judge(st, f"dislike:{tid}"):
+                self._skip(st, tid, weight=STATION_TUNING[st.character].skips_to_cool)
+                changed = True
         elif kind == "skip":
-            self._skip(st, tid)
-            changed = True
+            if self._judge(st, f"skip:{tid}"):
+                self._skip(st, tid)
+                changed = True
         elif kind == "played":
-            self._played(st, tid)
-            key = st.track_key(tid)
-            self._history_add(tid, key)
-            changed = True
+            if self._judge(st, f"played:{tid}"):
+                self._played(st, tid)
+                self._history_add(tid, st.track_key(tid))
+                changed = True
         if changed:
             self._bump(st)
             self._changed(st)
         return 200, {"rev": st.rev, "applied": True}
 
     def _changed(self, st: Station) -> None:
-        self.hub._save()  # noqa: SLF001 — same module
+        self._stations_touch()
         self.hub._spawn(self._announce(st))  # noqa: SLF001 — same module
+
+    @staticmethod
+    def _judge(st: Station, key: str) -> bool:
+        """Record that occurrence `key` was counted; False if it already was."""
+        if key in st.judged:
+            return False
+        st.judged.append(key)
+        st.judged = st.judged[-400:]
+        return True
 
     def _skip(self, st: Station, tid: str, weight: int = 1) -> None:
         now = _now_ms()
@@ -4066,15 +4084,16 @@ class StationEngine:
 
     # ----- the session's half (§18.3) ---------------------------------------- #
     def departure(self, track: Any, verdict: Optional[str], is_play: bool,
-                  steer: bool) -> None:
+                  steer: bool, occurrence: str = "") -> None:
         """The hub judged the track the session just left. Every play feeds the
         history; a skip or a play-through steers the bound station, when it is a
-        track that station served or seeded."""
+        track that station served or seeded, once per `occurrence` (the queue
+        position it was judged at)."""
         if not isinstance(track, dict):
             return
         tid = track.get("id")
-        if not isinstance(tid, str) or not tid:
-            return
+        if not isinstance(tid, str) or not _STATION_ID_RE.match(tid):
+            return   # a queue track is whatever a client sent; only song ids go on
         if is_play:
             self._history_add(tid, _station_title_key(track.get("title"),
                                                       track.get("artist")))
@@ -4083,6 +4102,8 @@ class StationEngine:
         st = self.bound()
         if st is None or not st.knows(tid):
             return
+        if not self._judge(st, f"q:{occurrence}:{tid}"):
+            return   # the same position again: an index that flipped back and forth
         if verdict == "played":
             self._played(st, tid)
         else:
@@ -4602,7 +4623,8 @@ class Hub:
         return order[0] if self.session.repeat == "all" and order else None
 
     def _judge_departure(self, left: int, new: Optional[int], pos_ms: int, *,
-                         ended: bool = False, steer: bool = True) -> None:
+                         ended: bool = False, steer: bool = True,
+                         playing: Optional[bool] = None) -> None:
         """Judge the track at `left`, which playback is leaving (PROTOCOL §18.3).
 
         `pos_ms` is where it was left: for a report, the position of the report
@@ -4613,9 +4635,16 @@ class Hub:
         40 %). Anything else is neither: a backward or non-adjacent move at a
         position that is not a play-through. `steer=False` (a setQueue or clear)
         feeds the play history only, so a new queue is never a skip.
+
+        Only a session that was PLAYING on an active device is judged (`playing`:
+        the play state before the report being read). A `next` pressed on a paused
+        or restored session carries a position nobody is listening at, and read as
+        a skip it cooled an artist the user never heard.
         """
         s = self.session
         if not 0 <= left < len(s.queue) or not isinstance(s.queue[left], dict):
+            return
+        if s.active_device_id is None or not (s.is_playing if playing is None else playing):
             return
         if not ended:
             self._ended_judged = None
@@ -4635,7 +4664,8 @@ class Hub:
              f"at {pos}/{dur} ms{' (ended)' if ended else ''}"
              f"{'' if steer else ' (history only)'}")
         try:
-            self.stations.departure(track, verdict, is_play, steer)
+            self.stations.departure(track, verdict, is_play, steer,
+                                    occurrence=f"{s.saved_queue_id}:{left}")
         except Exception as e:  # noqa: BLE001 — steering must never break playback
             log("station departure failed:", e)
 
@@ -6187,9 +6217,11 @@ class Hub:
             # without the cap until `applied` reaches `need`.
         changed = False
         now = time.monotonic()
-        # Where the track was before this report: a report that moves the index
-        # already carries the NEW track's position (PROTOCOL §18.3).
+        # Where the track was before this report, and whether it was playing: a
+        # report that moves the index already carries the NEW track's position, and
+        # the one that says `ended` also says it stopped (PROTOCOL §18.3).
         left_at = s.position_ms
+        was_playing = s.is_playing
         if "positionMs" in msg:
             # Right after a seek/jump/skip the receiver may still emit an in-flight
             # 1 Hz report carrying the OLD position, which would rewind the scrubber.
@@ -6227,7 +6259,7 @@ class Hub:
                     dlog(f"REPORT idx={idx} from {who} "
                          f"IGNORED(index-grace; session is at {s.index})")
                 else:
-                    self._judge_departure(s.index, idx, left_at)
+                    self._judge_departure(s.index, idx, left_at, playing=was_playing)
                     s.index = idx; changed = True
         if "isPlaying" in msg and msg["isPlaying"] != s.is_playing:
             playing = bool(msg["isPlaying"])
@@ -6257,7 +6289,8 @@ class Hub:
             # once per position, however many reports repeat the flag.
             mark = (s.saved_queue_id, s.index)
             if self._ended_judged != mark:
-                self._judge_departure(s.index, None, s.position_ms, ended=True)
+                self._judge_departure(s.index, None, s.position_ms, ended=True,
+                                      playing=was_playing)
                 self._ended_judged = mark
             self.session.is_playing = False
             changed = True
