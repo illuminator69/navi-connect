@@ -135,8 +135,9 @@ async def session_suite(failures, log_path):
         await settle()
         if not any(f.get("stationId") == sid and f.get("seq") == 14
                    and f.get("name") == "Indie Song 12-0 radio" and f.get("origin") == "radio"
+                   and (f.get("seed") or {}).get("ids") == [seed]
                    for f in c.station_frames):
-            failures.append(f"no station frame (with name and origin) after start: "
+            failures.append(f"no station frame (with name, origin and seed) after start: "
                             f"{c.station_frames}")
         queue = [{"id": seed, "title": LIB[seed]["title"], "artist": LIB[seed]["artist"],
                   "durationMs": DUR}] + [

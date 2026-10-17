@@ -2839,9 +2839,11 @@ Answers `{rev, applied, ignored?}`.
   played through>}` and `bindSession`. The queue then continues as that station.
 
 `{ "t": "station", "stationId": "st_…", "seq": 25, "rev": 2, "character": "balanced",
-"exhausted": false, "stopped": false, "name": "Cinnamon Girl radio", "origin": "radio" }` is
+"exhausted": false, "stopped": false, "name": "Cinnamon Girl radio", "origin": "radio",
+"seed": { "kind": "track", "ids": ["…"], "name": "Cinnamon Girl" } }` is
 broadcast to every client whenever a station's `seq`, `rev`, `character`, `exhausted` or
-`stopped` changes. A `start` that binds the session sends this frame **before** the `session`
+`stopped` changes. It carries the seed so a device that adopted the station from the session can
+start it again as itself if the hub loses it (a 404 on `next`). A `start` that binds the session sends this frame **before** the `session`
 frame whose `stationId` names it, so no client meets a bound station it has no frame for. `name` and `origin`
 never change; they are there so a device that learns of a station only from a frame can label it. That is how a second device learns `after`. Only a hub with
 `"station"` in `welcome.features` sends it.

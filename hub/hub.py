@@ -2667,7 +2667,11 @@ class Station:
     def frame(self) -> dict:
         return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
                 "character": self.character, "exhausted": self.exhausted,
-                "stopped": self.stopped, "name": self.name, "origin": self.origin}
+                "stopped": self.stopped, "name": self.name, "origin": self.origin,
+                # The seed too (≤5 ids and a name), so a device that adopted this
+                # station from the session can start it again as itself if the hub
+                # loses it (B-139), not as a new continuation of whatever plays.
+                "seed": self.seed}
 
     def to_state(self) -> dict:
         return {
