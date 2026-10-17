@@ -3587,16 +3587,17 @@ class StationEngine:
         if kind not in ("track", "tracks"):
             return None
         ids = raw.get("ids")
-        if not isinstance(ids, list):
+        cap = 1 if kind == "track" else STATION_SEEDS_MAX
+        # The length first, before any per-id work: a 256 KB body of short ids
+        # checked one by one held the event loop for seconds.
+        if not isinstance(ids, list) or not 0 < len(ids) <= cap:
             return None
-        clean = []
+        clean: list[str] = []
         for i in ids:
             if not isinstance(i, str) or not _STATION_ID_RE.match(i):
                 return None
-            if i not in clean:
+            if i not in clean:          # at most STATION_SEEDS_MAX long
                 clean.append(i)
-        if not clean or len(clean) > (1 if kind == "track" else STATION_SEEDS_MAX):
-            return None
         seed = {"kind": kind, "ids": clean}
         name = _as_str(raw.get("name"), 200)
         if name and name.strip():
@@ -3605,9 +3606,10 @@ class StationEngine:
 
     @staticmethod
     def _parse_exclude(raw: Any) -> set:
+        """Up to STATION_EXCLUDE_MAX ids, cut before any per-id work."""
         if not isinstance(raw, list):
             return set()
-        return {i for i in raw[:STATION_EXCLUDE_MAX] if isinstance(i, str)}
+        return {i for i in raw[:STATION_EXCLUDE_MAX] if isinstance(i, str) and len(i) <= 128}
 
     async def _seed_meta(self, ids: list, b: _StationBatch) -> list[dict]:
         """Each seed's own row, for its title key, its artist and its features."""
