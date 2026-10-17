@@ -2452,7 +2452,7 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
 }
 
 _STATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-_STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character")
+_STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character", "stop")
 # Why a station was started (§18.1): "radio" — the user asked for it, and it keeps
 # going with autoplay off — or "continue" — autoplay continued a queue, and it stops
 # when autoplay is turned off. Anything else is "radio".
@@ -2598,6 +2598,9 @@ class Station:
     seq: int = 0                     # tracks served, ever
     rev: int = 0                     # moved by every signal and character change
     exhausted: bool = False
+    # Autoplay turned Off, on any device (§18.1 `stop`): `next` serves nothing until
+    # a `character` signal starts it again. Shared, because the station is.
+    stopped: bool = False
     seed_ids: list = field(default_factory=list)    # never served
     # The anchors' own rows: a seed's (from AudioMuse's score or Navidrome's
     # getSong), or for Your mix the fingerprint's top rows, which ARE servable.
@@ -2664,7 +2667,7 @@ class Station:
     def frame(self) -> dict:
         return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
                 "character": self.character, "exhausted": self.exhausted,
-                "name": self.name, "origin": self.origin}
+                "stopped": self.stopped, "name": self.name, "origin": self.origin}
 
     def to_state(self) -> dict:
         return {
@@ -2672,7 +2675,8 @@ class Station:
             "character": self.character, "createdAt": self.created_at,
             "usedAt": self.used_at, "engine": self.engine, "origin": self.origin,
             "seq": self.seq,
-            "rev": self.rev, "exhausted": self.exhausted, "seedIds": self.seed_ids,
+            "rev": self.rev, "exhausted": self.exhausted, "stopped": self.stopped,
+            "seedIds": self.seed_ids,
             "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
             "trail": self.trail, "lastFeats": self.last_feats, "played": self.played,
             "skips": self.skips, "artistSkips": self.artist_skips,
@@ -2726,7 +2730,7 @@ class Station:
             engine="tier1" if d.get("engine") == "tier1" else "tier2",
             origin="continue" if d.get("origin") == "continue" else "radio",
             seq=_as_int(d.get("seq"), 0, 0), rev=_as_int(d.get("rev"), 0, 0),
-            exhausted=bool(d.get("exhausted")),
+            exhausted=bool(d.get("exhausted")), stopped=d.get("stopped") is True,
             seed_ids=strs(d.get("seedIds"), STATION_SEEDS_MAX), anchor_meta=meta,
             likes=strs(d.get("likes"), 50), served=served[-STATION_SERVED_MAX:],
             trail=[a for a in (d.get("trail") or []) if isinstance(a, str)][-STATION_TRAIL_MAX:],
@@ -3073,7 +3077,7 @@ class StationEngine:
         return frame
 
     async def _announce(self, st: Station) -> None:
-        sig = (st.seq, st.rev, st.character, st.exhausted)
+        sig = (st.seq, st.rev, st.character, st.exhausted, st.stopped)
         if st.announced == sig or st.id not in self.stations:
             return
         st.announced = sig
@@ -3840,7 +3844,12 @@ class StationEngine:
     def _answer(self, st: Station, tracks: list, exhausted: bool, partial: bool) -> dict:
         return {"stationId": st.id, "seq": st.seq, "rev": st.rev,
                 "character": st.character, "engine": st.engine, "origin": st.origin,
-                "tracks": tracks, "exhausted": exhausted, "partial": partial}
+                "tracks": tracks, "exhausted": exhausted, "partial": partial,
+                "stopped": st.stopped}
+
+    def _stopped_answer(self, st: Station) -> dict:
+        """`next` on a stopped station: nothing, and not because nothing is left."""
+        return {**self._answer(st, [], False, False), "servedElsewhere": False}
 
     async def start(self, body: dict, debug: bool = False) -> tuple[int, dict]:
         seed = self._parse_seed(body.get("seed"))
@@ -3951,6 +3960,9 @@ class StationEngine:
         count = _as_int(body.get("count"), 5, 1, 25)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
+        if st.stopped:
+            st.used_at = _now_ms()
+            return 200, self._stopped_answer(st)
         deadline = time.monotonic() + STATION_BUDGET_S
         lock = self._lock(st.id)
         if not await self._acquire(lock, deadline):
@@ -3961,6 +3973,8 @@ class StationEngine:
             if st.id not in self.stations:
                 return 404, {"code": "station_unknown", "error": "no such station"}
             st.used_at = _now_ms()
+            if st.stopped:   # stopped while this request waited for the lock
+                return 200, self._stopped_answer(st)
             last = st.last_batch or {}
             if after != st.seq and after == last.get("after") and device == last.get("device"):
                 # A retry of the batch this device was last given.
@@ -3981,6 +3995,9 @@ class StationEngine:
             try:
                 b = _StationBatch(deadline)
                 tracks = await self._compute(st, count, exclude, b, debug)
+                if st.stopped:
+                    # Stopped while this batch was computed: it is not served.
+                    return 200, self._stopped_answer(st)
                 exhausted, partial = self._commit(st, tracks, b, device, st.seq, rev)
             finally:
                 self._computing.release()
@@ -4002,13 +4019,22 @@ class StationEngine:
         if kind not in _STATION_SIGNALS:
             return 400, {"code": "bad_signal",
                          "error": f"kind must be one of {list(_STATION_SIGNALS)}"}
+        if kind == "stop":
+            # Autoplay Off, from any device. trackId and value are not read.
+            if not st.stopped:
+                st.stopped = True
+                self._bump(st)
+                self._changed(st)
+            return 200, {"rev": st.rev, "applied": True}
         if kind == "character":
             value = body.get("value")
             if value not in STATION_CHARACTERS:
                 return 400, {"code": "bad_character",
                              "error": f"value must be one of {list(STATION_CHARACTERS)}"}
-            if value != st.character:
+            # A character starts a stopped station again, even its own character.
+            if value != st.character or st.stopped:
                 st.character = value
+                st.stopped = False
                 self._bump(st)
                 self._changed(st)
             return 200, {"rev": st.rev, "applied": True}
