@@ -501,7 +501,7 @@ socket stays perfectly healthy. See §3.2 and §12.2.
 | `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
 | `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `index` | `{ seq, epoch }` | lb-bot's library-index head moved (§15.3). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
-| `station` | `{ stationId, seq, rev, character, exhausted, name, origin }` | a station's cursor, steering, character or exhaustion changed (§18.2). Only with `"station"` in `welcome.features` |
+| `station` | `{ stationId, seq, rev, character, exhausted, stopped, name, origin }` | a station's cursor, steering, character or exhaustion changed (§18.2). Only with `"station"` in `welcome.features` |
 | `lb` | `{ available, routes, webUrl }` — the same object as `welcome.lb` | the hub's verdict on lb-bot's availability **changed** (§15.3). Clients apply it exactly like `welcome.lb` |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `not_supported` (§5.1), `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
 
@@ -2732,6 +2732,7 @@ Answers:
 ```jsonc
 { "stationId": "st_1760650000000_9f2c", "name": "Cinnamon Girl radio",
   "character": "balanced", "engine": "tier2", "origin": "radio", "bound": false,
+  "stopped": false,
   "seed": { "kind": "track", "ids": ["…"], "name": "Cinnamon Girl" },
   "seq": 20, "rev": 0,
   "tracks": [ { "id": "…", "title": "…", "artist": "…", "album": "…",
@@ -2775,8 +2776,13 @@ Answers:
 { "stationId": "st_…", "after": 20, "count": 5, "exclude": [ … ], "deviceId": "…" }
 ```
 
-Answers `{stationId, seq, rev, character, engine, origin, tracks, exhausted, partial,
+Answers `{stationId, seq, rev, character, engine, origin, tracks, exhausted, partial, stopped,
 servedElsewhere}`.
+
+- **A stopped station** (`signal` `stop`, below) answers `next` with `200`, `tracks: []`,
+  `stopped: true`, `exhausted: false`, `partial: false`, and its `seq` unchanged. It serves
+  nothing, also a batch that was being computed when the stop arrived. A station from `start` is
+  never stopped.
 
 - **`after` is the `seq` the caller last applied.**
   - The same `after` from the same device as the last batch replays that batch (a retry).
@@ -2794,7 +2800,7 @@ servedElsewhere}`.
 
 ```jsonc
 { "stationId": "st_…", "trackId": "…",
-  "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character",
+  "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character" | "stop",
   "value": "explore" }       // only for `character`
 ```
 
@@ -2803,7 +2809,12 @@ Answers `{rev, applied, ignored?}`.
 - **Likes come only from here:** a star goes from the client straight to Navidrome, and the hub
   never sees it.
 - `character` changes the station's character from its next batch. It needs no `trackId`; one
-  sent with it is ignored.
+  sent with it is ignored. It also starts a stopped station again, whatever its `value` (the
+  station's own character included), and moves `rev`.
+- `stop` is autoplay turned Off, from any device: "Off ends any queue, radios included". The
+  station becomes `stopped` until a `character` signal. It takes no `value`, and a `trackId` is
+  not needed (one sent is ignored). It moves `rev` and sends the `station` frame; a repeated
+  `stop` changes nothing. `stopped` persists with the station.
 - `skip` and `played` are for a station whose queue is **not** the hub session. For a bound
   station the hub derives both itself (§18.3) and answers `ignored: "session"`.
 - A track the station never served or seeded answers `ignored: "unknown_track"`.
@@ -2828,8 +2839,10 @@ Answers `{rev, applied, ignored?}`.
   played through>}` and `bindSession`. The queue then continues as that station.
 
 `{ "t": "station", "stationId": "st_…", "seq": 25, "rev": 2, "character": "balanced",
-"exhausted": false, "name": "Cinnamon Girl radio", "origin": "radio" }` is broadcast to every
-client whenever a station's `seq`, `rev`, `character` or `exhausted` changes. `name` and `origin`
+"exhausted": false, "stopped": false, "name": "Cinnamon Girl radio", "origin": "radio" }` is
+broadcast to every client whenever a station's `seq`, `rev`, `character`, `exhausted` or
+`stopped` changes. A `start` that binds the session sends this frame **before** the `session`
+frame whose `stationId` names it, so no client meets a bound station it has no frame for. `name` and `origin`
 never change; they are there so a device that learns of a station only from a frame can label it. That is how a second device learns `after`. Only a hub with
 `"station"` in `welcome.features` sends it.
 
