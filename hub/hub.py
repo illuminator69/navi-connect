@@ -22,6 +22,7 @@ import os
 import random
 import re
 import signal
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -346,6 +347,12 @@ STATION_HISTORY_DAYS = 14
 STATION_HISTORY_RELAXED_DAYS = 3      # the ladder's history rung
 STATION_HISTORY_FLUSH_S = 30.0        # the history file is written at most this often
 STATION_HISTORY_SUFFIX = ".history"
+# The stations themselves, in a file of their own beside state.json and written on
+# the same schedule as the history: state.json is rewritten whole on every session
+# broadcast, and 8 stations of 2000 served tracks would make each of those a
+# megabyte. A crash loses at most this long of a station's served set; the bound
+# station's queue is excluded from its answers whatever the file says.
+STATION_STATE_SUFFIX = ".stations"
 STATION_HISTORY_REPEAT_MS = 30 * 60 * 1000  # one id again within this is the same play
 # Judging the track just left (§18.3).
 STATION_PLAYED_FRACTION = 0.85        # played through at 85 % ...
@@ -382,7 +389,7 @@ def _as_int(v: Any, default: int = 0, lo: Optional[int] = None,
             hi: Optional[int] = None) -> int:
     try:
         n = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: Infinity
         n = default
     if lo is not None and n < lo:
         n = lo
@@ -2562,7 +2569,7 @@ def _write_text_atomic(path: str, payload: str) -> None:
 @dataclass
 class Station:
     """One station. Everything here but the runtime sets is persisted in
-    state.json["stations"] (PROTOCOL §18.4), so a restart keeps it."""
+    <state>.stations (PROTOCOL §18.4), so a restart keeps it."""
     id: str
     seed: dict                       # as answered: {kind, ids?, name?}
     name: str
@@ -2719,6 +2726,103 @@ class Station:
         return st
 
 
+class _SideFile:
+    """A JSON file beside state.json that the stations keep for themselves (the
+    play history, the stations): rewritten whole, at most every `interval` s, and
+    at once on a graceful stop.
+
+    Every write goes through one lock and carries a generation, so a write still
+    running in a worker thread when the stop arrives finishes first, and an older
+    payload can never land after a newer one.
+    """
+
+    def __init__(self, path: str, build: Any, interval: float, enabled: bool = True) -> None:
+        self.path = path
+        self.build = build
+        self.interval = interval
+        self.enabled = enabled
+        self._dirty = False
+        self._task: Optional[asyncio.Task] = None
+        self._written_at = -interval
+        self._io = threading.Lock()
+        self._gen = 0
+        self._disk_gen = 0
+
+    def touch(self) -> None:
+        if not self.enabled:
+            return
+        self._dirty = True
+        if self._task is not None and not self._task.done():
+            return
+        try:
+            self._task = asyncio.get_running_loop().create_task(self._writer())
+        except RuntimeError:
+            self.flush()  # no loop: a tool driving the engine
+
+    def _payload(self) -> tuple[int, str]:
+        self._gen += 1
+        return self._gen, json.dumps(self.build())
+
+    def _write(self, gen: int, payload: str) -> None:
+        with self._io:
+            if gen <= self._disk_gen:
+                return
+            _write_text_atomic(self.path, payload)
+            self._disk_gen = gen
+
+    async def _writer(self) -> None:
+        try:
+            while self._dirty:
+                wait = self._written_at + self.interval - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._dirty = False
+                gen, payload = self._payload()
+                try:
+                    await asyncio.to_thread(self._write, gen, payload)
+                except Exception as e:  # noqa: BLE001 — retried on the next change
+                    log(f"could not write {os.path.basename(self.path)}:", e)
+                self._written_at = time.monotonic()
+        finally:
+            self._task = None
+
+    def flush(self) -> None:
+        """Write now, after any write in flight (it holds the lock)."""
+        if not self.enabled:
+            return
+        pending = self._task is not None and not self._task.done()
+        if pending:
+            self._task.cancel()
+        if not (self._dirty or pending):
+            return
+        self._dirty = False
+        try:
+            gen, payload = self._payload()
+            self._write(gen, payload)
+        except Exception as e:  # noqa: BLE001
+            log(f"could not write {os.path.basename(self.path)}:", e)
+
+
+def _history_entry(p: Any) -> Optional[list]:
+    """One play from the history file, or None: a finite time, an id of the shape
+    a song id has, and a hex key. Whatever else a file holds is dropped, never
+    raised: this is read while the hub starts."""
+    if not (isinstance(p, list) and len(p) == 3):
+        return None
+    tid, key, at = p
+    if not (isinstance(tid, str) and _STATION_ID_RE.match(tid)):
+        return None
+    if not (isinstance(key, str) and len(key) <= 32
+            and all(c in "0123456789abcdef" for c in key)):
+        return None
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+        return None
+    at = int(at)
+    if not 0 < at < 2 ** 53:
+        return None
+    return [tid, key, at]
+
+
 class _StationBatch:
     """One request's working state: its deadline, its share of the upstream calls,
     what failed, and the lists it has fetched (so the ladder asks for each once)."""
@@ -2762,10 +2866,16 @@ class StationEngine:
         # The play history: [id, title key, at ms], oldest first. Ids and hashed
         # keys only, never in health, welcome or a log line (§18.4).
         self.history: list[list] = []
-        self._history_path = STATE_PATH + STATION_HISTORY_SUFFIX
-        self._history_dirty = False
-        self._history_task: Optional[asyncio.Task] = None
-        self._history_written_at = -STATION_HISTORY_FLUSH_S
+        self._history_file = _SideFile(STATE_PATH + STATION_HISTORY_SUFFIX,
+                                       lambda: {"v": 1, "plays": self.history},
+                                       STATION_HISTORY_FLUSH_S, STATION_HISTORY_ON)
+        self._stations_file = _SideFile(STATE_PATH + STATION_STATE_SUFFIX,
+                                        lambda: {"v": 1, "stations": self.to_state()},
+                                        STATION_HISTORY_FLUSH_S)
+        # Parsed nearest lists: (item, depth) -> (expiry, rows). Rows are shared
+        # between stations; the total is bounded by STATION_LIST_CACHE_ROWS.
+        self._lists: dict[tuple[str, int], tuple[float, list]] = {}
+        self._auth_logged = False
         self._locks: dict[str, asyncio.Lock] = {}
         self._computing = asyncio.Semaphore(STATION_COMPUTING_MAX)
         self._nd_sem = asyncio.Semaphore(STATION_CALLS_PER_REQUEST)
@@ -2778,9 +2888,10 @@ class StationEngine:
         self._probe_at = 0.0
         self._probe_soon: Optional[asyncio.TimerHandle] = None
         self._probe_lock = asyncio.Lock()
-        self._t1_cache: dict[tuple[str, str, int], tuple[float, list]] = {}
+        self._t1_cache: dict[tuple[str, str], tuple[float, list]] = {}
         self._bg: set = set()
         self._load_history()
+        self._load_stations()
 
     # ----- configuration ---------------------------------------------------- #
     @staticmethod
@@ -2802,11 +2913,16 @@ class StationEngine:
     def load_state(self, rows: Any) -> None:
         """Boot: the persisted stations, minus the expired, the newest STATION_MAX.
         Runs before the session is validated against them, so it drops nothing
-        through `_drop` (which would announce an unbinding nobody can hear)."""
+        through `_drop` (which would announce an unbinding nobody can hear). A
+        station that cannot be read is skipped, never raised."""
         now = _now_ms()
         loaded = []
         for raw in rows if isinstance(rows, list) else []:
-            st = Station.from_state(raw)
+            try:
+                st = Station.from_state(raw)
+            except Exception as e:  # noqa: BLE001 — a hand-edited file, NaN, ...
+                log("station: skipped an unreadable station:", e)
+                continue
             if st is not None and now - st.used_at < STATION_IDLE_MS:
                 loaded.append(st)
         loaded.sort(key=lambda st: st.used_at, reverse=True)
@@ -2815,19 +2931,27 @@ class StationEngine:
     def to_state(self) -> list[dict]:
         return [st.to_state() for st in self.stations.values()]
 
+    def _load_stations(self) -> None:
+        status, data = _read_state_file(self._stations_file.path)
+        if status == "corrupt":
+            _set_aside_state_file(self._stations_file.path)
+        if status == "ok":
+            self.load_state(data.get("stations"))
+
     def _load_history(self) -> None:
         if not STATION_HISTORY_ON:
             return
-        status, data = _read_state_file(self._history_path)
+        path = self._history_file.path
+        status, data = _read_state_file(path)
         if status != "ok":
             if status == "corrupt":
-                _set_aside_state_file(self._history_path)
+                _set_aside_state_file(path)
             return
         plays = data.get("plays")
         for p in plays if isinstance(plays, list) else []:
-            if (isinstance(p, list) and len(p) == 3 and isinstance(p[0], str)
-                    and isinstance(p[1], str) and isinstance(p[2], (int, float))):
-                self.history.append([p[0], p[1], int(p[2])])
+            entry = _history_entry(p)
+            if entry is not None:
+                self.history.append(entry)
         self._prune_history()
         log(f"station history: {len(self.history)} plays loaded")
 
@@ -2857,49 +2981,16 @@ class StationEngine:
         return ids, keys
 
     def _history_touch(self) -> None:
-        if not STATION_HISTORY_ON:
-            return
-        self._history_dirty = True
-        if self._history_task is not None and not self._history_task.done():
-            return
-        try:
-            self._history_task = asyncio.get_running_loop().create_task(
-                self._history_writer())
-        except RuntimeError:
-            self._write_history_now()  # no loop: a tool or a test driving the engine
+        self._history_file.touch()
 
-    async def _history_writer(self) -> None:
-        try:
-            while self._history_dirty:
-                wait = self._history_written_at + STATION_HISTORY_FLUSH_S - time.monotonic()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                self._history_dirty = False
-                payload = json.dumps({"v": 1, "plays": self.history})
-                try:
-                    await asyncio.to_thread(_write_text_atomic, self._history_path, payload)
-                except Exception as e:  # noqa: BLE001 — a lost write is retried on the next play
-                    log("station history: write failed:", e)
-                self._history_written_at = time.monotonic()
-        finally:
-            self._history_task = None
-
-    def _write_history_now(self) -> None:
-        if not STATION_HISTORY_ON:
-            return
-        self._history_dirty = False
-        try:
-            _write_text_atomic(self._history_path, json.dumps({"v": 1, "plays": self.history}))
-        except Exception as e:  # noqa: BLE001
-            log("station history: write failed:", e)
+    def _stations_touch(self) -> None:
+        self._stations_file.touch()
 
     def close(self) -> None:
-        """Graceful stop: the history is written now, not up to 30 s from now."""
-        if self._history_task is not None and not self._history_task.done():
-            self._history_task.cancel()
-            self._history_dirty = True
-        if self._history_dirty:
-            self._write_history_now()
+        """Graceful stop: the history and the stations are written now, not up to
+        30 s from now, each after any write of its own still in flight."""
+        self._history_file.flush()
+        self._stations_file.flush()
         if self._probe_soon is not None:
             self._probe_soon.cancel()
 
@@ -2923,6 +3014,7 @@ class StationEngine:
 
     def _drop(self, sid: str, why: str) -> None:
         self.stations.pop(sid, None)
+        self._stations_touch()
         lock = self._locks.get(sid)
         if lock is not None and not lock.locked():
             self._locks.pop(sid, None)
@@ -3729,15 +3821,14 @@ class StationEngine:
             return conflict
         self.stations[st.id] = st
         self._evict()
+        self._stations_touch()
         s = self.hub.session
         bound = bool(bind and bind == s.saved_queue_id and st.id in self.stations)
         if bound:
             s.station_id = st.id
             s.bump()
             await self.hub._broadcast_session()  # noqa: SLF001 — same module
-        else:
-            # A bindSession naming another queue is not an error: `bound: false`.
-            self.hub._save()  # noqa: SLF001 — same module
+        # (A bindSession naming another queue is not an error: `bound: false`.)
         await self._announce(st)
         dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
              f"engine {st.engine}, rungs {b.rungs}")
@@ -3800,7 +3891,7 @@ class StationEngine:
                 self._computing.release()
         finally:
             lock.release()
-        self.hub._save()  # noqa: SLF001 — same module
+        self._stations_touch()
         await self._announce(st)
         answer = {**self._answer(st, tracks, exhausted, partial), "servedElsewhere": False}
         if debug:
@@ -4745,9 +4836,11 @@ class Hub:
                     self.mixes[clean["id"]] = clean
 
         def stations() -> None:
-            # Additive like `mixes`: a state.json from before stations loads with
-            # none, and an older hub reading this one drops the key.
-            self.stations.load_state(data.get("stations", []))
+            # The stations live in <state>.stations (StationEngine). A state.json
+            # written by the first station build carried them here; read those
+            # once, when the side file brought none.
+            if not self.stations.stations and data.get("stations"):
+                self.stations.load_state(data.get("stations"))
 
         def lb_index() -> None:
             # Additive like `mixes`: a state.json from before the index mirror
@@ -4888,9 +4981,6 @@ class Hub:
             "savedQueues": self._saved_queues_list(),
             "deletedSavedQueues": self.deleted_saved_queues,
             "mixes": mixes,
-            # The stations (PROTOCOL §18.4), so a restart keeps them. Their play
-            # history is NOT here: it has its own file (StationEngine).
-            "stations": self.stations.to_state(),
             "lbIndex": self.lb_index,
             "devices": [
                 {"id": d.id, "name": d.name, "platform": d.platform, "kind": d.kind,
