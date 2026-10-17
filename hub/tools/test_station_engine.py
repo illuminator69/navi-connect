@@ -155,7 +155,7 @@ def _near(item, n, radius=NEIGHBOURHOOD):
 # Fake AudioMuse
 # --------------------------------------------------------------------------- #
 AM = {"calls": [], "fail_min_n": None, "max_body": 0, "max_n": 0, "creds_seen": 0,
-      "slow": {}, "lock": threading.Lock()}
+      "slow": {}, "slow_fp": 0.0, "status": {}, "lock": threading.Lock()}
 
 
 class AudioMuse(http.server.BaseHTTPRequestHandler):
@@ -165,11 +165,14 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
         body = json.dumps(payload).encode()
         with AM["lock"]:
             AM["max_body"] = max(AM["max_body"], len(body))
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the hub gave up on a deliberately slow answer
 
     def do_GET(self):  # noqa: N802
         path, _, query = self.path.partition("?")
@@ -182,6 +185,9 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
             item, n = q.get("item_id", ""), int(q.get("n", "10"))
             if item in AM["slow"]:
                 time.sleep(AM["slow"][item])
+            if item in AM["status"]:
+                code, payload = AM["status"][item]
+                return self._send(code, payload)
             with AM["lock"]:
                 AM["max_n"] = max(AM["max_n"], n)
             if AM["fail_min_n"] is not None and n >= AM["fail_min_n"]:
@@ -190,6 +196,8 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
                 return self._send(404, {"error": "Target track not found in index"})
             return self._send(200, [_row(o, d) for d, o in _near(item, n)])
         if path == "/api/sonic_fingerprint/generate":
+            if AM["slow_fp"]:
+                time.sleep(AM["slow_fp"])
             if q.get("navidrome_user") == ND_USER and q.get("navidrome_password") == ND_PASS:
                 with AM["lock"]:
                     AM["creds_seen"] += 1
@@ -211,6 +219,8 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
                         {"item_id": f"B01_{i}", "title": LIB[f"B01_{i}"]["title"]}
                         for i in range(3)]}]}])
         if path == "/external/get_score":
+            if q.get("id", "") in AM["slow"]:
+                time.sleep(AM["slow"][q.get("id", "")])
             t = LIB.get(q.get("id", ""))
             if t is None:
                 return self._send(404, {"error": "Score not found"})
@@ -249,7 +259,10 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 # Fake Navidrome
 # --------------------------------------------------------------------------- #
-ND = {"methods": {}, "sonic": True, "lock": threading.Lock()}
+ND = {"methods": {}, "calls": [], "sonic": True, "lock": threading.Lock()}
+# Known to Navidrome, unknown to AudioMuse, and with no similar songs at all.
+ND_ONLY = {"ND_EMPTY_1": {"id": "ND_EMPTY_1", "title": "Lonely", "artist": "Nobody",
+                          "album": "None", "duration": 200, "genre": "x"}}
 
 
 def _song(t):
@@ -286,6 +299,7 @@ class Navidrome(http.server.BaseHTTPRequestHandler):
         method = path.rsplit("/", 1)[-1].replace(".view", "")
         with ND["lock"]:
             ND["methods"][method] = ND["methods"].get(method, 0) + 1
+            ND["calls"].append((method, q.get("id"), q.get("count")))
         if q.get("u") != ND_USER or not q.get("t") or not q.get("s"):
             return self._fail(40, "wrong username or password")
         if method == "ping":
@@ -296,6 +310,13 @@ class Navidrome(http.server.BaseHTTPRequestHandler):
                 ext.append({"name": "sonicSimilarity", "versions": [1]})
             return self._send({"openSubsonicExtensions": ext})
         tid = q.get("id", "")
+        if tid in ND_ONLY:
+            if method == "getSong":
+                return self._send({"song": ND_ONLY[tid]})
+            if method == "getSonicSimilarTracks":
+                return self._send({"sonicMatch": []})
+            if method == "getSimilarSongs2":
+                return self._send({"similarSongs2": {}})
         if method == "getSong":
             if tid not in LIB:
                 return self._fail(70, "data not found")
@@ -337,14 +358,16 @@ def serve(handler):
 # The hub under test, and a client's way of calling it
 # --------------------------------------------------------------------------- #
 def unlink_all(path):
-    for suffix in ("", ".bak", ".history", ".history.tmp", ".tmp"):
+    for suffix in ("", ".bak", ".history", ".history.tmp", ".tmp", ".stations",
+                   ".stations.tmp"):
         try:
             os.unlink(path + suffix)
         except FileNotFoundError:
             pass
 
 
-def spawn(port, state, audiomuse=None, navidrome=None, extra=None, log_path=None):
+def spawn(port, state, audiomuse=None, navidrome=None, extra=None, log_path=None,
+          am_token="am-token"):
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_HEALTH_PORT": str(_free_port())}
@@ -352,7 +375,7 @@ def spawn(port, state, audiomuse=None, navidrome=None, extra=None, log_path=None
               "HUB_ND_PASS", "LBBOT_URL", "PREVIEW_URL"):
         env.pop(k, None)
     if audiomuse:
-        env.update(AUDIOMUSE_URL=audiomuse, AUDIOMUSE_TOKEN="am-token")
+        env.update(AUDIOMUSE_URL=audiomuse, AUDIOMUSE_TOKEN=am_token)
     if navidrome:
         env["NAVIDROME_URL"] = navidrome
     if audiomuse or navidrome:
@@ -743,14 +766,30 @@ async def main_suite(failures):
             failures.append(f"the least recently used station should be evicted: {st_}")
 
         # ----- 12. the budget runs from arrival ------------------------------ #
-        AM["slow"].update({"L35_0": 7.0, "L36_0": 7.0, "L37_0": 7.0})
+        # Two-seed starts, so each request has its two calls in flight: before the
+        # stations had a pool of their own, two of them filled all four of SONIC's
+        # slots and an older client's /sonic/* call queued behind them.
+        slow = ("L35_0", "L36_0", "L37_0", "L38_0", "L39_0", "L34_1")
+        AM["slow"].update({i: 7.0 for i in slow})
         t0 = time.monotonic()
-        res = await asyncio.gather(*(
+        starts = asyncio.gather(*(
             acall(port, "POST", "/sonic/station/start", {
-                "seed": {"kind": "track", "ids": [i]}, "count": 5})
-            for i in ("L35_0", "L36_0", "L37_0")))
+                "seed": {"kind": "tracks", "ids": list(pair)}, "count": 5})
+            for pair in (slow[0:2], slow[2:4], slow[4:6])))
+        await asyncio.sleep(0.8)
+        t1 = time.monotonic()
+        st_, old = await acall(port, "GET", "/sonic/score?id=L01_0")
+        old_took = time.monotonic() - t1
+        if st_ != 200 or old_took > 2.0:
+            failures.append(f"an older client's /sonic/score waited {old_took:.1f}s ({st_}) "
+                            "behind station calls: the stations must have their own pool")
+        res = await starts
         took = time.monotonic() - t0
+        await asyncio.sleep(3.0)    # let the abandoned slow calls finish
         AM["slow"].clear()
+        st_, ch = await acall(port, "GET", "/sonic/station/characters")
+        if ch.get("engine") != "tier2":
+            failures.append(f"station load made AudioMuse read as unreachable: {ch}")
         if took > 13.5:
             failures.append(f"three starts behind a slow AudioMuse took {took:.1f}s: the "
                             "12 s budget must run from arrival, not from a computing slot")
@@ -865,6 +904,7 @@ async def tier1_suite(failures):
     """Cases 9 and 10: AudioMuse down; nothing configured."""
     nd_srv, nd_url = serve(Navidrome)
     dead = f"http://127.0.0.1:{_free_port()}"   # nothing listens there
+    ND["calls"].clear()
     for sonic in (True, False):
         ND["sonic"] = sonic
         before = dict(ND["methods"])
@@ -900,6 +940,46 @@ async def tier1_suite(failures):
             stop(proc)
             unlink_all(state)
     ND["sonic"] = True
+    t1_asks = [(m, i, n) for m, i, n in ND["calls"]
+               if m in ("getSonicSimilarTracks", "getSimilarSongs2")]
+    if not t1_asks or any(n != "500" for _m, _i, n in t1_asks):
+        failures.append(f"Tier 1 must ask once, at its deepest (500): "
+                        f"{sorted({n for _m, _i, n in t1_asks})}")
+    per = {}
+    for m, i, _n in t1_asks:
+        per[(m, i)] = per.get((m, i), 0) + 1
+    if any(v > 1 for v in per.values()):
+        failures.append(f"Tier 1 asked Navidrome again for a list it had: {per}")
+
+    # ----- AudioMuse refuses the hub's token --------------------------------- #
+    am_srv, am_url = serve(AudioMuse)
+    port = _free_port()
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    log_path = state + ".log"
+    proc = spawn(port, state, am_url, nd_url, am_token="not-the-token-1f9e",
+                 log_path=log_path)
+    try:
+        await asyncio.to_thread(wait_up, port)
+        st_, ch = await acall(port, "GET", "/sonic/station/characters")
+        if ch.get("engine") != "tier1":
+            failures.append(f"a refused AudioMuse token must read as tier1: {ch}")
+        st_, a = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L04_0"]}, "count": 5})
+        if st_ != 200 or a.get("engine") != "tier1" or not a.get("partial"):
+            failures.append(f"a refused token: start should fall to tier1, partial: "
+                            f"{st_} {a.get('engine')} {a.get('partial')}")
+    finally:
+        stop(proc)
+        am_srv.shutdown()
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        unlink_all(state)
+        try:
+            os.unlink(log_path)
+        except FileNotFoundError:
+            pass
+    if "AUDIOMUSE_TOKEN" not in text or "not-the-token-1f9e" in text:
+        failures.append("a refused token: one clear log line, without the token")
     nd_srv.shutdown()
     if ND["methods"].get("getRandomSongs"):
         failures.append("getRandomSongs was called on the tier1 path")
@@ -956,10 +1036,373 @@ def unit_checks(failures):
         failures.append(f"other_features string parse: {kv}")
 
 
+async def review_suite(failures):
+    """The review's findings, each through the routes a client calls."""
+    am_srv, am_url = serve(AudioMuse)
+    nd_srv, nd_url = serve(Navidrome)
+    port = _free_port()
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    log_path = state + ".log"
+    # History written by an older, careless writer: NaN, Infinity, an id that is
+    # not a song id. The hub must start, and keep the one good play.
+    now_ms = int(time.time() * 1000)
+    n1, n2, n3 = [o["id"] for _d, o in _near("L01_0", 3)]
+    with open(state + ".history", "w", encoding="utf-8") as f:
+        f.write('{"v": 1, "plays": [["%s", "0123456789abcdef", NaN], '
+                '["%s", "0123456789abcdef", Infinity], ["../x", "00", 1], '
+                '["%s", "0123456789abcdef", %d]]}' % (n2, n3, n1, now_ms))
+    with open(state + ".stations", "w", encoding="utf-8") as f:
+        f.write('{"v": 1, "stations": [{"id": "st_1_dead", "seed": {"kind": "track"}, '
+                '"character": "close", "seq": Infinity, "usedAt": NaN}]}')
+    proc = spawn(port, state, am_url, nd_url, log_path=log_path)
+    try:
+        await asyncio.to_thread(wait_up, port)
+        st_, ch = await acall(port, "GET", "/sonic/station/characters")
+        if st_ != 200:
+            failures.append(f"a history/stations file with NaN stopped the hub: {st_}")
+
+        # ----- 1. a seed of 5,000 ids is refused at once -------------------- #
+        big = {"seed": {"kind": "tracks", "ids": [f"x{i}" for i in range(5000)]}}
+        t0 = time.monotonic()
+        st_, r = await acall(port, "POST", "/sonic/station/start", big)
+        took = time.monotonic() - t0
+        if st_ != 400 or r.get("code") != "bad_seed" or took > 0.1:
+            failures.append(f"a 5,000-id seed: {st_} {r.get('code')} in {took * 1000:.0f} ms")
+
+        # ----- the good history entry survived, the bad ones went ------------ #
+        st_, h = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L01_0"]}, "character": "close", "count": 10})
+        got = [t["id"] for t in h.get("tracks", [])]
+        if n1 in got:
+            failures.append("the good play in the history file was served (it did not load)")
+        if n2 not in got or n3 not in got:
+            failures.append(f"the NaN / Infinity plays should have been dropped, so their "
+                            f"tracks served: {got}")
+
+        # ----- 4. a seed AudioMuse does not know, with no Tier-1 neighbours --- #
+        st_, r = await acall(port, "POST", "/sonic/station/start",
+                             {"seed": {"kind": "track", "ids": ["ND_EMPTY_1"]}})
+        if st_ != 404 or r.get("code") != "seed_unknown":
+            failures.append(f"AudioMuse 404 + Navidrome empty must be seed_unknown: {st_} {r}")
+
+        # ----- 3. every non-answer makes the batch partial ------------------- #
+        # Two seeds, one answering: a failed list among good ones must still make
+        # the batch partial (with one seed the whole stream fails and says so anyway).
+        AM["status"]["L02_0"] = (429, {"error": "slow down"})
+        AM["status"]["L02_1"] = (200, {"not": "a list"})
+        for sid_ in ("L02_0", "L02_1"):
+            st_, r = await acall(port, "POST", "/sonic/station/start", {
+                "seed": {"kind": "tracks", "ids": [sid_, "L02_2"]}, "count": 5})
+            if st_ != 200 or r.get("partial") is not True or r.get("exhausted") \
+                    or not r.get("tracks"):
+                failures.append(f"an AudioMuse {AM['status'][sid_][0]} on one seed's list "
+                                f"must be partial, never exhausted: {st_} "
+                                f"partial={r.get('partial')} exhausted={r.get('exhausted')}")
+        AM["status"].clear()
+        st_, ch = await acall(port, "GET", "/sonic/station/characters")
+        if ch.get("engine") != "tier2":
+            failures.append(f"a 429 and a bad body made AudioMuse unreachable: {ch}")
+
+        # ----- dislike / unlike, and a retried signal counts once ------------ #
+        st_, d0 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L05_1"]}, "character": "balanced",
+            "count": 10})
+        dsid, dseq, dtr = d0["stationId"], d0["seq"], d0["tracks"]
+
+        async def sig(kind, tid):
+            return (await acall(port, "POST", "/sonic/station/signal", {
+                "stationId": dsid, "trackId": tid, "kind": kind}))[1]
+        r1 = await sig("like", dtr[0]["id"])
+        r2 = await sig("like", dtr[0]["id"])
+        r3 = await sig("unlike", dtr[0]["id"])
+        if (r1["rev"], r2["rev"], r3["rev"]) != (1, 1, 2) or not r2.get("applied"):
+            failures.append(f"like/like/unlike revs: {r1} {r2} {r3}")
+        r4 = await sig("skip", dtr[2]["id"])
+        r5 = await sig("skip", dtr[2]["id"])
+        if (r4["rev"], r5["rev"]) != (3, 3):
+            failures.append(f"a retried skip signal counted twice: {r4} {r5}")
+        disliked = artist_key(dtr[1]["artist"])
+        r6 = await sig("dislike", dtr[1]["id"])
+        r7 = await sig("dislike", dtr[1]["id"])
+        if (r6["rev"], r7["rev"]) != (4, 4):
+            failures.append(f"dislike revs: {r6} {r7}")
+        after_dislike = []
+        for _ in range(3):
+            st_, nx = await acall(port, "POST", "/sonic/station/next", {
+                "stationId": dsid, "after": dseq, "count": 10})
+            dseq = nx["seq"]
+            after_dislike += nx["tracks"]
+        if any(artist_key(t["artist"]) == disliked for t in after_dislike):
+            failures.append("a disliked track's artist was served while cooled")
+
+        # ----- exclude, on start and on next --------------------------------- #
+        st_, e1 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L06_1"]}, "character": "close", "count": 5})
+        first5 = [t["id"] for t in e1["tracks"]]
+        st_, e2 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L06_1"]}, "character": "close", "count": 5,
+            "exclude": first5})
+        if set(first5) & {t["id"] for t in e2["tracks"]} or len(e2["tracks"]) != 5:
+            failures.append("start's exclude was not honoured")
+        # What a next would serve after those five (Close is nearest-first, so a
+        # second station from the same seed shows it), then exclude exactly that.
+        st_, e4 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L06_1"]}, "character": "close", "count": 10})
+        would = {t["id"] for t in e4["tracks"][5:]}
+        st_, e3 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L06_1"]}, "character": "close", "count": 5})
+        st_, n3 = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": e3["stationId"], "after": 5, "count": 5, "exclude": sorted(would)})
+        if len(would) != 5 or {t["id"] for t in n3["tracks"]} & would:
+            failures.append("next's exclude was not honoured")
+
+        # ----- bindSession excludes the session's queue; eviction spares it --- #
+        cl = Client("Lru", device_id="lru")
+        await cl.connect(f"ws://127.0.0.1:{port}")
+        q = [{"id": "L06_1", "title": "s", "durationMs": 200000}] + [
+            {"id": i, "title": "q", "durationMs": 200000} for i in first5]
+        await cl.act(action="setQueue", tracks=q, index=0, play=True, savedQueueId="q_lru")
+        await asyncio.sleep(0.4)
+        st_, b0 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L06_1"]}, "character": "close", "count": 5,
+            "bindSession": "q_lru"})
+        if not b0.get("bound") or set(first5) & {t["id"] for t in b0.get("tracks", [])}:
+            failures.append(f"a bound start served its session's own queue: "
+                            f"bound={b0.get('bound')}")
+        others = []
+        for i in range(9):   # the bound station is now the least recently used
+            st_, o = await acall(port, "POST", "/sonic/station/start", {
+                "seed": {"kind": "track", "ids": [f"L{20 + i:02d}_2"]}, "count": 2})
+            others.append(o["stationId"])
+        st_, keep = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": b0["stationId"], "after": b0["seq"], "count": 2})
+        if st_ != 200:
+            failures.append(f"the bound station was evicted as the least recently used: {st_}")
+        st_, gone = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": others[0], "after": 2, "count": 2})
+        if st_ != 404:
+            failures.append(f"the oldest unbound station should have gone instead: {st_}")
+
+        # ----- two bound starts at once: one station, one 409 ---------------- #
+        await cl.act(action="setQueue", tracks=q, index=0, play=True, savedQueueId="q_two")
+        await asyncio.sleep(0.4)
+        res = await asyncio.gather(*(acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": [sd]}, "count": 5, "bindSession": "q_two"})
+            for sd in ("L07_1", "L08_1")))
+        oks = [b for st_, b in res if st_ == 200]
+        conflicts = [b for st_, b in res if st_ == 409]
+        if len(oks) != 1 or len(conflicts) != 1 or not oks[0].get("bound") \
+                or conflicts[0].get("stationId") != oks[0].get("stationId"):
+            failures.append(f"two bound starts at once: {[(st_, b.get('stationId'), b.get('bound'), b.get('code')) for st_, b in res]}")
+        await cl.ws.close()
+
+        # ----- 9. the engine caches parsed lists: one AudioMuse call per depth - #
+        AM["calls"].clear()
+        st_, c0 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L09_1"]}, "character": "balanced", "count": 5})
+        cseq = c0["seq"]
+        for _ in range(6):
+            st_, nx = await acall(port, "POST", "/sonic/station/next", {
+                "stationId": c0["stationId"], "after": cseq, "count": 5})
+            cseq = nx["seq"]
+        asks = [q_ for path, q_ in AM["calls"] if path == "/api/similar_tracks"
+                and isinstance(q_, dict) and q_.get("item_id") == "L09_1"]
+        if len(asks) != len({q_.get("n") for q_ in asks}):
+            failures.append(f"a list was fetched again instead of from the engine's cache: "
+                            f"{[q_.get('n') for q_ in asks]}")
+    finally:
+        stop(proc)
+        am_srv.shutdown()
+        nd_srv.shutdown()
+        AM["status"].clear()
+    try:
+        with open(state, encoding="utf-8") as f:
+            if "stations" in json.load(f):
+                failures.append("state.json still carries the stations")
+        with open(state + ".stations", encoding="utf-8") as f:
+            if not json.load(f).get("stations"):
+                failures.append("the stations file holds no station after a graceful stop")
+    except (FileNotFoundError, ValueError) as e:
+        failures.append(f"state files after the review suite: {e}")
+    unlink_all(state)
+    try:
+        os.unlink(log_path)
+    except FileNotFoundError:
+        pass
+
+
+class _StubHub:
+    """What StationEngine needs of a Hub, for the in-process checks."""
+
+    def __init__(self, hubmod):
+        self.session = hubmod.Session()
+        self.frames = []
+
+    def _save(self):
+        pass
+
+    def _spawn(self, coro):
+        asyncio.ensure_future(coro)
+
+    async def _broadcast(self, obj):
+        self.frames.append(obj)
+
+    async def _broadcast_session(self):
+        pass
+
+
+async def inprocess_checks(failures):
+    """Findings 1, 2, 5 and 8 and the body whitelist, at the function they are about."""
+    import contextlib
+    import io
+    import types
+    import hub as hubmod
+    saved = {k: getattr(hubmod, k) for k in ("STATE_PATH", "TOKEN", "AUDIOMUSE_URL",
+                                             "HUB_INSTANCE", "_write_text_atomic")}
+    saved_call = hubmod.SONIC.call
+    tmpdir = tempfile.mkdtemp(prefix="station-inproc-")
+    hubmod.STATE_PATH = os.path.join(tmpdir, "state.json")
+    try:
+        # 1: the seed parser does no per-id work on an oversized list.
+        t0 = time.monotonic()
+        r = hubmod.StationEngine._parse_seed({"kind": "tracks",
+                                             "ids": [f"x{i}" for i in range(42_000)]})
+        if r is not None or time.monotonic() - t0 > 0.02:
+            failures.append(f"_parse_seed on 42,000 ids: {r} in "
+                            f"{(time.monotonic() - t0) * 1000:.1f} ms")
+
+        # 2: what an answer says about AudioMuse.
+        v = hubmod.StationEngine._tier2_verdict
+        table = [(0, b"", None), (503, b'{"busy": true}', None),
+                 (502, b'{"down": true}', False), (504, b'{"busy": true}', False),
+                 (401, b"{}", False), (403, b"{}", False), (500, b'{"error": "x"}', True),
+                 (502, b'{"tooLarge": true}', True), (404, b"{}", True), (200, b"[]", True)]
+        for status, raw, want in table:
+            if v(status, raw) is not want:
+                failures.append(f"_tier2_verdict({status}, {raw!r}) = {v(status, raw)}, "
+                                f"expected {want}")
+        hubmod.AUDIOMUSE_URL = "http://audiomuse.invalid"
+        eng = hubmod.StationEngine(_StubHub(hubmod))
+        answer = {"v": (500, b'{"error": "boom"}', "application/json")}
+
+        async def fake_call(route, spec, params, body):
+            return answer["v"]
+        hubmod.SONIC.call = fake_call
+        eng.tier2_ok = True
+        await eng.probe()
+        if eng.tier2_ok is not True or eng._probe_soon is not None:
+            failures.append("a probe answered 500 must leave AudioMuse reachable")
+        answer["v"] = (502, b'{"down": true}', "application/json")
+        await eng.probe()
+        if eng.tier2_ok is not False or eng._probe_soon is None:
+            failures.append("a probe that cannot connect must say unreachable and re-probe")
+        eng._probe_soon.cancel()
+        eng._probe_soon = None
+        eng.tier2_ok = True
+        answer["v"] = (503, b'{"busy": true}', "application/json")
+        await eng.probe()
+        if eng.tier2_ok is not True:
+            failures.append("the hub's own busy must not make AudioMuse unreachable")
+        answer["v"] = (401, b'{"error": "bad token"}', "application/json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await eng.probe()
+            await eng.probe()
+        if eng.tier2_ok is not False:
+            failures.append("a 401 must make AudioMuse unavailable")
+        lines = [ln for ln in buf.getvalue().splitlines() if "AUDIOMUSE_TOKEN" in ln]
+        if len(lines) != 1:
+            failures.append(f"a refused token should log one line, got {lines}")
+        if eng._probe_soon is not None:
+            eng._probe_soon.cancel()
+            eng._probe_soon = None
+        hubmod.SONIC.call = saved_call
+
+        # 5: a ladder stopped by the budget is partial.
+        now = int(time.time() * 1000)
+        st = hubmod.Station(id="st_1_beef", seed={"kind": "track", "ids": ["L01_0"]},
+                            name="x", character="close", created_at=now, used_at=now,
+                            seed_ids=["L01_0"],
+                            anchor_meta=[{"id": "L01_0", "title": "", "artist": "",
+                                          "album": "", "ak": "", "tk": "", "feats": None,
+                                          "mix": False}])
+        st.index()
+        b = hubmod._StationBatch(time.monotonic() - 0.01)
+        tracks = await eng._compute(st, 5, set(), b)
+        exhausted, partial = eng._commit(st, tracks, b, None, 0, st.rev)
+        if not (b.timed_out and partial and not exhausted):
+            failures.append(f"a batch stopped by the budget: timed_out={b.timed_out} "
+                            f"partial={partial} exhausted={exhausted}")
+
+        # 8: a write in flight when the stop arrives finishes first, then the newer.
+        path = os.path.join(tmpdir, "side.json")
+        val = {"n": 0}
+        active, overlap = [0], [0]
+        orig = saved["_write_text_atomic"]
+
+        def slow_write(p, payload):
+            active[0] += 1
+            overlap[0] = max(overlap[0], active[0])
+            time.sleep(0.3)
+            orig(p, payload)
+            active[0] -= 1
+        hubmod._write_text_atomic = slow_write
+        sf = hubmod._SideFile(path, lambda: {"n": val["n"]}, 0.0)
+        val["n"] = 1
+        sf.touch()
+        await asyncio.sleep(0.1)      # the writer's thread is inside its write
+        val["n"] = 2
+        sf.flush()
+        await asyncio.sleep(0.4)
+        with open(path, encoding="utf-8") as f:
+            final = json.load(f)
+        if final != {"n": 2} or overlap[0] != 1:
+            failures.append(f"side file after a flush during a write: {final}, "
+                            f"{overlap[0]} writes at once")
+        hubmod._write_text_atomic = orig
+
+        # The body whitelist: keys another route acts on never reach this one.
+        hubmod.TOKEN = "t"
+        seen = []
+
+        class _Stations:
+            async def route(self, path, body):
+                seen.append((path, sorted(body)))
+                return 200, {"ok": True}
+        hubmod.HUB_INSTANCE = types.SimpleNamespace(stations=_Stations())
+        foreign = {"/sonic/station/start": ({"seed": {"kind": "yourMix"}},
+                                            ["after", "stationId", "trackId", "kind", "value"]),
+                   "/sonic/station/next": ({"stationId": "st_1_x", "after": 0},
+                                           ["seed", "bindSession", "origin", "character",
+                                            "trackId", "kind"]),
+                   "/sonic/station/signal": ({"stationId": "st_1_x", "kind": "like",
+                                              "trackId": "a"},
+                                             ["after", "count", "exclude", "seed", "origin"])}
+        for path, (good, bad) in foreign.items():
+            raw = json.dumps({**good, **{k: 1 for k in bad}}).encode()
+            proto = types.SimpleNamespace(reader=asyncio.StreamReader(), body_consumed=False)
+            proto.reader.feed_data(raw)
+            proto.reader.feed_eof()
+            res = await hubmod.STATION.handle(
+                proto, path, {"Authorization": "Bearer t", "Content-Length": str(len(raw))},
+                "POST")
+            if res is None or not seen or seen[-1][0] != path:
+                failures.append(f"{path} did not reach the engine: {res}")
+                continue
+            if set(seen[-1][1]) != set(good):
+                failures.append(f"{path} passed keys the route does not list: {seen[-1][1]}")
+    finally:
+        hubmod.SONIC.call = saved_call
+        for k, v in saved.items():
+            setattr(hubmod, k, v)
+
+
 async def main():
     failures: list[str] = []
     unit_checks(failures)
+    await inprocess_checks(failures)
     await main_suite(failures)
+    await review_suite(failures)
     await tier1_suite(failures)
     if failures:
         print("FAIL (station engine):")
@@ -971,6 +1414,12 @@ async def main():
           "500-mid-ladder-partial/after-replay+servedElsewhere/session_bound-409/"
           "unlisted-keys-dropped/your-mix/restart-keeps-station+history/"
           "explore-drifts-only-after-a-play-through/budget-from-arrival/"
+          "own-pool-old-clients-unstarved/busy-is-not-unreachable/5000-id-seed-fast/"
+          "nan-history-loads/aM404+nd-empty-seed_unknown/429+bad-body-partial/"
+          "dislike+unlike+idempotent-signals/exclude-start+next/bound-queue-excluded/"
+          "bound-lru-not-evicted/concurrent-bound-starts/parsed-list-cache/"
+          "tier1-asked-once/refused-token-tier1+one-log-line/stations-out-of-state.json/"
+          "verdicts+probe/budget-guard-partial/side-file-serialized/body-whitelist/"
           "tier1-sonic+similarSongs2/unconfigured-503-fallback/largest-under-cap/"
           "no-getRandomSongs/title-key")
 

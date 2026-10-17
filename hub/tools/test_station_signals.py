@@ -124,13 +124,13 @@ async def session_suite(failures, log_path):
         seed = "L12_0"
         st_, a = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": [seed], "name": "Indie Song 12-0"},
-            "character": "balanced", "count": 6, "deviceId": "recv"})
+            "character": "balanced", "count": 14, "deviceId": "recv"})
         if st_ != 200:
             failures.append(f"start: {st_} {a}")
             return
         sid = a["stationId"]
         await settle()
-        if not any(f.get("stationId") == sid and f.get("seq") == 6
+        if not any(f.get("stationId") == sid and f.get("seq") == 14
                    and f.get("name") == "Indie Song 12-0 radio" and f.get("origin") == "radio"
                    for f in c.station_frames):
             failures.append(f"no station frame (with name and origin) after start: "
@@ -147,7 +147,7 @@ async def session_suite(failures, log_path):
         d = SClient("Late", device_id="late", caps=["controller"])
         await d.connect(url)
         ws_ = d.welcome.get("station") or {}
-        if ws_.get("stationId") != sid or ws_.get("seq") != 6 or ws_.get("name") != \
+        if ws_.get("stationId") != sid or ws_.get("seq") != 14 or ws_.get("name") != \
                 "Indie Song 12-0 radio" or ws_.get("seed", {}).get("ids") != [seed] \
                 or ws_.get("character") != "balanced" or "exhausted" not in ws_ \
                 or ws_.get("origin") != "radio":
@@ -180,38 +180,87 @@ async def session_suite(failures, log_path):
             failures.append(f"a backward jump steered: rev {c.rev(sid)}")
 
         # ----- 4. report-driven: the report BEFORE the move decides ---------- #
+        # On positions not judged yet: a position judged once is never judged
+        # again (case 6).
+        await c.act(action="jump", index=3)      # 0 -> 3: not the next one, neither
         await asyncio.sleep(2.3)   # past INTENT_GRACE, so reports move the index again
-        await r.report(index=0, positionMs=190_000, isPlaying=True)
+        await r.report(index=3, positionMs=190_000, isPlaying=True)
         await settle(0.15)
-        await r.report(index=1, positionMs=500, isPlaying=True)   # auto-advance
+        await r.report(index=4, positionMs=500, isPlaying=True)   # auto-advance
         await settle()
         if c.rev(sid) != rev0 + 3:
             failures.append(f"95% then an auto-advance did not steer: rev {c.rev(sid)}")
-        await r.report(index=1, positionMs=5_000, isPlaying=True)
+        await r.report(index=4, positionMs=5_000, isPlaying=True)
         await settle(0.15)
-        await r.report(index=2, positionMs=300, isPlaying=True)
+        await r.report(index=5, positionMs=300, isPlaying=True)
         await settle()
         if c.rev(sid) != rev0 + 4:
             failures.append(f"5 s then an auto-advance did not steer: rev {c.rev(sid)}")
 
         # ----- 5. a stale report = nothing ----------------------------------- #
-        await c.act(action="next")          # 2 -> 3 at 300 ms: a skip, by the act
-        await r.report(index=2, positionMs=12_000, isPlaying=True)   # sampled before it
+        await c.act(action="next")          # 5 -> 6 at 300 ms: a skip, by the act
+        await r.report(index=5, positionMs=12_000, isPlaying=True)   # sampled before it
         await settle(0.15)
-        await r.report(index=3, positionMs=900, isPlaying=True)
+        await r.report(index=6, positionMs=900, isPlaying=True)
         await settle()
         if c.rev(sid) != rev0 + 5:
             failures.append(f"a stale report was judged, or the act was not: rev {c.rev(sid)}")
-        if c.session.get("index") != 3:
+        if c.session.get("index") != 6:
             failures.append(f"the stale report moved the session: index {c.session.get('index')}")
 
-        # ----- 6. setQueue = neither; binds and unbinds ---------------------- #
-        await r.report(index=3, positionMs=150_000, isPlaying=True)
+        # ----- 6. an index flipping back and forth counts once --------------- #
+        # A stale report after INTENT_GRACE moves the session back, the next moves
+        # it forward again: the forward move is judged a skip of index 5 a second
+        # time, and must not steer twice.
+        await asyncio.sleep(2.3)
+        await r.report(index=5, positionMs=12_000, isPlaying=True)
+        await settle(0.15)
+        await r.report(index=6, positionMs=400, isPlaying=True)
+        await settle()
+        if c.rev(sid) != rev0 + 5:
+            failures.append(f"a flip back and forth steered again: rev {c.rev(sid)}")
+
+        # ----- 7. a `next` on a paused session is not judged ----------------- #
+        await r.report(index=6, positionMs=10_000, isPlaying=False)
+        await settle()
+        await c.act(action="next")             # 6 -> 7 while paused
+        await settle()
+        if c.rev(sid) != rev0 + 5:
+            failures.append(f"a next on a paused session steered: rev {c.rev(sid)}")
+        await r.report(index=7, positionMs=1_000, isPlaying=True)
+        await settle()
+
+        # ----- 8. a skip is a step forward in PLAY order (shuffle) ----------- #
+        await c.act(action="shuffle", on=True)
+        await settle()
+        order = c.session.get("order") or []
+        if not order or order[0] != 7:
+            failures.append(f"shuffle order should start at the current track: {order}")
+        await r.report(index=7, positionMs=10_000, isPlaying=True)
+        await settle()
+        await c.act(action="next")             # 7 -> order[1]: the next in play order
+        await settle()
+        x = c.session.get("index")
+        if x != (order[1] if len(order) > 1 else None) or c.rev(sid) != rev0 + 6:
+            failures.append(f"next under shuffle was not a skip: index {x}, order {order}, "
+                            f"rev {c.rev(sid)}")
+        pos = order.index(x) if x in order else 0
+        y = next(i for i in range(len(queue)) if i != x
+                 and i != order[(pos + 1) % len(order)] and abs(i - x) == 1)
+        await c.act(action="jump", index=y)    # the neighbour by index, not by play order
+        await settle()
+        if c.rev(sid) != rev0 + 6:
+            failures.append(f"a jump to index {y}, not next in play order {order}, steered")
+        await c.act(action="shuffle", on=False)
+        await settle()
+
+        # ----- 9. setQueue = neither; binds and unbinds ---------------------- #
+        await r.report(index=y, positionMs=150_000, isPlaying=True)
         await settle()
         await r.act(action="setQueue", tracks=queue, index=0, play=True,
                     savedQueueId="q_sig", stationId=sid)
         await settle()
-        if c.rev(sid) != rev0 + 5:
+        if c.rev(sid) != rev0 + 6:
             failures.append(f"setQueue steered the station: rev {c.rev(sid)}")
         await r.act(action="setQueue", tracks=queue[:3], index=0, play=True,
                     savedQueueId="q_sig2")
@@ -230,7 +279,7 @@ async def session_suite(failures, log_path):
         if c.session.get("stationId") != sid:
             failures.append("re-binding by setQueue failed")
 
-        # ----- 7. ended = played through, once ------------------------------- #
+        # ----- 10. ended = played through, once ------------------------------ #
         last = len(queue) - 1
         await c.act(action="jump", index=last)   # 0 -> last: not the next one, neither
         await settle()
@@ -240,11 +289,11 @@ async def session_suite(failures, log_path):
         await settle()
         await r.report(index=last, positionMs=199_000, isPlaying=False, ended=True)
         await settle()
-        if before != rev0 + 5 or c.rev(sid) != rev0 + 6:
-            failures.append(f"ended: rev {rev0 + 5} -> {before} -> {c.rev(sid)}, "
+        if before != rev0 + 6 or c.rev(sid) != rev0 + 7:
+            failures.append(f"ended: rev {rev0 + 6} -> {before} -> {c.rev(sid)}, "
                             "expected one step, at the ended report")
 
-        # ----- 9. bound: skip/played signals are the hub's own ---------------- #
+        # ----- 11. bound: skip/played signals are the hub's own --------------- #
         for kind in ("skip", "played"):
             st_, sg = await acall(port, "POST", "/sonic/station/signal", {
                 "stationId": sid, "trackId": a["tracks"][0]["id"], "kind": kind})
@@ -252,7 +301,7 @@ async def session_suite(failures, log_path):
                 failures.append(f"a {kind} signal for a bound station: {sg}")
         st_, sg = await acall(port, "POST", "/sonic/station/signal", {
             "stationId": sid, "trackId": a["tracks"][1]["id"], "kind": "like"})
-        if not sg.get("applied") or sg.get("rev") != rev0 + 7:
+        if not sg.get("applied") or sg.get("rev") != rev0 + 8:
             failures.append(f"a like on a bound station: {sg}")
         st_, sg = await acall(port, "POST", "/sonic/station/signal", {
             "stationId": sid, "kind": "character", "value": "explore"})
@@ -261,7 +310,30 @@ async def session_suite(failures, log_path):
                                             for f in c.station_frames):
             failures.append(f"a character change did not reach the frame: {sg}")
 
+        # ----- 12. a queue track with an id that is not a song id ------------ #
+        bogus = [{"id": "../not a song id", "title": "Bogus", "artist": "X",
+                  "durationMs": DUR}, queue[1]]
+        await r.act(action="setQueue", tracks=bogus, index=0, play=True,
+                    savedQueueId="q_bogus")
+        await settle()
+        await r.report(index=0, positionMs=195_000, isPlaying=True)
+        await settle(0.15)
+        await r.report(index=1, positionMs=300, isPlaying=True)
+        await settle()
+
+        # ----- 13. no active device: nothing is judged ----------------------- #
+        await r.ws.close()
+        await settle(0.6)
+        if c.session.get("activeDeviceId") is not None:
+            failures.append("the receiver left but the session kept it active")
+        await c.act(action="previous")
+        await c.act(action="next")
+        await settle()
+
         # clear unbinds
+        await c.act(action="setQueue", tracks=queue, index=0, play=False,
+                    savedQueueId="q_sig", stationId=sid)
+        await settle()
         await c.act(action="clear")
         await settle()
         if c.session.get("stationId") is not None:
@@ -290,26 +362,40 @@ async def session_suite(failures, log_path):
                 failures.append(f"mix {name}: {m.get('kind')} {m.get('character')} "
                                 f"{m.get('moodCharacter')}, expected {kind} {ch} {mood}")
         await e.ws.close()
-        await r.ws.close()
         await c.ws.close()
     finally:
         stop(proc)
         am_srv.shutdown()
         nd_srv.shutdown()
+        try:
+            with open(state + ".history", encoding="utf-8") as f:
+                hist = f.read()
+            if "not a song id" in hist:
+                failures.append("a queue id that is not a song id entered the history")
+            if '"plays"' not in hist:
+                failures.append("the history file has no plays")
+        except FileNotFoundError:
+            failures.append("no history file after the session suite")
         unlink_all(state)
 
     got = judgements(log_path)
     steering = [(i, j, v) for i, j, v, steer in got if steer]
-    want = [(0, "1", "played"), (1, "2", "skip"), (2, "0", "neither"),
-            (0, "1", "played"), (1, "2", "skip"), (2, "3", "skip"),
-            (0, "6", "neither"), (6, "None", "played")]
-    if steering != want:
-        failures.append(f"the hub's judgements: {steering}, expected {want} — the "
-                        "setQueues, the stale report and the repeated `ended` steer nothing")
+    head = [(0, "1", "played"), (1, "2", "skip"), (2, "0", "neither"),
+            (0, "3", "neither"), (3, "4", "played"), (4, "5", "skip"), (5, "6", "skip"),
+            (6, "5", "neither"), (5, "6", "skip")]
+    if steering[:len(head)] != head:
+        failures.append(f"the hub's judgements: {steering[:len(head)]}, expected {head}")
+    tail = steering[len(head):]
+    # 8: the skip under shuffle and the neighbour jump; 10: the jump and `ended`;
+    # 12: the bogus queue's play-through. Nothing for the paused next (7), the
+    # repeated `ended`, or the acts with no active device (13).
+    kinds = [v for _i, _j, v in tail]
+    if kinds != ["skip", "neither", "neither", "played", "played"]:
+        failures.append(f"judgements after the flip: {tail}")
     history_only = [g for g in got if not g[3]]
-    if len(history_only) != 5:
-        failures.append(f"four setQueues and a clear should each feed the history only: "
-                        f"{history_only}")
+    if len(history_only) != 4:
+        failures.append(f"the four setQueues on a playing session should each feed the "
+                        f"history only: {history_only}")
 
 
 class Sleepy(http.server.BaseHTTPRequestHandler):
@@ -320,6 +406,42 @@ class Sleepy(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_a):
         pass
+
+
+async def timeout_suite(failures):
+    """B-136 through the real path: a fingerprint call that times out inside the
+    hub (Your mix, via SONIC with the Navidrome creds injected), the hub's own
+    output captured."""
+    import test_station_engine as eng_t
+    am_srv, am_url = serve(AudioMuse)
+    port = _free_port()
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    log_path = state + ".log"
+    eng_t.AM["slow_fp"] = 9.0           # past STATION_CALL_TIMEOUT (8 s)
+    proc = spawn(port, state, am_url, None, extra={"HUB_STATION_HISTORY": "0"},
+                 log_path=log_path)
+    try:
+        await asyncio.to_thread(wait_up, port)
+        st_, ym = await acall(port, "POST", "/sonic/station/start",
+                              {"seed": {"kind": "yourMix"}, "count": 3})
+        if st_ != 503 or not ym.get("fallback"):
+            failures.append(f"Your mix with a timed-out fingerprint: {st_} {ym}")
+    finally:
+        stop(proc)
+        eng_t.AM["slow_fp"] = 0.0
+        am_srv.shutdown()
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        unlink_all(state)
+        try:
+            os.unlink(log_path)
+        except FileNotFoundError:
+            pass
+    line = next((ln for ln in text.splitlines() if "timed out after" in ln), "")
+    if "/api/sonic_fingerprint/generate" not in line:
+        failures.append(f"the timed-out fingerprint call left no log line: {text[-400:]!r}")
+    if ND_PASS in text or "navidrome_password" in text or "?" in line:
+        failures.append(f"the timeout line carries the query: {line!r}")
 
 
 def log_checks(failures, log_path):
@@ -354,6 +476,7 @@ async def main():
     try:
         await session_suite(failures, log_path)
         log_checks(failures, log_path)
+        await timeout_suite(failures)
     finally:
         try:
             os.unlink(log_path)
@@ -365,9 +488,12 @@ async def main():
             print("  -", f)
         sys.exit(1)
     print("PASS - station signals: 90%-next-played/next-at-10s-skip/backward-neither/"
-          "report-before-the-move-decides/stale-report-nothing/setQueue-neither+binds+"
+          "report-before-the-move-decides/stale-report-nothing/flip-back-counts-once/"
+          "paused-next-not-judged/skip-in-shuffle-play-order/setQueue-neither+binds+"
           "unbinds/ended-played-once/frame+welcome.station+feature/bound-signals-ignored/"
-          "clear-unbinds/no-credentials-in-logs/timeout-line-path-only/mix-character+legacy")
+          "bad-queue-id-not-in-history/no-active-device-not-judged/clear-unbinds/"
+          "no-credentials-in-logs/timeout-line-path-only/timed-out-fingerprint-logs-path-"
+          "only/mix-character+legacy")
 
 
 if __name__ == "__main__":
