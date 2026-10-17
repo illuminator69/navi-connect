@@ -3928,12 +3928,14 @@ class StationEngine:
         self._stations_touch()
         s = self.hub.session
         bound = bool(bind and bind == s.saved_queue_id and st.id in self.stations)
+        # The station frame first: a client must never meet a `session.stationId`
+        # naming a station whose frame it has not been sent.
+        await self._announce(st)
         if bound:
             s.station_id = st.id
             s.bump()
             await self.hub._broadcast_session()  # noqa: SLF001 — same module
         # (A bindSession naming another queue is not an error: `bound: false`.)
-        await self._announce(st)
         dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
              f"engine {st.engine}, rungs {b.rungs}")
         answer = {**self._answer(st, tracks, exhausted, partial), "name": st.name,
