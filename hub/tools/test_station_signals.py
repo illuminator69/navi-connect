@@ -60,6 +60,7 @@ class SClient(Client):
         self.station_frames: list[dict] = []
         self.welcome: dict = {}
         self.session: dict = {}
+        self.order: list[tuple] = []   # ("station" | "session", stationId), in arrival order
 
     async def _loop(self):
         try:
@@ -72,8 +73,10 @@ class SClient(Client):
                     self.mixes = msg.get("mixes", [])
                 elif t == "session":
                     self.session = msg
+                    self.order.append(("session", msg.get("stationId")))
                 elif t == "station":
                     self.station_frames.append(msg)
+                    self.order.append(("station", msg.get("stationId")))
                 elif t == "mixes":
                     self.mixes = msg.get("mixes", [])
                 elif t == "do":
@@ -310,6 +313,45 @@ async def session_suite(failures, log_path):
                                             for f in c.station_frames):
             failures.append(f"a character change did not reach the frame: {sg}")
 
+        # ----- stop: autoplay Off, on the frame and in welcome --------------- #
+        st_, sp = await acall(port, "POST", "/sonic/station/signal",
+                              {"stationId": sid, "kind": "stop"})
+        await settle()
+        if not any(f.get("stationId") == sid and f.get("stopped") is True
+                   and f.get("rev") == sp.get("rev") for f in c.station_frames):
+            failures.append(f"no station frame saying stopped: {c.station_frames[-1:]}")
+        d2 = SClient("Late2", device_id="late2", caps=["controller"])
+        await d2.connect(url)
+        if (d2.welcome.get("station") or {}).get("stopped") is not True:
+            failures.append(f"welcome.station must carry stopped: {d2.welcome.get('station')}")
+        await d2.ws.close()
+        st_, cs = await acall(port, "POST", "/sonic/station/signal", {
+            "stationId": sid, "kind": "character", "value": "explore"})   # its own
+        await settle()
+        if cs.get("rev") != sp.get("rev") + 1 or (c.station_frames[-1].get("stopped")
+                                                   is not False):
+            failures.append(f"a character signal must clear stopped on the frame: "
+                            f"{cs} {c.station_frames[-1:]}")
+
+        # ----- a bound start: its station frame before the session naming it - #
+        await r.act(action="setQueue", tracks=queue[:2], index=0, play=True,
+                    savedQueueId="q_order")
+        await settle()
+        c.order.clear()
+        st_, ob = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L13_0"]}, "count": 3,
+            "bindSession": "q_order"})
+        await settle()
+        oid = ob.get("stationId")
+        frame_at = next((i for i, (t, x) in enumerate(c.order)
+                         if t == "station" and x == oid), None)
+        session_at = next((i for i, (t, x) in enumerate(c.order)
+                           if t == "session" and x == oid), None)
+        if not ob.get("bound") or frame_at is None or session_at is None \
+                or frame_at > session_at:
+            failures.append(f"a bound start must send its station frame before the "
+                            f"session naming it: {c.order}")
+
         # ----- 12. a queue track with an id that is not a song id ------------ #
         bogus = [{"id": "../not a song id", "title": "Bogus", "artist": "X",
                   "durationMs": DUR}, queue[1]]
@@ -393,8 +435,10 @@ async def session_suite(failures, log_path):
     if kinds != ["skip", "neither", "neither", "played", "played"]:
         failures.append(f"judgements after the flip: {tail}")
     history_only = [g for g in got if not g[3]]
-    if len(history_only) != 4:
-        failures.append(f"the four setQueues on a playing session should each feed the "
+    # Case 9's four, and case 12's (the bound-start case before it left the
+    # session playing).
+    if len(history_only) != 5:
+        failures.append(f"the five setQueues on a playing session should each feed the "
                         f"history only: {history_only}")
 
 
@@ -492,6 +536,7 @@ async def main():
           "paused-next-not-judged/skip-in-shuffle-play-order/setQueue-neither+binds+"
           "unbinds/ended-played-once/frame+welcome.station+feature/bound-signals-ignored/"
           "bad-queue-id-not-in-history/no-active-device-not-judged/clear-unbinds/"
+          "stop-on-frame+welcome/character-clears-stop/bound-start-frame-before-session/"
           "no-credentials-in-logs/timeout-line-path-only/timed-out-fingerprint-logs-path-"
           "only/mix-character+legacy")
 

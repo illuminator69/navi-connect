@@ -679,6 +679,32 @@ async def main_suite(failures):
         if st_ != 400:
             failures.append(f"next without after: {st_} {r6}")
 
+        # ----- stop: autoplay Off, shared ------------------------------------ #
+        if r0.get("stopped") is not False:
+            failures.append(f"a new station must not be stopped: {r0.get('stopped')}")
+        st_, sp1 = await acall(port, "POST", "/sonic/station/signal",
+                               {"stationId": rsid, "kind": "stop"})
+        st_, sp2 = await acall(port, "POST", "/sonic/station/signal",
+                               {"stationId": rsid, "kind": "stop",
+                                "trackId": r0["tracks"][0]["id"]})
+        if not sp1.get("applied") or sp2.get("rev") != sp1.get("rev") \
+                or sp1.get("rev") != r3.get("rev", 0) + 1:
+            failures.append(f"stop, then stop again: {sp1} {sp2} (rev before "
+                            f"{r3.get('rev')})")
+        st_, ns = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": rsid, "after": 15, "count": 5, "deviceId": "dev-b"})
+        if st_ != 200 or ns.get("tracks") or ns.get("stopped") is not True \
+                or ns.get("exhausted") or ns.get("partial") or ns.get("seq") != 15:
+            failures.append(f"next on a stopped station: {st_} {ns}")
+        st_, cs = await acall(port, "POST", "/sonic/station/signal", {
+            "stationId": rsid, "kind": "character", "value": ns.get("character")})
+        if cs.get("rev") != sp1.get("rev") + 1:
+            failures.append(f"the station's own character must start it again: {cs}")
+        st_, nr = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": rsid, "after": 15, "count": 5, "deviceId": "dev-b"})
+        if len(nr.get("tracks", [])) != 5 or nr.get("stopped") is not False:
+            failures.append(f"next after a character signal: {nr}")
+
         # ----- 6. bindSession and session_bound ----------------------------- #
         cl = Client("Binder", device_id="binder")
         await cl.connect(f"ws://127.0.0.1:{port}")
@@ -827,6 +853,11 @@ async def main_suite(failures):
         # Also a version of a song: whichever Echo Song station 2 served (if any),
         # its siblings must now be out for every station.
         before_seq = seq
+        # A stopped station stays stopped across the restart.
+        st_, q0 = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L21_1"]}, "count": 3})
+        await acall(port, "POST", "/sonic/station/signal",
+                    {"stationId": q0["stationId"], "kind": "stop"})
     finally:
         stop(proc)
 
@@ -855,6 +886,10 @@ async def main_suite(failures):
             failures.append("the restarted station served a track it had served")
         if nx.get("origin") != "continue":
             failures.append(f"origin did not survive the restart: {nx.get('origin')}")
+        st_, qn = await acall(port, "POST", "/sonic/station/next", {
+            "stationId": q0["stationId"], "after": 3, "count": 3})
+        if qn.get("stopped") is not True or qn.get("tracks"):
+            failures.append(f"stopped did not survive the restart: {st_} {qn}")
         st_, again = await acall(port, "POST", "/sonic/station/start", {
             "seed": {"kind": "track", "ids": [seed]}, "character": "balanced",
             "count": 50, "deviceId": "dev-a"})
@@ -1414,6 +1449,7 @@ async def main():
           "500-mid-ladder-partial/after-replay+servedElsewhere/session_bound-409/"
           "unlisted-keys-dropped/your-mix/restart-keeps-station+history/"
           "explore-drifts-only-after-a-play-through/budget-from-arrival/"
+          "stop+next-empty+repeat-stop+character-restarts+stopped-survives-restart/"
           "own-pool-old-clients-unstarved/busy-is-not-unreachable/5000-id-seed-fast/"
           "nan-history-loads/aM404+nd-empty-seed_unknown/429+bad-body-partial/"
           "dislike+unlike+idempotent-signals/exclude-start+next/bound-queue-excluded/"
