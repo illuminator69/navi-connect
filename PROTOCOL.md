@@ -81,7 +81,8 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
                              "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
-                 "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station"],
+                 "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station",
+                              "stationEdits"],
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899" },   // §15.3
@@ -2801,10 +2802,12 @@ servedElsewhere}`.
 ```jsonc
 { "stationId": "st_…", "trackId": "…",
   "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character" | "stop",
-  "value": "explore" }       // only for `character`
+  "value": "explore",        // only for `character`
+  "apply": true }            // only for `character` and `stop`, hub with "stationEdits" (§18.2)
 ```
 
-Answers `{rev, applied, ignored?}`.
+Answers `{rev, applied, ignored?}`, and with `apply`, `edited: {removed, added, from} | false`
+and on `false` a `reason` (§18.2).
 
 - **Likes come only from here:** a star goes from the client straight to Navidrome, and the hub
   never sees it.
@@ -2852,6 +2855,40 @@ never change; they are there so a device that learns of a station only from a fr
 bound to (`null` when none), so a device that connects mid-station knows `after` without a
 round trip. The station is the session's: whichever device drives autoplay continues it with
 `next`, and the `seq` cursor is what keeps two such devices from both adding a batch.
+
+**The hub edits the bound queue (`stationEdits`, 2026-10-17).** A device can only swap the rows
+it fetched itself, and the playing device never heard a change made elsewhere, so a character
+change or Off from a controller, or after a transfer, left the old station rows in the queue. A
+`character` or `stop` signal with `apply: true`, for the station `session.stationId` names, while
+the session has a queue, makes the hub edit `session.queue` itself:
+
+- **The cut** is a position in play order (`order` under shuffle): the playing track's + 1, or
+  + 2 while it has under 20 s left or no known `durationMs` (the next one may be decoding). The
+  playing track is never touched.
+- **Removed:** every row from the cut on whose id this station served. A row it never served (a
+  song the user added) stays.
+- **`stop`** inserts nothing.
+- **`character`** (a stopped station's included) computes a batch with the new character,
+  `max(5, min(removed, 10))` tracks, excluding everything left in the queue. Without shuffle it
+  goes where the first removed row was, or at the end when none was. With shuffle the rows are
+  appended to the queue and placed in play order right after the cut, or at its end when none
+  was removed. `seq` moves by the batch as for `next`.
+- **Rows** are shaped as clients send them in `setQueue`: from Navidrome's `getSong` when the hub
+  has Tier 1 (`id`, `title`, `artist`, `album`, `albumId`, `durationMs`, `coverArtId`), else the
+  station's own (`id`, `title`, `artist`, `album`), with `serverId` copied from a queue track
+  that carries one.
+- **One session mutation,** computed against the session as it is when the batch is ready (the
+  cut and the removals are found again then), one edit per station at a time. The playing device
+  is sent `queueChanged` (never `load`: it keeps playing), then `session`, `savedQueues` (the
+  current record follows the queue, as for `enqueue`) and the `station` frame.
+- `edited: {removed, added, from}`: how many rows went and came, and the play-order position the
+  new rows start at (the cut when none were added). `edited: false` with `reason`:
+  `"transfer"` (a transfer is under way and acts are held; the signal itself still applies),
+  `"busy"` (the 12 s budget ran out waiting), `"unbound"` (the session stopped being this
+  station's while the batch was computed), `"empty"` (no queue), `"error"` (the edit failed in
+  the hub; logged).
+- Without `apply`, or for a station the session is not bound to, a signal answers as before
+  and edits nothing. A hub without `"stationEdits"` ignores `apply` (it drops the key).
 
 ### 18.3 What steers a station
 
