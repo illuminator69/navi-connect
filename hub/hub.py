@@ -143,7 +143,11 @@ ECHO_BACKSTOP = 12.0
 # `act:sleepTimer` with `bad_action`, so a client sends neither without them.
 # `station` (§18): the station engine, `session.stationId`, `setQueue.stationId`
 # and the `station` frame. Without it a client runs its own radio and autoplay.
-HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station"]
+# `stationEdits` (§18.2): a `character` or `stop` signal with `apply` edits the
+# bound station's queue here, for every device; without it each client edits the
+# rows it fetched itself.
+HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station",
+                "stationEdits"]
 # "I apply `do:setVolume` while I am not the playing device." Only a device that
 # says so on its current connection is sent one while idle (PROTOCOL §5.1): to
 # anything else the directive would be a level recorded here and applied nowhere.
@@ -2447,7 +2451,7 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
         "body": ("stationId", "after", "count", "exclude", "deviceId"),
     },
     ("POST", "/sonic/station/signal"): {
-        "method": "POST", "body": ("stationId", "trackId", "kind", "value"),
+        "method": "POST", "body": ("stationId", "trackId", "kind", "value", "apply"),
     },
 }
 
@@ -2457,6 +2461,9 @@ _STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character", 
 # going with autoplay off — or "continue" — autoplay continued a queue, and it stops
 # when autoplay is turned off. Anything else is "radio".
 _STATION_ORIGINS = ("radio", "continue")
+# A queue edit (§18.2 `apply`) never touches the playing track, and not the next
+# one either while the playing one has less than this left (it may be decoding).
+STATION_EDIT_TAIL_MS = 20_000
 
 
 def _now_ms() -> int:
@@ -4031,7 +4038,7 @@ class StationEngine:
                 st.stopped = True
                 self._bump(st)
                 self._changed(st)
-            return 200, {"rev": st.rev, "applied": True}
+            return 200, await self._maybe_edit(st, kind, body)
         if kind == "character":
             value = body.get("value")
             if value not in STATION_CHARACTERS:
@@ -4043,7 +4050,7 @@ class StationEngine:
                 st.stopped = False
                 self._bump(st)
                 self._changed(st)
-            return 200, {"rev": st.rev, "applied": True}
+            return 200, await self._maybe_edit(st, kind, body)
         tid = body.get("trackId")
         if kind in ("skip", "played") and self.hub.session.station_id == st.id:
             # The hub hears this station's queue itself (§18.3).
@@ -4079,6 +4086,182 @@ class StationEngine:
             self._bump(st)
             self._changed(st)
         return 200, {"rev": st.rev, "applied": True}
+
+    # ----- editing the bound station's queue (§18.2 `apply`) ---------------- #
+    async def _maybe_edit(self, st: Station, kind: str, body: dict) -> dict:
+        """The answer to a `character` or `stop` signal, and the queue edit it asks
+        for. Without `apply`, or for a station the session is not bound to, exactly
+        the old answer: the signal alone."""
+        answer: dict = {"rev": st.rev, "applied": True}
+        if body.get("apply") is not True or self.hub.session.station_id != st.id:
+            return answer
+        try:
+            answer.update(await self._edit_queue(st, kind))
+        except Exception as e:  # noqa: BLE001 — the signal applied; the edit is extra
+            log("station: queue edit failed:", e)
+            answer.update(edited=False, reason="error")
+        answer["rev"] = st.rev
+        return answer
+
+    def _edit_plan(self, st: Station) -> Optional[tuple[int, list[int]]]:
+        """Where the bound queue may be edited, against the session as it is now:
+        (cut, removed). `cut` is a position in PLAY order: the playing track's + 1,
+        or + 2 while it has under STATION_EDIT_TAIL_MS left (or no known length),
+        since the next one may already be decoding. `removed` are the raw indices,
+        in play order, of every row from the cut on that this station served; a
+        row it never served (the user's own) stays."""
+        s = self.hub.session
+        if s.station_id != st.id or not s.queue:
+            return None
+        order = self.hub._play_order()  # noqa: SLF001 — same module
+        try:
+            pos = order.index(s.index)
+        except ValueError:
+            pos = 0
+        cur = s.queue[s.index] if 0 <= s.index < len(s.queue) else None
+        dur = _as_int(cur.get("durationMs"), 0, 0) if isinstance(cur, dict) else 0
+        near_end = dur <= 0 or dur - s.position_ms < STATION_EDIT_TAIL_MS
+        cut = pos + (2 if near_end else 1)
+        removed = [order[k] for k in range(cut, len(order))
+                   if isinstance(s.queue[order[k]], dict)
+                   and s.queue[order[k]].get("id") in st.served_ids]
+        return cut, removed
+
+    async def _track_dicts(self, tracks: list[dict], b: _StationBatch) -> list[dict]:
+        """Queue rows for what a batch answered, in the shape clients give setQueue:
+        Navidrome's getSong when Tier 1 is configured (id, title, artist, album,
+        albumId, durationMs, coverArtId), the answer's own row otherwise or when
+        getSong fails, and serverId copied from a queue track that carries one."""
+        server_id = next((t.get("serverId") for t in self.hub.session.queue
+                          if isinstance(t, dict) and isinstance(t.get("serverId"), str)),
+                         None)
+
+        async def one(t: dict) -> dict:
+            row = {"id": t["id"], "title": t.get("title") or "",
+                   "artist": t.get("artist") or "", "album": t.get("album") or ""}
+            if self.tier1_configured():
+                outcome, payload = await self._nd("getSong", {"id": t["id"]}, b)
+                song = (payload or {}).get("song") if outcome == "ok" else None
+                if isinstance(song, dict):
+                    row = {"id": t["id"], "title": _as_str(song.get("title")) or row["title"],
+                           "artist": _as_str(song.get("artist")) or row["artist"],
+                           "album": _as_str(song.get("album")) or row["album"]}
+                    for k_out, k_in in (("albumId", "albumId"), ("coverArtId", "coverArt")):
+                        v = _as_str(song.get(k_in))
+                        if v:
+                            row[k_out] = v
+                    dur = song.get("duration")
+                    if isinstance(dur, (int, float)) and not isinstance(dur, bool) \
+                            and math.isfinite(dur) and dur > 0:
+                        row["durationMs"] = int(dur * 1000)
+            if server_id:
+                row["serverId"] = server_id
+            return row
+        return list(await asyncio.gather(*(one(t) for t in tracks)))
+
+    async def _edit_queue(self, st: Station, kind: str) -> dict:
+        """§18.2: edit the bound queue for a character change or a stop, for every
+        device at once. Station rows from the cut on go; a character change puts
+        a new batch where the first of them was. One session mutation, computed
+        against the session as it is when the batch is ready, sent to the playing
+        device as `queueChanged` (never `load`: it keeps playing)."""
+        hub = self.hub
+        if hub._drain_task is not None:  # noqa: SLF001 — acts are held for a transfer
+            return {"edited": False, "reason": "transfer"}
+        deadline = time.monotonic() + STATION_BUDGET_S
+        lock = self._lock(st.id)
+        if not await self._acquire(lock, deadline):
+            return {"edited": False, "reason": "busy"}
+        try:
+            plan = self._edit_plan(st)
+            if plan is None:
+                return {"edited": False, "reason": "unbound" if hub.session.queue
+                        else "empty"}
+            tracks: list[dict] = []
+            b: Optional[_StationBatch] = None
+            if kind == "character" and not st.stopped:
+                _cut, removed = plan
+                gone = set(removed)
+                keep = {t.get("id") for i, t in enumerate(hub.session.queue)
+                        if i not in gone and isinstance(t, dict)}
+                count = max(5, min(len(removed), 10))
+                if not await self._acquire(self._computing, deadline):
+                    return {"edited": False, "reason": "busy"}
+                try:
+                    b = _StationBatch(deadline)
+                    tracks = await self._compute(st, count, keep, b)
+                    rows = await self._track_dicts(tracks, b)
+                finally:
+                    self._computing.release()
+            else:
+                rows = []
+            # The awaits above let the session move: judge it again as it is now.
+            if hub._drain_task is not None:  # noqa: SLF001
+                return {"edited": False, "reason": "transfer"}
+            plan = self._edit_plan(st)
+            if plan is None:
+                return {"edited": False, "reason": "unbound"}
+            cut, removed = plan
+            s = hub.session
+            gone = set(removed)
+            present = {t.get("id") for i, t in enumerate(s.queue)
+                       if i not in gone and isinstance(t, dict)}
+            keep_new = [i for i, r in enumerate(rows) if r["id"] not in present]
+            rows = [rows[i] for i in keep_new]
+            if b is not None:
+                b.picked_meta = [b.picked_meta[i] for i in keep_new
+                                 if i < len(b.picked_meta)]
+                tracks = [tracks[i] for i in keep_new]
+                self._commit(st, tracks, b, None, st.seq, st.rev)
+                self._stations_touch()
+            if not removed and not rows:
+                return {"edited": {"removed": 0, "added": 0, "from": cut}}
+            at = self._apply_edit(cut, removed, rows)
+            s.bump()
+            hub._sync_current_saved_queue()  # noqa: SLF001 — the record follows the queue
+            await hub._do(hub._dev(s.active_device_id), "queueChanged",  # noqa: SLF001
+                          tracks=s.queue, index=s.index)
+            await hub._broadcast_session()  # noqa: SLF001
+            await hub._broadcast_saved_queues()  # noqa: SLF001
+            await self._announce(st)
+            log(f"station {st.id}: {kind} edited the queue at play position {at}: "
+                f"{len(removed)} out, {len(rows)} in")
+            return {"edited": {"removed": len(removed), "added": len(rows), "from": at}}
+        finally:
+            lock.release()
+
+    def _apply_edit(self, cut: int, removed: list[int], rows: list[dict]) -> int:
+        """The one session mutation: drop `removed`, put `rows` in. Returns the play
+        position the inserted rows start at (the cut when nothing is inserted).
+        Without shuffle they go where the first removed row was, or at the end when
+        none was; with shuffle they are appended to the queue and placed in play
+        order right after the cut (or at its end when none was removed)."""
+        s = self.hub.session
+        gone = set(removed)
+        shuffled = s.order is not None and len(s.order) == len(s.queue)
+        remap: dict[int, int] = {}
+        queue: list = []
+        for i, t in enumerate(s.queue):
+            if i not in gone:
+                remap[i] = len(queue)
+                queue.append(t)
+        index = remap.get(s.index, 0)
+        if shuffled:
+            order = [remap[v] for v in s.order if v in remap]
+            base = len(queue)
+            queue.extend(rows)
+            at = min(cut, len(order)) if removed else len(order)
+            order[at:at] = list(range(base, base + len(rows)))
+            s.order = order
+        else:
+            # Every removed row lies after the playing one, so the first of them
+            # keeps its raw position once the rest are gone.
+            at = min(removed) if removed else len(queue)
+            at = min(at, len(queue))
+            queue[at:at] = rows
+        s.queue = queue
+        s.index = index
+        return at
 
     def _changed(self, st: Station) -> None:
         self._stations_touch()
