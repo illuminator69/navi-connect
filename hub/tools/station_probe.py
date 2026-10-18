@@ -236,7 +236,7 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=5)
     ap.add_argument("--skip", default="")
     ap.add_argument("--played", default="")
-    ap.add_argument("--navidrome", default="http://192.168.129.153:4533")
+    ap.add_argument("--navidrome", default="http://localhost:4533")
     ap.add_argument("--tier1-only", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
