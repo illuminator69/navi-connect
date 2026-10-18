@@ -2916,6 +2916,9 @@ class StationEngine:
         self._auth_logged = False
         self._locks: dict[str, asyncio.Lock] = {}
         self._computing = asyncio.Semaphore(STATION_COMPUTING_MAX)
+        # saved queue id -> the station binding it while its frame goes out, before
+        # `session.stationId` names it: a second start must meet the binding then too.
+        self._binding: dict[str, str] = {}
         self._nd_sem = asyncio.Semaphore(STATION_CALLS_PER_REQUEST)
         # The tiers' last verdicts (None = never asked) and whether Navidrome
         # offers AudioMuse's sonic similarity (`getSonicSimilarTracks`).
@@ -3881,8 +3884,13 @@ class StationEngine:
 
         def bound_conflict() -> Optional[tuple[int, dict]]:
             s = self.hub.session
-            if bind and bind == s.saved_queue_id and s.station_id in self.stations:
-                return 409, {"code": "session_bound", "stationId": s.station_id}
+            if not bind or bind != s.saved_queue_id:
+                return None
+            held = self._binding.get(bind)
+            if held is None and s.station_id in self.stations:
+                held = s.station_id
+            if held is not None:
+                return 409, {"code": "session_bound", "stationId": held}
             return None
 
         conflict = bound_conflict()
@@ -3940,8 +3948,15 @@ class StationEngine:
         s = self.hub.session
         bound = bool(bind and bind == s.saved_queue_id and st.id in self.stations)
         # The station frame first: a client must never meet a `session.stationId`
-        # naming a station whose frame it has not been sent.
-        await self._announce(st)
+        # naming a station whose frame it has not been sent. The binding is claimed
+        # before that await, or a start arriving during it would bind too.
+        if bound:
+            self._binding[bind] = st.id
+        try:
+            await self._announce(st)
+        finally:
+            if bound:
+                self._binding.pop(bind, None)
         if bound:
             s.station_id = st.id
             s.bump()
