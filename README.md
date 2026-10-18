@@ -57,15 +57,25 @@ sources are ready, and what it's working on.
 ### Everything else
 
 - **One playback session, every device.** Control what's playing on one device from another; move
-  playback mid-song to your desktop, your phone, or a Chromecast, and it resumes on the same beat.
-- **Recommendations that follow you.** AudioMuse-AI similar-songs radio, artist radio, Song Journey,
-  text→mood search, and an adaptive "Mood Flow" that reacts to what you skip — playing on whichever
-  device is currently active.
+  playback mid-song to your desktop, your phone, or a Chromecast, and it resumes where it was. A
+  play, pause, seek or volume change shows at once on the device you pressed it on.
+- **Every device in one picker.** Each says what it is and how loud it is, and any one's volume can
+  be set from its row, playing or not. The sleep timer belongs to the session, not to one device.
+- **Stations that every device shares.** Radio and autoplay are computed by the hub, so a station
+  started on the phone carries on unchanged when playback moves to the desktop. Skips and
+  plays-through steer it, and no song repeats within it. Autoplay sits in the queue as four chips
+  (Off, Close, Balanced, Explore); a tap changes the upcoming songs at once, on whichever device is
+  playing.
+- **Mixed for You, the same in both clients.** Radio around a song, Your mix (built from what you
+  play most), a genre run, or more like one artist; plus Song Journey and text-to-music search.
+- **Discover and Listening.** Rows of fresh releases, ListenBrainz playlists, rediscoveries and
+  similar artists, and a listening-history page mirrored from ListenBrainz.
 - **Continue Listening across clients.** A shared, hub-owned queue history, so what you started on
   your phone is waiting on your desktop.
 
-Both halves are optional and fail soft: no lb-bot means the discography surface simply isn't there,
-no AudioMuse means those features grey out. The core remote-control layer needs neither.
+Both halves are optional and fail soft: no lb-bot means the discography surface simply isn't there;
+without AudioMuse the stations run on Navidrome's similar songs alone, and without the hub each
+client falls back to its own Auto DJ. The core remote-control layer needs neither.
 
 ---
 
@@ -75,9 +85,9 @@ Four pieces, three of them optional:
 
 | | |
 |---|---|
-| **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active — and never touches audio. Python, one file, ~200 lines of protocol. Lives in this repo under `hub/`. |
+| **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active, the sleep timer — and never touches audio. It also computes the stations, and proxies AudioMuse, lb-bot and the preview sidecar so no device carries their credentials. Python and `websockets`, one file. Lives in this repo under `hub/`. |
 | **Clients** | Every client is both a controller and a receiver. **Feishin** (desktop) and **Navic** (Android) each connect over WebSocket and can play, or hand playback to someone else. |
-| **AudioMuse-AI** | Optional. The recommendation engine behind radio, Song Journey and Mood Flow. Reached through the hub, so no device carries its credentials. |
+| **AudioMuse-AI** | Optional. The recommendation engine behind the stations, the mixes and Song Journey. Reached through the hub, so no device carries its credentials. |
 | **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, can acquire it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
 | **Preview sidecar** | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
 
@@ -90,7 +100,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 |---|---|
 | **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the preview sidecar, the docs, and the [prebuilt releases](../../releases). |
 | **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic). Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. GPL-3.0. |
-| **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening ~4,700 commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
+| **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
 
 ## Contents of this repo
