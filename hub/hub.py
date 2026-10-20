@@ -13,6 +13,7 @@ Stdlib + `websockets` only. Python 3.11+.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import http
@@ -187,6 +188,7 @@ MIX_KINDS = ("similar", "fingerprint", "adaptive", "genre", "artist", "station")
 # AudioMuse's three Mood Flow characters, the legacy names of the station
 # characters (§17.1, §18): a mix carries `character` and this name beside it.
 MIX_MOODS = ("EchoMatch", "SteadyVibes", "TransitionMaestro")
+MIX_SEED_IDS_MAX = 8  # a custom radio's artists (P5)
 MIX_COUNT_MAX = 500  # a recipe asks for a queue, not a library dump
 SQ_PROGRESS_THROTTLE = 5.0  # seconds between cursor writes to the current saved-queue record
 TOMBSTONE_MAX = 200  # remembered saved-queue deletions (so a client re-sync can't resurrect)
@@ -305,11 +307,11 @@ STATION_LEGACY = {"close": "EchoMatch", "balanced": "SteadyVibes",
                   "explore": "TransitionMaestro"}
 STATION_FROM_LEGACY = {v: k for k, v in STATION_LEGACY.items()}
 STATION_CATALOGUE = (
-    {"id": "close", "label": "Close", "legacy": "EchoMatch",
+    {"id": "close", "label": "Familiar", "legacy": "EchoMatch",
      "description": "Stays right next to what you started with."},
-    {"id": "balanced", "label": "Balanced", "legacy": "SteadyVibes",
+    {"id": "balanced", "label": "Blend", "legacy": "SteadyVibes",
      "description": "Near what you started with, with room to move."},
-    {"id": "explore", "label": "Explore", "legacy": "TransitionMaestro",
+    {"id": "explore", "label": "Discover", "legacy": "TransitionMaestro",
      "description": "Wanders further, steered by what you skip and like."},
 )
 STATION_MAX = 8                       # stations held at once, least recently used evicted
@@ -351,7 +353,16 @@ STATION_COOL_MS = 2 * 3600 * 1000     # an artist skipped enough is cooled this 
 STATION_SKIP_TTL_MS = 2 * 3600 * 1000 # a skip stays in the alchemy subtract set this long
 STATION_FINGERPRINT_N = 100
 STATION_MIX_ANCHORS = 5               # Your mix: at most this many of the top rows
-STATION_SEEDS_MAX = 5
+# A custom radio (P5) shares these among up to 8 artists: clamp(12 / artists, 1, 5)
+# songs each. AudioMuse answers a 400-row list in a median 189 ms (measured
+# 2026-10-20), so twelve anchors stay inside the budget.
+STATION_SEEDS_MAX = 12
+# Artist variety (§18.1 `variety`): how often one artist may come back. Medium is
+# the character's own numbers, and what an absent value means.
+STATION_VARIETIES = ("low", "medium", "high")
+# The count route (§18.1): its own slots, so a pick screen counting never holds a
+# `start` back, and never more than this many counts computing at once.
+STATION_COUNT_INFLIGHT = 2
 STATION_EXCLUDE_MAX = 1000
 STATION_HISTORY_MAX = 2000
 STATION_HISTORY_DAYS = 14
@@ -2436,6 +2447,25 @@ STATION_TUNING: dict[str, _StationTuning] = {
                               skips_to_cool=1, drift=True, artists=True),
 }
 
+def _with_variety(tune: _StationTuning, variety: Optional[str]) -> _StationTuning:
+    """A character's numbers under one station's Artist variety (P5 call 3).
+
+    Low: one more by an artist in any 10 (at most 3) and two fewer between them (at
+    least 1). High: one per artist in any 10 and at least 8 between. Medium, or no
+    value, is the character itself. The ceiling never moves: variety changes how
+    the pool is spaced out, not what is in it, so it is not a count key.
+    """
+    if variety == "low":
+        return dataclasses.replace(
+            tune, artist_cap=min(3, tune.artist_cap + 1),
+            seed_artist_cap=min(3, max(tune.seed_artist_cap, tune.artist_cap + 1)),
+            artist_gap=max(1, tune.artist_gap - 2))
+    if variety == "high":
+        return dataclasses.replace(tune, artist_cap=1, seed_artist_cap=1,
+                                   artist_gap=max(8, tune.artist_gap))
+    return tune
+
+
 STATION_ROUTES: dict[tuple[str, str], dict] = {
     # The probe and the shared catalogue: always 200, so both clients render the
     # same words whether or not this hub can compute a station.
@@ -2444,8 +2474,10 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
     ("POST", "/sonic/station/start"): {
         "method": "POST",
         "body": ("seed", "character", "count", "exclude", "bindSession", "deviceId",
-                 "origin"),
+                 "origin", "variety"),
     },
+    # Read-only: how many songs a seed set could draw from. Creates no station.
+    ("POST", "/sonic/station/count"): {"method": "POST", "body": ("seed", "character")},
     ("POST", "/sonic/station/next"): {
         "method": "POST",
         "body": ("stationId", "after", "count", "exclude", "deviceId"),
@@ -2454,6 +2486,13 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
         "method": "POST", "body": ("stationId", "trackId", "kind", "value", "apply"),
     },
 }
+
+# What this hub's routes take beyond §18's first version, so a client draws a control
+# only when the hub behind it obeys it (P5): the count route, the Artist variety
+# values, and the filters a custom radio may name (none yet; a later hub adds them
+# here and the clients draw them without a release).
+_STATION_FEATURES_PROBE = {"count": True, "varieties": list(STATION_VARIETIES),
+                           "filters": []}
 
 _STATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character", "stop")
@@ -2602,6 +2641,7 @@ class Station:
     used_at: int
     engine: str = "tier2"
     origin: str = "radio"            # radio | continue (_STATION_ORIGINS)
+    variety: str = "medium"          # Artist variety (STATION_VARIETIES), P5
     seq: int = 0                     # tracks served, ever
     rev: int = 0                     # moved by every signal and character change
     exhausted: bool = False
@@ -2639,12 +2679,16 @@ class Station:
         self.served_keys = {r[1] for r in self.served if r[1]}
         self.hops = {r[0]: r[3] for r in self.served}
 
+    def tune(self) -> _StationTuning:
+        """The character's numbers under this station's Artist variety."""
+        return _with_variety(STATION_TUNING[self.character], self.variety)
+
     def base_anchors(self) -> list[str]:
         return [m["id"] for m in self.anchor_meta]
 
     def anchors(self) -> list[str]:
         """The seed's (or Your mix's) anchors, then the likes the character allows."""
-        tune = STATION_TUNING[self.character]
+        tune = self.tune()
         base = self.base_anchors()
         extra = [i for i in self.likes if i not in base][:tune.like_anchors]
         return base + extra
@@ -2675,7 +2719,8 @@ class Station:
         return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
                 "character": self.character, "exhausted": self.exhausted,
                 "stopped": self.stopped, "name": self.name, "origin": self.origin,
-                # The seed too (≤5 ids and a name), so a device that adopted this
+                "variety": self.variety,
+                # The seed too (≤12 ids and a name), so a device that adopted this
                 # station from the session can start it again as itself if the hub
                 # loses it (B-139), not as a new continuation of whatever plays.
                 "seed": self.seed}
@@ -2685,7 +2730,7 @@ class Station:
             "id": self.id, "seed": self.seed, "name": self.name,
             "character": self.character, "createdAt": self.created_at,
             "usedAt": self.used_at, "engine": self.engine, "origin": self.origin,
-            "seq": self.seq,
+            "variety": self.variety, "seq": self.seq,
             "rev": self.rev, "exhausted": self.exhausted, "stopped": self.stopped,
             "seedIds": self.seed_ids,
             "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
@@ -2740,6 +2785,7 @@ class Station:
             used_at=_as_int(d.get("usedAt"), _now_ms(), 0),
             engine="tier1" if d.get("engine") == "tier1" else "tier2",
             origin="continue" if d.get("origin") == "continue" else "radio",
+            variety=d.get("variety") if d.get("variety") in STATION_VARIETIES else "medium",
             seq=_as_int(d.get("seq"), 0, 0), rev=_as_int(d.get("rev"), 0, 0),
             exhausted=bool(d.get("exhausted")), stopped=d.get("stopped") is True,
             seed_ids=strs(d.get("seedIds"), STATION_SEEDS_MAX), anchor_meta=meta,
@@ -2916,6 +2962,7 @@ class StationEngine:
         self._auth_logged = False
         self._locks: dict[str, asyncio.Lock] = {}
         self._computing = asyncio.Semaphore(STATION_COMPUTING_MAX)
+        self._counting = asyncio.Semaphore(STATION_COUNT_INFLIGHT)
         # saved queue id -> the station binding it while its frame goes out, before
         # `session.stationId` names it: a second start must meet the binding then too.
         self._binding: dict[str, str] = {}
@@ -3558,7 +3605,7 @@ class StationEngine:
         played-through-neighbours and similar-artists rungs are Explore's sources
         from the first rung on; on Close and Balanced they could only offer what
         the anchor gate already holds, so they add no rung of their own."""
-        tune = STATION_TUNING[st.character]
+        tune = st.tune()
         top = tune.ceiling_max if not tier1_primary else min(tune.ceiling_max,
                                                              STATION_TIER1_MAX)
         ceiling = min(tune.ceiling, top)
@@ -3575,7 +3622,7 @@ class StationEngine:
                        b: _StationBatch, debug: bool = False) -> list[dict]:
         """Choose up to `count` tracks. Writes nothing to the station: `_commit`
         does, once the request is sure to be answered."""
-        tune = STATION_TUNING[st.character]
+        tune = st.tune()
         now = _now_ms()
         hard_ids = set(exclude) | st.served_ids | set(st.seed_ids) | self._bound_queue_ids(st)
         seed_keys = {m["tk"] for m in st.anchor_meta if not m.get("mix") and m.get("tk")}
@@ -3767,6 +3814,8 @@ class StationEngine:
             return await self.next(body)
         if path == "/sonic/station/signal":
             return await self.signal(body)
+        if path == "/sonic/station/count":
+            return await self.count(body)
         return 404, {"error": "unknown route"}
 
     async def characters(self) -> dict:
@@ -3778,7 +3827,8 @@ class StationEngine:
         engine = self.engine_name()
         return {"configured": True, "available": engine is not None, "engine": engine,
                 "default": STATION_DEFAULT_CHARACTER,
-                "characters": [dict(c) for c in STATION_CATALOGUE]}
+                "characters": [dict(c) for c in STATION_CATALOGUE],
+                **_STATION_FEATURES_PROBE}
 
     @staticmethod
     def _parse_seed(raw: Any) -> Optional[dict]:
@@ -3875,6 +3925,12 @@ class StationEngine:
         if character not in STATION_CHARACTERS:
             return 400, {"code": "bad_character",
                          "error": f"character must be one of {list(STATION_CHARACTERS)}"}
+        variety = body.get("variety")
+        if variety is None:
+            variety = "medium"
+        if variety not in STATION_VARIETIES:
+            return 400, {"code": "bad_variety",
+                         "error": f"variety must be one of {list(STATION_VARIETIES)}"}
         count = _as_int(body.get("count"), 20, 1, 50)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
@@ -3902,7 +3958,7 @@ class StationEngine:
                         if isinstance(t, dict) and isinstance(t.get("id"), str)}
         now = _now_ms()
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
-                     created_at=now, used_at=now, origin=origin)
+                     created_at=now, used_at=now, origin=origin, variety=variety)
         deadline = time.monotonic() + STATION_BUDGET_S
         if not await self._acquire(self._computing, deadline):
             return 503, {"fallback": True, "busy": True,
@@ -3965,11 +4021,66 @@ class StationEngine:
         dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
              f"engine {st.engine}, rungs {b.rungs}")
         answer = {**self._answer(st, tracks, exhausted, partial), "name": st.name,
-                  "seed": st.seed, "bound": bound}
+                  "seed": st.seed, "bound": bound, "variety": st.variety}
         if debug:
             answer["_debug"] = {"rungs": b.rungs, "failed": b.failed,
                                 "timedOut": b.timed_out}
         return 200, answer
+
+    async def count(self, body: dict) -> tuple[int, dict]:
+        """How many songs a seed set could draw from (§18.1 `count`, P5): the union
+        of the seeds' nearest lists cut at the character's ceiling, the seeds
+        themselves left out, BEFORE the 14-day play filter and the spacing rule. So
+        it is a pool, not a queue length, and Artist variety does not change it.
+
+        Read-only: no station is made, nothing is recorded. The lists come from the
+        engine's cache, which a `start` from the same seeds then finds warm."""
+        seed = self._parse_seed(body.get("seed"))
+        if seed is None or seed["kind"] == "yourMix":
+            return 400, {"code": "bad_seed", "error": "seed must be track or tracks"}
+        character = body.get("character")
+        if character is None:
+            character = STATION_DEFAULT_CHARACTER
+        if character not in STATION_CHARACTERS:
+            return 400, {"code": "bad_character",
+                         "error": f"character must be one of {list(STATION_CHARACTERS)}"}
+        ids = seed["ids"]
+        tune = STATION_TUNING[character]
+        deadline = time.monotonic() + STATION_BUDGET_S
+        if not await self._acquire(self._counting, deadline):
+            return 503, {"fallback": True, "busy": True,
+                         "error": "the hub is counting two seed sets already"}
+        try:
+            b = _StationBatch(deadline)
+            tier1 = not self.tier2_configured() or (
+                self.tier2_ok is False and self.tier1_configured())
+            lists: list[Optional[list]] = []
+            if not tier1:
+                depth = _station_depth(tune.ceiling)
+                lists = await self._gather([self._nearest(i, depth, b) for i in ids])
+                lists = [r[:tune.ceiling] if r is not None else None for r in lists]
+                if all(r is None for r in lists) and self.tier1_configured():
+                    tier1 = True     # every list failed at AudioMuse: ask Navidrome
+            if tier1:
+                if self.tier2_configured():
+                    b.failed = True  # AudioMuse is a source this answer lacks
+                b.unknown.clear()
+                b.found.clear()
+                n = min(tune.ceiling, STATION_TIER1_MAX)
+                lists = await self._gather([self._tier1_list(i, n, b) for i in ids])
+        finally:
+            self._counting.release()
+        unknown = [i for i, rows in zip(ids, lists) if rows is not None and not rows]
+        answered = [rows for rows in lists if rows]
+        if len(unknown) == len(ids):
+            return 404, {"code": "seed_unknown",
+                         "error": "no tier holds any of the seed tracks"}
+        if not answered:
+            return 503, {"fallback": True, "error": "no tier answered"}
+        pool = {r["id"] for rows in answered for r in rows} - set(ids)
+        return 200, {"count": len(pool), "character": character,
+                     "engine": "tier1" if tier1 else "tier2", "anchors": len(answered),
+                     "unknown": unknown, "partial": b.failed or b.timed_out}
 
     def _name(self, st: Station) -> str:
         if st.seed.get("kind") == "yourMix":
@@ -4086,7 +4197,7 @@ class StationEngine:
                 st.likes.remove(tid)
                 changed = True
             if self._judge(st, f"dislike:{tid}"):
-                self._skip(st, tid, weight=STATION_TUNING[st.character].skips_to_cool)
+                self._skip(st, tid, weight=st.tune().skips_to_cool)
                 changed = True
         elif kind == "skip":
             if self._judge(st, f"skip:{tid}"):
@@ -4301,7 +4412,7 @@ class StationEngine:
         times = [t for t in st.artist_skips.get(ak, []) if now - t < STATION_COOL_MS]
         times += [now] * weight
         st.artist_skips[ak] = times[-10:]
-        if len(times) >= STATION_TUNING[st.character].skips_to_cool:
+        if len(times) >= st.tune().skips_to_cool:
             st.cooldown[ak] = now + STATION_COOL_MS
         st.cooldown = {k: v for k, v in st.cooldown.items() if v > now}
 
@@ -4383,7 +4494,8 @@ class StationProxy(HttpProxy):
         if spec.get("probe"):
             return _http_json(200, {"configured": False, "available": False,
                                     "engine": None, "default": STATION_DEFAULT_CHARACTER,
-                                    "characters": [dict(c) for c in STATION_CATALOGUE]})
+                                    "characters": [dict(c) for c in STATION_CATALOGUE],
+                                    **_STATION_FEATURES_PROBE})
         # The client's own fallback runs; nothing here is an error to show.
         return _http_json(503, {"fallback": True,
                                 "error": f"stations disabled: {self.disabled_reason}"})
@@ -5960,6 +6072,21 @@ class Hub:
         if character:
             rec["character"] = character
             rec["moodCharacter"] = STATION_LEGACY[character]
+        # A custom radio (P5): `kind: "artist"` with every artist in `seedIds` (the
+        # first is also `seedId`, so a client that predates them plays that one)
+        # and its Artist variety. Unlisted fields are dropped, so these two must be
+        # named here or every save loses them.
+        seed_ids: list[str] = []
+        raw_ids = raw.get("seedIds")
+        for v in raw_ids if isinstance(raw_ids, list) else []:
+            if isinstance(v, str) and v.strip() and len(v) <= 128 and v not in seed_ids:
+                seed_ids.append(v)
+            if len(seed_ids) == MIX_SEED_IDS_MAX:
+                break
+        if seed_ids:
+            rec["seedIds"] = seed_ids
+        if raw.get("variety") in STATION_VARIETIES:
+            rec["variety"] = raw["variety"]
         return rec
 
     def _mixes_list(self) -> list[dict]:

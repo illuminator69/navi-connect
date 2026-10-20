@@ -474,10 +474,10 @@ async def main_suite(failures):
         if st_ != 200 or not ch or ch.get("configured") is not True \
                 or ch.get("available") is not True or ch.get("engine") != "tier2":
             failures.append(f"characters probe: {st_} {ch}")
-        want = [("close", "Close", "EchoMatch", "Stays right next to what you started with."),
-                ("balanced", "Balanced", "SteadyVibes",
+        want = [("close", "Familiar", "EchoMatch", "Stays right next to what you started with."),
+                ("balanced", "Blend", "SteadyVibes",
                  "Near what you started with, with room to move."),
-                ("explore", "Explore", "TransitionMaestro",
+                ("explore", "Discover", "TransitionMaestro",
                  "Wanders further, steered by what you skip and like.")]
         got = [(c.get("id"), c.get("label"), c.get("legacy"), c.get("description"))
                for c in (ch or {}).get("characters", [])]

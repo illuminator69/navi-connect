@@ -2603,6 +2603,8 @@ what these are not.
   "moodCharacter": "EchoMatch|SteadyVibes|TransitionMaestro",   // legacy; kept beside `character`
   "character": "close|balanced|explore",                         // §18
   "count": 50, "coverArtId": "",
+  "seedIds": ["<artistId>", …],                                  // custom radio, ≤8 (below)
+  "variety": "low|medium|high",                                  // custom radio (below)
   "createdAt": 0, "updatedAt": 0, "lastPlayedAt": 0 }
 ```
 
@@ -2630,6 +2632,15 @@ is rewritten to match; an unknown `character` is dropped and derived again from 
 kind it does not know. Without the engine a client plays `similar`, `fingerprint` and `adaptive`
 the old way; with it, `similar` is a track radio on Balanced and `fingerprint` / `adaptive` are
 Your mix.
+
+**A custom radio (2026-10-20, P5)** is `kind: "artist"` with every artist in `seedIds` (at most
+8 distinct strings of at most 128 characters; others dropped) and the first of them also in
+`seedId`, plus an optional `variety` (§18.1; any other value is dropped). It is not a new kind, so
+a client that predates `seedIds` plays its first artist's radio instead of hiding the row. A client
+plays it as a `tracks` station seeded with `clamp(12 / artists, 1, 5)` songs of each artist,
+interleaved, and skips an artist the library no longer holds. Both keys are absent, never empty,
+on a recipe without them; `renameMix` keeps them. The clients' form for the other kinds is retired
+(a Genre mix can no longer be created; an existing one still plays).
 
 ### 17.2 Acts
 
@@ -2702,29 +2713,38 @@ still answers (below, `configured: false`) and every other route answers `503 {f
 { "configured": true, "available": true, "engine": "tier2",   // tier2 | tier1 | null
   "default": "balanced",
   "characters": [
-    { "id": "close",    "label": "Close",    "legacy": "EchoMatch",
+    { "id": "close",    "label": "Familiar", "legacy": "EchoMatch",
       "description": "Stays right next to what you started with." },
-    { "id": "balanced", "label": "Balanced", "legacy": "SteadyVibes",
+    { "id": "balanced", "label": "Blend",    "legacy": "SteadyVibes",
       "description": "Near what you started with, with room to move." },
-    { "id": "explore",  "label": "Explore",  "legacy": "TransitionMaestro",
-      "description": "Wanders further, steered by what you skip and like." } ] }
+    { "id": "explore",  "label": "Discover", "legacy": "TransitionMaestro",
+      "description": "Wanders further, steered by what you skip and like." } ],
+  "count": true,                              // P5: POST /sonic/station/count exists
+  "varieties": ["low", "medium", "high"],     // P5: start takes `variety`
+  "filters": [] }                             // P5: custom-radio filters this hub obeys (none yet)
 ```
 
 - `configured` is false when the engine is disabled. `available` is false when no tier answered
   its last probe (re-probed every 10 min, and after a failure).
 - `legacy` maps the old `MoodCharacter` names, so a stored preference or recipe migrates.
+- The labels were Close / Balanced / Explore until 2026-10-20 (P5); the ids did not move. A
+  client shows the catalogue's labels once it has answered.
+- `count`, `varieties` and `filters` (P5) are absent on an older hub: a client then draws no
+  variety control, says the count is unavailable, and draws no filter. A client draws a filter only
+  when its id is listed, so a later hub adds filters without a client release.
 
 **`POST /sonic/station/start`**
 
 ```jsonc
 { "seed": { "kind": "track",   "ids": ["<songId>"],         "name": "Cinnamon Girl" }
-       // | { "kind": "tracks",  "ids": ["…", "…"] (1–5),   "name": "Norman Fucking Rockwell!" }
+       // | { "kind": "tracks",  "ids": ["…", "…"] (1–12),  "name": "Norman Fucking Rockwell!" }
        // | { "kind": "yourMix" }
   "character": "balanced",   // close | balanced | explore; absent = default
   "count": 20,               // 1–50, default 20
   "exclude": ["<songId>", …],// what is already queued (≤1000 ids)
   "bindSession": "<savedQueueId>",  // optional: bind this station to the live session (below)
   "origin": "radio",         // radio | continue; absent or anything else = radio (below)
+  "variety": "medium",       // low | medium | high; absent = medium (below)
   "deviceId": "<deviceId>" }
 ```
 
@@ -2741,6 +2761,13 @@ Answers:
   "exhausted": false, "partial": false }
 ```
 
+- `variety` (Artist variety, P5) is kept with the station and governs every `next`, and the
+  answer and the `station` frame echo it. It changes only the spacing rule (§18.3), never the
+  pool: **Low** one more by an artist in any 10 (at most 3) and two fewer tracks between two by one
+  artist (at least 1); **Medium** the character's own numbers (absent means this, so nothing that
+  predates it changes); **High** one per artist in any 10 and at least 8 between. Every seed's
+  artist counts as "the seed's artist" for `seed_artist_cap`, which matters with several. Anything
+  else is `400 {code: "bad_variety"}`.
 - `origin` says why the station was started, and is kept with it: `radio`, the user asked for
   it, so it keeps going with autoplay off; `continue`, autoplay continued a queue that ran out, so
   it stops when autoplay is turned off. It is echoed by `start` and `next`, and carried by the
@@ -2762,7 +2789,8 @@ Answers:
   - `tier1`: Navidrome.
 - `rank` is the track's place in the nearest list of the anchor that admitted it.
 - Refusals:
-  - `400 {code: "bad_seed" | "bad_character"}`.
+  - `400 {code: "bad_seed" | "bad_character" | "bad_variety"}`. More than 12 seed ids is
+    `bad_seed` (the length is checked before any id).
   - `404 {code: "seed_unknown"}`: no tier knows a seed track or has anything near it: AudioMuse
     answers 404 (or an empty list) for every seed and Navidrome has no similar songs for it.
   - `503 {fallback: true}`: no tier is usable. Also Your mix on a hub whose AudioMuse is unset
@@ -2770,6 +2798,29 @@ Answers:
   - `409 {code: "session_bound", stationId}`: `bindSession` was asked and the session already has
     a station. The client then continues that one with `next`. This is how two devices reaching
     the end of one queue together end up on one station, not two.
+
+**`POST /sonic/station/count`** (P5) — how many songs a seed set could draw from, for a custom
+radio's pick screen. Read-only: it creates no station and records nothing.
+
+```jsonc
+{ "seed": { "kind": "tracks", "ids": ["…"] (1–12) },   // or "track"; not yourMix
+  "character": "balanced" }                            // the only other key read
+```
+
+Answers `200 {count, character, engine, anchors, unknown: [ids], partial}`:
+
+- `count` is the size of the union of the seeds' nearest lists cut at the character's first
+  ceiling (150 / 400 / 1000; Tier 1: Navidrome's similar songs, at most 500 per seed), the seeds
+  themselves left out, **before** the 14-day play filter and the spacing rule. It is a pool, not a
+  queue length, and `variety` does not change it, so a client asks again only when the seeds or the
+  character change.
+- `anchors` is how many seeds answered rows; `unknown` names the seeds no tier holds (they add
+  nothing, the rest still count). `partial: true` means a list failed and the number may be low; a
+  client never shows such a number as complete.
+- `404 {code: "seed_unknown"}` when no seed is known; `503 {fallback: true}` when no tier answers
+  or two counts are already computing (`busy: true`); `400 bad_seed | bad_character`.
+- It has its own two slots, so counting never holds a `start` back, and it uses the engine's list
+  cache, so a second count of the same seeds, and the `start` that follows, ask AudioMuse nothing.
 
 **`POST /sonic/station/next`**
 
@@ -2924,6 +2975,8 @@ character, and nothing that called for a change, so they stand as they were.
 | Gate: a candidate must be within this rank of an anchor's nearest list | 150 | 400 | 1000, or 200 of a played-through track's list when that track itself passed |
 | Sources | the anchors' nearest lists, in order | the same, and alchemy over anchors + the last 3 played through (temperature 0.3) every other batch | the same, alchemy every batch (temperature 0.8, anchors + the last 5 played through or liked), played-through neighbours, similar artists |
 | Artists: at most / minimum gap | 2 per 10 (the seed's artist 3) / 3 tracks | 2 per 10 / 4 tracks | 1 per 10 / 8 tracks |
+| … with `variety: low` (P5) | 3 per 10 (seed artists 3) / 1 track | 3 per 10 / 2 tracks | 2 per 10 / 6 tracks |
+| … with `variety: high` (P5) | 1 per 10 / 8 tracks | 1 per 10 / 8 tracks | 1 per 10 / 8 tracks |
 | A like adds an anchor, at most | 2 | 4 | 6 |
 | A skip | joins the subtract set (alchemy); 2 skips of one artist cool it for 2 h | same | 1 skip cools the artist |
 | Lists asked for | nearest-first `similar_tracks` (`radius_similarity=false`, `eliminate_duplicates=false`), the ceiling rounded up to 150 / 200 / 400 / 1000 / 2000 rows, cached 30 min | same | same; a played-through track's list at 200 |

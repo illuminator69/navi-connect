@@ -20,6 +20,8 @@ One case per property the design rests on:
      refused with `bad_mix` and not stored — these records are persisted and
      fanned out to devices that never saw the sender.
   6. The cap evicts by `updatedAt`, oldest first.
+  8. A custom radio's `seedIds` (at most 8 distinct strings) and `variety` are
+     kept, a bad value dropped, and a rename keeps both (P5).
   7. Recipes survive a save/load round trip, and a state.json written BEFORE
      mixes existed still loads (the collection is additive in exactly the way
      savedQueues is: `data.get(key, default)`, no schema version, no migration).
@@ -248,11 +250,52 @@ async def test_cap_and_persistence():
     return failures
 
 
+async def test_custom_radio_fields():
+    """Case 8 (P5): a custom radio's `seedIds` and `variety` survive the sanitiser,
+    capped and cleaned; a recipe without them is unchanged; a rename keeps them."""
+    port, failures = _free_port(), []
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    hub = spawn(port, state)
+    try:
+        await asyncio.sleep(1.2)
+        c = Client("Ctl", device_id="ctl", caps=["controller"])
+        await c.connect(f"ws://127.0.0.1:{port}")
+        nine = [f"ar-{i}" for i in range(9)]
+        await c.act(action="saveMix", id="mx_custom", name="A, B, C", kind="artist",
+                    seedId="ar-0", seedIds=nine[:2] + [7, None, "", "x" * 129, "ar-1"]
+                    + nine[2:], variety="high", character="explore", count=50)
+        await c.act(action="saveMix", id="mx_bad_v", name="Bad", kind="artist",
+                    seedId="ar-0", seedIds="ar-0", variety="x")
+        await c.act(action="saveMix", id="mx_plain", name="Plain", kind="artist",
+                    seedId="ar-5", moodCharacter="EchoMatch")
+        await asyncio.sleep(0.5)
+        rec, bad, plain = mix(c, "mx_custom"), mix(c, "mx_bad_v"), mix(c, "mx_plain")
+        if rec is None or rec.get("seedIds") != nine[:8] or rec.get("variety") != "high":
+            failures.append(f"seedIds/variety did not survive: {rec}")
+        if bad is None or "seedIds" in bad or "variety" in bad:
+            failures.append(f"a bad seedIds/variety was kept: {bad}")
+        if plain is None or "seedIds" in plain or "variety" in plain \
+                or plain.get("character") != "close":
+            failures.append(f"a recipe without the new fields changed: {plain}")
+        await c.act(action="renameMix", id="mx_custom", name="Evening radio")
+        await asyncio.sleep(0.4)
+        rec = mix(c, "mx_custom")
+        if rec is None or rec.get("name") != "Evening radio" \
+                or rec.get("seedIds") != nine[:8] or rec.get("variety") != "high":
+            failures.append(f"renameMix lost the custom radio's fields: {rec}")
+        await c.ws.close()
+    finally:
+        stop(hub)
+        unlink_state(state)
+    return failures
+
+
 async def main():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     failures = []
     failures += await test_crud_and_touch()
     failures += await test_cap_and_persistence()
+    failures += await test_custom_radio_fields()
     if failures:
         print("FAIL (mixes):")
         for f in failures:
@@ -261,7 +304,7 @@ async def main():
     print("PASS - mixes: create-mints-and-broadcasts/update-keeps-createdAt/"
           "rename-trims/unknown-rename-errors/bad-recipe-refused/delete/"
           "touch-moves-lastPlayedAt-only/cap-evicts-oldest/survives-reload/"
-          "pre-mixes-state-loads")
+          "pre-mixes-state-loads/custom-radio-seedIds+variety")
 
 
 if __name__ == "__main__":
