@@ -388,6 +388,138 @@ STATION_PLAY_MS = 240_000             # ... or 4 min
 # and never gate one: a feature gate let Lana Del Rey -> OsamaSon through.
 STATION_FEATURES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
+# Moods (PROTOCOL §18.5, P7): the catalogue both clients draw, and the CLAP prompts
+# behind it. A mood's name alone is the wrong search for most moods (the 2026-10-19
+# spike: 7 of 13 one-word searches came back half hip-hop); four short prompts that
+# describe the SOUND, merged one rank at a time with at most 3 songs per artist,
+# met the owner's ear. `prompts` are the four the owner rated: merged, they are the
+# mood's list for the queue's chips, autoplay and the radio filter. A Home tile is
+# ONE of them alone (the prompt of the same position, or the tile's own `prompt`),
+# so a tile can be reworded here without moving any rated list. Ids are wire ids;
+# a tile id is unique within its mood, a title across the whole catalogue (Home's
+# "saved queues from these mixes" matches a queue on its name).
+#
+# `maxSeconds` is the owner's length ruling, applied by the client to its own
+# durations (AudioMuse's stop at 600 s); null = no limit. `depth` is how far into a
+# tile's list a mix draws from: the character of sleep and focus fades after ~200.
+MOODS_VERSION = "2026-10-20"
+MOODS: tuple[dict, ...] = (
+    {"id": "relax", "label": "Relax", "group": "home", "filter": True, "maxSeconds": 480,
+     "prompts": ("relaxed acoustic guitar folk", "chillout downtempo electronic smooth",
+                 "smooth jazz piano relaxed slow", "mellow indie female vocal slow-paced"),
+     "tiles": ({"id": "acoustic", "title": "Acoustic evenings", "hue": (32, 12)},
+               {"id": "mellow-beats", "title": "Mellow beats", "hue": (190, 230)},
+               {"id": "piano-jazz", "title": "Piano and jazz", "hue": (265, 300)},
+               {"id": "indie", "title": "Laid-back indie", "hue": (140, 175)})},
+    {"id": "sleep", "label": "Sleep", "group": "home", "filter": False, "maxSeconds": None,
+     "depth": 200,
+     "prompts": ("ambient slow instrumental dreamy", "piano slow relaxed soft",
+                 "ethereal ambient pads quiet", "lullaby acoustic whispered slow-paced"),
+     "tiles": ({"id": "ambient", "title": "Dreamy ambient", "hue": (235, 270)},
+               {"id": "piano", "title": "Soft piano", "hue": (205, 185)},
+               {"id": "pads", "title": "Ethereal pads", "hue": (285, 320)},
+               {"id": "lullabies", "title": "Lullabies", "hue": (250, 215)})},
+    {"id": "romance", "label": "Romance", "group": "home", "filter": False, "maxSeconds": 480,
+     "prompts": ("romantic r&b smooth slow-paced", "sexy soul male vocal slow",
+                 "romantic jazz ballad female vocal", "beautiful acoustic love song"),
+     "tiles": ({"id": "rnb", "title": "Slow R&B", "hue": (330, 290)},
+               {"id": "soul", "title": "Soul", "hue": (10, 345)},
+               {"id": "jazz", "title": "Jazz ballads", "hue": (275, 245)},
+               {"id": "acoustic", "title": "Acoustic love songs", "hue": (350, 25)})},
+    {"id": "sad", "label": "Sad", "group": "home", "filter": True, "maxSeconds": 480,
+     "prompts": ("slow minor-key piano ballad, sparse and mournful",
+                 "quiet fragile indie folk with hushed heartbroken vocals",
+                 "bleak slow downtempo electronic, lonely and desolate",
+                 "mournful strings and cello, slow and tragic"),
+     "tiles": ({"id": "piano", "title": "Piano ballads", "hue": (220, 250)},
+               {"id": "folk", "title": "Hushed folk", "hue": (195, 160)},
+               {"id": "electronic", "title": "Lonely electronic", "hue": (255, 285)},
+               {"id": "strings", "title": "Strings and cello", "hue": (235, 205)})},
+    {"id": "energize", "label": "Energize", "group": "home", "filter": True,
+     "maxSeconds": None,
+     "prompts": ("energetic rock fast-paced electric guitar",
+                 "energetic electronic dance fast tempo",
+                 "energetic hip-hop aggressive confident", "excited pop danceable upbeat"),
+     "tiles": ({"id": "guitars", "title": "Guitars up", "hue": (8, 35)},
+               {"id": "dance", "title": "Dance", "hue": (300, 330)},
+               {"id": "hip-hop", "title": "Hip-hop energy", "hue": (25, 55)},
+               {"id": "pop", "title": "Pop energy", "hue": (335, 5)})},
+    {"id": "feel-good", "label": "Feel good", "group": "home", "filter": True,
+     "maxSeconds": 480,
+     "prompts": ("bright cheerful pop with handclaps and a bouncy beat",
+                 "sunny soul and funk groove with brass and a bouncy bassline",
+                 "jangly guitar pop with sing-along harmonies, bright and carefree",
+                 "joyful disco and dance-pop with strings and a steady clap"),
+     "tiles": ({"id": "pop", "title": "Bright pop", "hue": (45, 15)},
+               {"id": "soul-funk", "title": "Soul and funk", "hue": (25, 350)},
+               {"id": "guitars", "title": "Jangly guitars", "hue": (95, 60)},
+               {"id": "disco", "title": "Disco and dance-pop", "hue": (315, 345)})},
+    {"id": "party", "label": "Party", "group": "home", "filter": False, "maxSeconds": 480,
+     "prompts": ("party dance club house fast-paced", "party hip-hop trap heavy bass",
+                 "party disco funk danceable", "party pop dance energetic"),
+     # Tile 4 is not "party pop dance energetic": alone, that prompt shares 67 % of
+     # its 300 songs with tile 1 (measured 2026-10-20). The merged list keeps the
+     # rated prompt; only the tile is reworded.
+     "tiles": ({"id": "house", "title": "House", "hue": (280, 315)},
+               {"id": "hip-hop", "title": "Hip-hop and trap", "hue": (0, 30)},
+               {"id": "disco-funk", "title": "Disco and funk", "hue": (40, 320)},
+               {"id": "pop", "title": "Pop anthems", "hue": (325, 355),
+                "prompt": "upbeat pop party anthems with a singalong chorus"})},
+    {"id": "workout", "label": "Workout", "group": "home", "filter": False,
+     "maxSeconds": None,
+     "prompts": ("aggressive electronic fast tempo heavy bass",
+                 "hard rock fast-paced distorted guitar",
+                 "aggressive hip-hop heavy bass fast", "drum and bass fast-paced energetic"),
+     "tiles": ({"id": "electronic", "title": "Heavy electronic", "hue": (350, 20)},
+               {"id": "rock", "title": "Hard rock", "hue": (15, 40)},
+               {"id": "hip-hop", "title": "Hard hip-hop", "hue": (0, 330)},
+               {"id": "dnb", "title": "Drum and bass", "hue": (165, 195)})},
+    {"id": "commute", "label": "Commute", "group": "home", "filter": False,
+     "maxSeconds": 480,
+     "prompts": ("mid-tempo indie rock smooth", "smooth pop mid-tempo easygoing",
+                 "chillout electronic medium tempo", "groovy soul mid-tempo relaxed"),
+     "tiles": ({"id": "indie", "title": "Indie rock", "hue": (200, 170)},
+               {"id": "pop", "title": "Easy pop", "hue": (30, 55)},
+               {"id": "electronic", "title": "Chill electronic", "hue": (215, 250)},
+               {"id": "soul", "title": "Groovy soul", "hue": (20, 345)})},
+    {"id": "focus", "label": "Focus", "group": "home", "filter": True, "maxSeconds": None,
+     "depth": 200,
+     "prompts": ("instrumental ambient electronic steady", "instrumental piano minimal calm",
+                 "lo-fi hip-hop instrumental mellow", "instrumental post-rock classical calm"),
+     "tiles": ({"id": "ambient", "title": "Ambient electronic", "hue": (185, 215)},
+               {"id": "piano", "title": "Minimal piano", "hue": (225, 200)},
+               {"id": "lo-fi", "title": "Lo-fi beats", "hue": (260, 30)},
+               {"id": "post-rock", "title": "Post-rock and classical", "hue": (150, 120)})},
+    # YouTube's three that the owner kept: the queue's chips and the radio's filter
+    # only, no Home tile.
+    {"id": "pump-up", "label": "Pump-up", "group": "extra", "filter": True,
+     "maxSeconds": None,
+     "prompts": ("triumphant stadium rock anthem with big guitars and a shouted chorus",
+                 "hard hitting hip hop with heavy bass, confident and aggressive",
+                 "huge cinematic electronic build with epic drums and a drop",
+                 "fast punk and hard rock with a driving beat and shouting")},
+    {"id": "upbeat", "label": "Upbeat", "group": "extra", "filter": True, "maxSeconds": 480,
+     "prompts": ("happy upbeat fast-paced pop", "upbeat funk groovy",
+                 "upbeat indie rock bright guitar", "energetic danceable disco")},
+    {"id": "downbeat", "label": "Downbeat", "group": "extra", "filter": True,
+     "maxSeconds": 480,
+     "prompts": ("slow-paced dark moody electronic", "melancholic slow acoustic",
+                 "sad slow-paced alternative male vocal", "dark trip-hop slow moody")},
+)
+MOOD_BY_ID: dict[str, dict] = {m["id"]: m for m in MOODS}
+MOOD_DEPTH_DEFAULT = 300              # a tile's draw comes from its first 300 songs
+MOOD_LIST_RAW = 600                   # rows asked of each prompt (1,192-1,721 per mood merged)
+MOOD_ARTIST_CAP = 3                   # songs per artist in any one list
+MOOD_GATE_DEPTH = 1000                # the merged list kept for the engine and the chips
+MOOD_FOR_SONG_RANK = 600              # a queue chip: the song within this of the mood's list
+MOOD_FOR_SONG_MAX = 3
+MOOD_TTL = 6 * 3600.0                 # a list is rebuilt this often (served stale meanwhile)
+# A build that failed is tried again no sooner than this. Overridable for the tests.
+MOOD_RETRY = float(os.environ.get("HUB_MOOD_RETRY_S", "60") or "60")
+MOOD_CALL_TIMEOUT = 20.0              # one CLAP search (0.9 s cold measured, 2.2 s first)
+MOOD_STATS_TTL = 600.0                # CLAP's "loaded" is re-asked at most this often...
+MOOD_STATS_RETRY = 15.0               # ...or this soon after AudioMuse did not answer
+
 
 def log(*a: Any) -> None:
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
@@ -838,6 +970,12 @@ SONIC_INTERNAL: dict[str, tuple[tuple[str, str], dict]] = {
         "method": "GET", "path": "/external/get_score", "fallback": "/get_score",
         "params": ("id",), "cache": True, "ttl": PROXY_CACHE_TTL_LONG,
         "timeout": STATION_CALL_TIMEOUT, "pool": "station",
+    }),
+    # The moods' searches (§18.5): one prompt, up to MOOD_LIST_RAW rows. Not cached
+    # here, MoodService keeps the merged lists; in the station pool, one at a time.
+    "clap_search": (("POST", "mood:clap_search"), {
+        "method": "POST", "path": "/api/clap/search", "body": ("query", "limit"),
+        "cache": False, "timeout": MOOD_CALL_TIMEOUT, "pool": "station",
     }),
 }
 
@@ -4511,14 +4649,381 @@ class StationProxy(HttpProxy):
         return status, json.dumps(payload).encode(), "application/json"
 
 
+# --------------------------------------------------------------------------- #
+# Moods (PROTOCOL §18.5): the catalogue, a tile's list, and which moods fit a song
+# --------------------------------------------------------------------------- #
+_MOOD_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+
+
+def _mood_prompt(mood: dict, position: int) -> str:
+    tile = mood["tiles"][position]
+    return tile.get("prompt") or mood["prompts"][position]
+
+
+def _mood_merge(lists: list[list[dict]], cap: int = MOOD_ARTIST_CAP) -> list[dict]:
+    """Several ranked lists as one: one rank at a time across them, the first
+    sighting of an id kept, at most `cap` rows per artist key (an empty key is
+    never capped). Rows are `_station_row`'s."""
+    seen: set = set()
+    per_artist: dict[str, int] = {}
+    out: list[dict] = []
+    for r in StationEngine._round_robin(lists):
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        ak = r.get("ak") or ""
+        if ak:
+            if per_artist.get(ak, 0) >= cap:
+                continue
+            per_artist[ak] = per_artist.get(ak, 0) + 1
+        out.append(r)
+    return out
+
+
+def _clap_rows(data: Any) -> Optional[list]:
+    """A CLAP search answer's rows: `{"results": [...]}` on AudioMuse 3.6, a bare
+    list on some builds. None = neither."""
+    if isinstance(data, dict):
+        data = data.get("results")
+    if not isinstance(data, list):
+        return None
+    return [r for r in (_station_row(x) for x in data) if r is not None]
+
+
+class MoodService:
+    """The moods' lists, built from AudioMuse's CLAP search and kept in memory.
+
+    A search is one prompt, asked once per MOOD_TTL, one at a time (the station
+    pool's two slots are shared with the stations), and single-flight: callers
+    asking for a prompt already in flight wait for that call. A stale list is
+    served while it is rebuilt. A mood's merged list exists only when all four of
+    its searches answered: three of four is never stored or served.
+    """
+
+    def __init__(self, hub: Optional["Hub"] = None) -> None:
+        self.hub = hub
+        self._sem = asyncio.Semaphore(1)
+        self._inflight: dict[str, asyncio.Future] = {}
+        # prompt -> (monotonic built at, parsed rows)
+        self._searches: dict[str, tuple[float, list]] = {}
+        # mood -> (the four searches' built-at stamps, rows, {id: rank})
+        self._merged: dict[str, tuple[tuple, list, dict]] = {}
+        self._failed_at: dict[str, float] = {}
+        self._stats_ok: Optional[bool] = None
+        self._stats_at = -math.inf
+        self._stats_task: Optional[asyncio.Task] = None
+        self._build_task: Optional[asyncio.Task] = None
+        self._refresh: set[str] = set()
+        self._bg: set = set()
+
+    # ----- availability ----------------------------------------------------- #
+    @staticmethod
+    def configured() -> bool:
+        return bool(AUDIOMUSE_URL)
+
+    def available(self) -> bool:
+        """AudioMuse answered and its CLAP index is loaded (the last verdict)."""
+        return self.configured() and self._stats_ok is True
+
+    def ready(self) -> bool:
+        return all(m["id"] in self._merged for m in MOODS)
+
+    async def _ask_stats(self) -> None:
+        spec = SONIC_ROUTES[("GET", "/sonic/clap/stats")]
+        ok = False
+        try:
+            status, raw, _ct = await SONIC.call(("GET", "/sonic/clap/stats"), spec, [], None)
+            stats = json.loads(raw or b"{}") if status == 200 else {}
+            stats = stats if isinstance(stats, dict) else {}
+            ok = bool(stats.get("upstreamReachable") and stats.get("clap_enabled")
+                      and (stats.get("loaded") or _as_int(stats.get("song_count")) > 0))
+            reached = bool(stats.get("upstreamReachable"))
+        except Exception as e:  # noqa: BLE001 — a probe never raises into a route
+            log("moods: clap stats failed:", e)
+            reached = False
+        self._stats_ok = ok
+        # Unreachable is asked again soon; an answer (loaded or not) in ten minutes.
+        self._stats_at = time.monotonic() - (MOOD_STATS_TTL - MOOD_STATS_RETRY
+                                             if not reached else 0.0)
+
+    async def refresh_stats(self, wait: float = STATION_PROBE_STARTUP_WAIT) -> None:
+        """Re-ask CLAP's stats when the verdict is older than MOOD_STATS_TTL, and
+        wait for the answer at most `wait` s (the probe route must not hang on a
+        hung AudioMuse; the answer lands for the next call)."""
+        if not self.configured():
+            return
+        if time.monotonic() - self._stats_at < MOOD_STATS_TTL:
+            return
+        if self._stats_task is None or self._stats_task.done():
+            self._stats_task = asyncio.ensure_future(self._ask_stats())
+        try:
+            await asyncio.wait_for(asyncio.shield(self._stats_task), wait)
+        except asyncio.TimeoutError:
+            pass
+
+    def _note_failure(self, status: int, raw: bytes) -> None:
+        if StationEngine._tier2_verdict(status, raw) is False:
+            self._stats_ok = False
+            self._stats_at = -math.inf   # the next catalogue asks again
+
+    # ----- searches --------------------------------------------------------- #
+    async def _fetch(self, prompt: str) -> Optional[list]:
+        """One search, single-flight per prompt. Stored only on a 200 with rows."""
+        fut = self._inflight.get(prompt)
+        if fut is not None:
+            return await asyncio.shield(fut)
+        fut = asyncio.get_running_loop().create_future()
+        self._inflight[prompt] = fut
+        rows: Optional[list] = None
+        try:
+            route, spec = SONIC_INTERNAL["clap_search"]
+            async with self._sem:
+                status, raw, _ct = await SONIC.call(
+                    route, spec, [], {"query": prompt, "limit": MOOD_LIST_RAW})
+            if status == 200:
+                try:
+                    rows = _clap_rows(json.loads(raw or b"null"))
+                except Exception:  # noqa: BLE001 — not JSON: a failed search
+                    rows = None
+            if rows is None:
+                self._note_failure(status, raw)
+                dlog(f"moods: a search failed ({status})")
+            else:
+                self._searches[prompt] = (time.monotonic(), rows)
+            fut.set_result(rows)
+            return rows
+        except BaseException as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            self._inflight.pop(prompt, None)
+            if fut.done() and not fut.cancelled():
+                fut.exception()   # retrieved, so a failure with no follower is not logged
+
+    async def _search(self, prompt: str) -> Optional[list]:
+        hit = self._searches.get(prompt)
+        if hit is None:
+            return await self._fetch(prompt)
+        if time.monotonic() - hit[0] >= MOOD_TTL and prompt not in self._refresh:
+            self._refresh.add(prompt)
+            task = asyncio.ensure_future(self._fetch(prompt))
+            self._bg.add(task)
+            task.add_done_callback(lambda t, p=prompt: (self._bg.discard(t),
+                                                        self._refresh.discard(p)))
+        return hit[1]
+
+    # ----- the lists -------------------------------------------------------- #
+    async def tile(self, mood_id: str, variant_id: str) -> Optional[list[str]]:
+        """A tile's songs: its one prompt's rows, at most 3 per artist, the first
+        `depth`. None = the search failed."""
+        mood = MOOD_BY_ID[mood_id]
+        pos = next(i for i, t in enumerate(mood["tiles"]) if t["id"] == variant_id)
+        rows = await self._search(_mood_prompt(mood, pos))
+        if rows is None:
+            return None
+        depth = mood.get("depth", MOOD_DEPTH_DEFAULT)
+        return [r["id"] for r in _mood_merge([rows])[:depth]]
+
+    def _stamp(self, mood: dict) -> tuple:
+        return tuple(self._searches.get(p, (None,))[0] for p in mood["prompts"])
+
+    async def merged(self, mood_id: str) -> Optional[list[dict]]:
+        """A mood's merged list, its first MOOD_GATE_DEPTH rows. None = it cannot be
+        had: an unknown mood, a search that failed, or a failure less than
+        MOOD_RETRY ago with nothing built before it."""
+        mood = MOOD_BY_ID.get(mood_id)
+        if mood is None:
+            return None
+        cached = self._merged.get(mood_id)
+        if cached is not None and cached[0] == self._stamp(mood):
+            for p in mood["prompts"]:
+                await self._search(p)    # a stale search starts its rebuild
+            return cached[1]
+        failed = self._failed_at.get(mood_id)
+        if cached is None and failed is not None and time.monotonic() - failed < MOOD_RETRY:
+            return None
+        lists = []
+        for p in mood["prompts"]:
+            rows = await self._search(p)
+            if rows is None:
+                self._failed_at[mood_id] = time.monotonic()
+                return cached[1] if cached is not None else None
+            lists.append(rows)
+        rows = _mood_merge(lists)[:MOOD_GATE_DEPTH]
+        self._merged[mood_id] = (self._stamp(mood), rows,
+                                 {r["id"]: i + 1 for i, r in enumerate(rows)})
+        self._failed_at.pop(mood_id, None)
+        return rows
+
+    def merged_now(self, mood_id: str) -> Optional[dict]:
+        """The merged list's ranks if it is built, without asking anything."""
+        cached = self._merged.get(mood_id)
+        return cached[2] if cached is not None else None
+
+    async def build_all(self, refresh: bool = False) -> bool:
+        """Every mood's merged list; True when all 13 are built. `refresh` asks
+        every prompt again first (the TTL run), keeping the old rows on a failure."""
+        if refresh:
+            for m in MOODS:
+                for p in m["prompts"]:
+                    await self._fetch(p)
+        for m in MOODS:
+            await self.merged(m["id"])
+        return self.ready()
+
+    def ensure_building(self) -> None:
+        if not self.available():
+            return
+        if self._build_task is not None and not self._build_task.done():
+            return
+        # A mood that failed less than MOOD_RETRY ago is skipped by `merged`.
+        self._build_task = asyncio.ensure_future(self.build_all())
+
+    async def warm_loop(self) -> None:
+        """Build all 13 after the stations' first probe, again at the TTL, and a
+        minute after a build that failed."""
+        hub = self.hub
+        if hub is not None:
+            try:
+                await asyncio.wait_for(hub.stations._probed.wait(), 30)  # noqa: SLF001
+            except asyncio.TimeoutError:
+                pass
+        refresh = False
+        while True:
+            try:
+                await self.refresh_stats()
+                ok = False
+                # No search of an AudioMuse whose CLAP index is not there: asked again later.
+                if self.available():
+                    self._build_task = asyncio.ensure_future(self.build_all(refresh))
+                    ok = await self._build_task
+                if ok:
+                    log(f"moods: {len(MOODS)} lists built")
+            except Exception as e:  # noqa: BLE001 — a build must never kill its loop
+                log("moods: build failed:", e)
+                ok = False
+            refresh = ok
+            await asyncio.sleep(MOOD_TTL if ok else MOOD_RETRY)
+
+    async def for_song(self, song_id: str) -> tuple[bool, list[tuple[str, int]]]:
+        if not self.ready():
+            self.ensure_building()
+            return False, []
+        hits = []
+        for m in MOODS:
+            rank = self._merged[m["id"]][2].get(song_id)
+            if rank is not None and rank <= MOOD_FOR_SONG_RANK:
+                hits.append((m["id"], rank))
+        hits.sort(key=lambda h: h[1])
+        return True, hits[:MOOD_FOR_SONG_MAX]
+
+    # ----- routes ----------------------------------------------------------- #
+    @staticmethod
+    def catalogue_moods() -> list[dict]:
+        out = []
+        for m in MOODS:
+            out.append({
+                "id": m["id"], "label": m["label"], "group": m["group"],
+                "filter": bool(m["filter"]), "maxSeconds": m["maxSeconds"],
+                "depth": m.get("depth", MOOD_DEPTH_DEFAULT),
+                "variants": [{"id": t["id"], "title": t["title"], "hue": list(t["hue"])}
+                             for t in m.get("tiles") or ()],
+            })
+        return out
+
+    async def catalogue(self) -> dict:
+        await self.refresh_stats()
+        return {"configured": self.configured(), "available": self.available(),
+                "ready": self.ready(), "version": MOODS_VERSION,
+                "moods": self.catalogue_moods()}
+
+    async def route(self, path: str, body: dict) -> tuple[int, dict]:
+        if path == "/sonic/mood/catalogue":
+            return 200, await self.catalogue()
+        if path == "/sonic/mood/list":
+            mood_id, variant = body.get("mood"), body.get("variant")
+            if not isinstance(mood_id, str) or not isinstance(variant, str):
+                return 400, {"code": "bad_request", "error": "mood and variant are ids"}
+            mood = MOOD_BY_ID.get(mood_id)
+            if mood is None:
+                return 404, {"code": "mood_unknown", "error": "no such mood"}
+            if not any(t["id"] == variant for t in mood.get("tiles") or ()):
+                return 404, {"code": "variant_unknown", "error": "no such tile"}
+            ids = await self.tile(mood_id, variant)
+            if ids is None:
+                return 503, {"fallback": True, "error": "the mood search did not answer"}
+            return 200, {"mood": mood_id, "variant": variant,
+                         "depth": mood.get("depth", MOOD_DEPTH_DEFAULT),
+                         "version": MOODS_VERSION, "ids": ids}
+        if path == "/sonic/mood/for":
+            sid = body.get("id")
+            if not isinstance(sid, str) or not _STATION_ID_RE.match(sid):
+                return 400, {"code": "bad_request", "error": "id is a song id"}
+            ready, hits = await self.for_song(sid)
+            return 200, {"ready": ready,
+                         "moods": [{"id": m, "rank": r} for m, r in hits]}
+        return 404, {"error": "unknown route"}
+
+
+MOOD_ROUTES: dict[tuple[str, str], dict] = {
+    # The probe and the catalogue: always 200 (configured / available / ready).
+    ("GET", "/sonic/mood/catalogue"): {"method": "GET", "params": (), "probe": True},
+    # Every body key a route reads is listed: HttpProxy drops the rest silently.
+    ("POST", "/sonic/mood/list"): {"method": "POST", "body": ("mood", "variant")},
+    ("POST", "/sonic/mood/for"): {"method": "POST", "body": ("id",)},
+}
+
+
+class MoodProxy(HttpProxy):
+    """`/sonic/mood/*` (PROTOCOL §18.5), answered by the hub's MoodService. Like
+    StationProxy it must sit BEFORE SonicProxy in PROXIES."""
+
+    prefix = "/sonic/mood"
+    label = "mood"
+    routes = MOOD_ROUTES
+
+    @property
+    def upstream(self) -> str:
+        return AUDIOMUSE_URL
+
+    @property
+    def disabled_reason(self) -> str:
+        return ("AUDIOMUSE_URL is unset" if not AUDIOMUSE_URL
+                else "HUB_TOKEN is empty (refusing to run as an open relay)")
+
+    def disabled_probe(self, route: tuple[str, str]) -> Optional[tuple]:
+        spec = self.routes.get(route)
+        if spec is None:
+            return None
+        if spec.get("probe"):
+            return _http_json(200, {"configured": False, "available": False,
+                                    "ready": False, "version": MOODS_VERSION,
+                                    "moods": MoodService.catalogue_moods()})
+        return _http_json(503, {"fallback": True,
+                                "error": f"moods disabled: {self.disabled_reason}"})
+
+    async def call(self, route: tuple[str, str], spec: dict,
+                   params: list[tuple[str, str]],
+                   body: Optional[dict]) -> tuple[int, bytes, str]:
+        hub = HUB_INSTANCE
+        if hub is None:
+            return 503, json.dumps({"fallback": True, "error": "hub starting"}).encode(), \
+                "application/json"
+        status, payload = await hub.moods.route(route[1], body or {})
+        return status, json.dumps(payload).encode(), "application/json"
+
+
 SONIC = SonicProxy()
 LB = LbProxy()
 PREVIEW = PreviewProxy()
 STATION = StationProxy()
+MOOD = MoodProxy()
 # Each returns None for paths outside its own prefix, and the first one that
-# claims a path answers it. So STATION goes before SONIC: SonicProxy claims every
-# `/sonic/*` path, `/sonic/station/*` included, and 404s the ones it does not list.
-PROXIES: tuple[HttpProxy, ...] = (STATION, SONIC, LB, PREVIEW)
+# claims a path answers it. So STATION and MOOD go before SONIC: SonicProxy claims
+# every `/sonic/*` path, `/sonic/station/*` and `/sonic/mood/*` included, and 404s
+# the ones it does not list.
+PROXIES: tuple[HttpProxy, ...] = (STATION, MOOD, SONIC, LB, PREVIEW)
 
 # Set once main() builds the hub, so the inbound notify handler below can reach
 # the connected devices. The proxy protocol class is constructed by `websockets`
@@ -4917,6 +5422,7 @@ class Hub:
         # The stations and their play history (PROTOCOL §18). Built before _load,
         # which hands it the persisted stations.
         self.stations = StationEngine(self)
+        self.moods = MoodService(self)
         # The queue position an `ended` report was last judged at, so a receiver
         # repeating the flag does not count one play-through twice.
         self._ended_judged: Optional[tuple] = None
@@ -7686,6 +8192,9 @@ async def main() -> None:
                      if STATION.enabled else None)
     # The hub's own lb-bot probe, for `welcome.lb` (see LB_PROBE_STARTUP_WAIT).
     lb_probe = asyncio.create_task(LB.probe_loop()) if LB.enabled else None
+    # The moods' lists (§18.5), built once the stations have probed AudioMuse, so
+    # the first Home visit after a restart usually finds them ready.
+    mood_warm = asyncio.create_task(hub.moods.warm_loop()) if MOOD.enabled else None
     # `open_timeout` is the WebSocket *handshake* deadline, and it defaults to 10s
     # -- but the HTTP proxies answer from inside `process_request`, which runs
     # during that handshake. So a proxied request slower than the handshake
@@ -7711,6 +8220,8 @@ async def main() -> None:
         lb_probe.cancel()
     if station_probe is not None:
         station_probe.cancel()
+    if mood_warm is not None:
+        mood_warm.cancel()
     hub.stations.close()   # the play history, written now rather than in 30 s
 
     health_server.close()

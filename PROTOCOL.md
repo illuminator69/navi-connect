@@ -3049,3 +3049,68 @@ for a radio. It is that user's mix, whoever asks.
     `partial: true`, `start` with `503 {fallback: true, busy: true}`.
   - At most two AudioMuse calls in flight per request, inside §14's pool.
 - **Unchanged:** §14's `/sonic/alchemy` and `/sonic/fingerprint` stay for older clients.
+
+### 18.5 Moods
+
+A **mood** is a named list of the owner's own songs, ranked by AudioMuse's CLAP text search (P7,
+2026-10-20). The catalogue is the hub's, in `hub.py` beside the characters (`MOODS`), so a prompt
+is reworded without a client release. A mood's name alone is the wrong search for most moods;
+each mood is **four short prompts that describe the sound**, merged one rank at a time with at
+most 3 songs per artist (the 2026-10-19 spike, `SESSION-2026-10-19-mood-prompt-test.md`). The
+similarity score is never read: rank only.
+
+- **Ten Home moods** (Relax, Sleep, Romance, Sad, Energize, Feel good, Party, Workout, Commute,
+  Focus) each have four **tiles**. A tile is ONE of the mood's prompts alone (or a prompt of its
+  own: Party's fourth), so its songs are a single sound. Navic draws a mix of about 50 from a
+  tile's list each time its page opens.
+- **Three extra moods** (Pump-up, Upbeat, Downbeat) have prompts and no tiles: they exist for the
+  queue's chips and the radio's filter.
+- The **merged list** (the four rated prompts, its first 1000) is what the chips, autoplay and the
+  filter use. A tile's own prompt never changes it.
+
+Same port, bearer and whitelist rule as §18.1. Enabled when `HUB_TOKEN` and `AUDIOMUSE_URL` are
+set; disabled, the catalogue answers `configured: false` and the other routes
+`503 {fallback: true}`. **A hub older than this answers 404 on every route, which a client reads
+as "no moods": no chip, no error.**
+
+**`GET /sonic/mood/catalogue`**, always 200:
+
+```jsonc
+{ "configured": true,   // AUDIOMUSE_URL is set
+  "available": true,    // AudioMuse answered and CLAP is loaded (clap/stats, re-asked ≤ every 10 min,
+                        //   15 s after it did not answer, at once after a search said it is down)
+  "ready": true,        // all 13 merged lists are built (the chips need them; tiles do not)
+  "version": "2026-10-20",
+  "moods": [
+    { "id": "relax", "label": "Relax", "group": "home", "filter": true, "maxSeconds": 480,
+      "depth": 300,
+      "variants": [ { "id": "acoustic", "title": "Acoustic evenings", "hue": [32, 12] }, … ] },
+    …
+    { "id": "pump-up", "label": "Pump-up", "group": "extra", "filter": true, "maxSeconds": null,
+      "depth": 300, "variants": [] } ] }
+```
+
+Moods come in display order. Ids are lowercase with hyphens; a variant id is unique within its
+mood and a variant `title` across the catalogue (a saved queue is matched to its mood by name).
+`filter` marks the eight words the radio's mood filter offers. `maxSeconds` is the owner's length
+rule, applied by the client to its own durations (AudioMuse's stop at 600 s): `null` is no limit.
+`depth` is how far into a tile's list a mix is drawn from (200 for Sleep and Focus). `hue` is
+two hues for the tile's generated art.
+
+**`POST /sonic/mood/list {mood, variant}`** → `200 {mood, variant, depth, version, ids}`: the
+tile's songs, Navidrome ids in rank order, at most 3 per artist, the first `depth`.
+`400 {code: "bad_request"}`; `404 {code: "mood_unknown" | "variant_unknown"}` (an extra mood has
+no variant); `503 {fallback: true}` when the search failed (AudioMuse unreachable, CLAP not
+loaded). The ids are what AudioMuse analysed: a client resolves them in its own library and
+drops what it does not hold.
+
+**`POST /sonic/mood/for {id}`** → `200 {ready, moods: [{id, rank}]}`: up to 3 moods whose merged
+list holds the song within its first 600 (`MOOD_FOR_SONG_RANK`), best rank first. `ready: false`
+and no moods while the lists are building, or after a build that failed.
+
+**Building.** One search per prompt (`/api/clap/search`, `limit` 600), one at a time in the
+stations' pool, single-flight per prompt. A list lives 6 h and a stale one is served while it is
+rebuilt. A mood's merged list is stored only when all four of its searches answered: a merge of
+three is never served. A failed build is tried again no sooner than 60 s later. All 13 are built
+once the stations have probed AudioMuse, so the first Home visit after a restart usually finds
+`ready`; the tiles do not wait for it.
