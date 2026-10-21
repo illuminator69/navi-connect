@@ -14,7 +14,7 @@ running and what to expect once it is.
 - [1. The shape of the thing](#1-the-shape-of-the-thing)
 - [2. Prerequisites](#2-prerequisites)
   - [2.1 Server side (a NAS, a Linux box, Unraid — anything that runs Docker)](#21-server-side-a-nas-a-linux-box-unraid--anything-that-runs-docker)
-  - [2.2 Build machine (Windows, for the clients)](#22-build-machine-windows-for-the-clients)
+  - [2.2 Build machine (only to build the clients yourself)](#22-build-machine-only-to-build-the-clients-yourself)
   - [2.3 The public-URL requirement (read this one)](#23-the-public-url-requirement-read-this-one)
 - [3. Step 1 — the hub (start here)](#3-step-1--the-hub-start-here)
 - [4. Step 2 — AudioMuse (optional, for recommendations)](#4-step-2--audiomuse-optional-for-recommendations)
@@ -23,7 +23,7 @@ running and what to expect once it is.
 - [6. Step 4 — the clients](#6-step-4--the-clients)
   - [Option A: download prebuilt (recommended for testing)](#option-a-download-prebuilt-recommended-for-testing)
   - [Option B: build from source](#option-b-build-from-source)
-  - [Feishin (Windows desktop)](#feishin-windows-desktop)
+  - [Feishin (desktop)](#feishin-desktop)
   - [Navic (Android)](#navic-android)
 - [7. Smoke test — the order that isolates failures](#7-smoke-test--the-order-that-isolates-failures)
 - [8. Known issues, caveats, and what's untested](#8-known-issues-caveats-and-whats-untested)
@@ -40,9 +40,10 @@ running and what to expect once it is.
 - **This is a single-user, personal-infrastructure project.** There is no multi-tenant story, no
   account system, no hosted instance. Every component assumes it is the only one, talking to one
   Navidrome account.
-- **Nothing here is signed.** The Feishin binary is unsigned, so Windows Defender objects and the
-  NSIS installer is unusable (§6); the Navic APK is signed with a debug key unless you supply your
-  own.
+- **Nothing here is code-signed.** The Feishin binary is unsigned, so Windows Defender objects and
+  the NSIS installer is unreliable (§6). The Navic APK is signed with the fork's own key and keeps
+  upstream Navic's package name, so **upstream Navic has to be uninstalled before it will install**
+  (§6).
 - **Several major subsystems are built but not yet field-tested** — most of the Chromecast recovery
   work and the whole lb-bot client surface. §8 lists exactly which. If you are testing, those are
   the interesting parts.
@@ -92,20 +93,26 @@ them the features they power grey out or disappear entirely, by design. Start wi
 | **Docker** + an external network named `media` | yes | `docker network create media` if it doesn't exist. Both compose files declare it `external`. |
 | **Navidrome** ≥ 0.62.0 | yes | With at least one user and a scanned library. |
 | **A publicly reachable HTTPS URL for Navidrome** | only for Chromecast | See §2.3 — this is the single most common setup failure. |
-| **AudioMuse-AI** | no | Two tiers, see §4. Tier 1 is a Navidrome plugin; Tier 2 is its own container. |
+| **AudioMuse-AI** | no | Two tiers, see §4. Tier 1 is a Navidrome plugin; Tier 2 is its own container. Moods need Tier 2 with CLAP text search. |
 | **slskd** | only for lb-bot | Soulseek client; lb-bot's acquisition backend. |
 | **A MusicBrainz-tagged library** (Picard or similar) | **recommended** for lb-bot | Not required to run, but per-track gap filling only works on tagged albums, and artist names have to match. See §5.1. |
 | **lb-bot** | no | Its own repository (linked from the README). Needs slskd + a writable library mount. |
 
-### 2.2 Build machine (Windows, for the clients)
+### 2.2 Build machine (only to build the clients yourself)
+
+Skip this if you use the prebuilt clients (§6, Option A). Linux, Windows and macOS all work; the
+Feishin build targets the OS it runs on.
 
 | Thing | For | Version |
 |---|---|---|
-| **Node.js** | Feishin | 20 LTS, then `corepack enable` (pnpm 11.5.2 is pinned via `packageManager`) |
-| **JDK** | Navic | **21** — the build sets `JavaVersion.VERSION_21` / `JVM_21`. Microsoft OpenJDK 21 works. |
-| **Android SDK** | Navic | `compileSdk`/`targetSdk` **37**, `minSdk` 24, AGP 9.2.1, Kotlin 2.3.21. Path goes in the client's `local.properties` (gitignored). |
+| **Node.js** | Feishin | 20 LTS or newer (24 is what it is built with), then `corepack enable` (pnpm 11.5.2 is pinned via `packageManager`) |
+| **JDK** | Navic | Any recent JDK to run Gradle; it provisions the **21** toolchain the build asks for itself. |
+| **Android SDK** | Navic | `compileSdk`/`targetSdk` **37**, `minSdk` 24. Path goes in the client's `local.properties` (gitignored). |
 | **Python** | hub (non-Docker) | 3.11+ with `websockets`. Skip if you run the hub in Docker. |
 | An Android device | Navic | Android 7.0+ (minSdk 24). A **release** build — see §6. |
+
+AGP and Kotlin versions are pinned in navic-gaps' `gradle/libs.versions.toml` and follow upstream
+Navic; the table does not track them.
 
 ### 2.3 The public-URL requirement (read this one)
 
@@ -145,8 +152,10 @@ HUB_PORT=4790
 ```
 
 `HUB_TOKEN` is the shared secret every client presents. There is no other auth. Generate something
-real (`openssl rand -hex 32`); the proxies in §4 and §5 **refuse to start** if it's empty, which is
-deliberate.
+real (`openssl rand -hex 32`). **The hub refuses to start without it**, which is deliberate: the
+WebSocket alone can rewrite your queue and move your playback. (For a throwaway experiment on one
+machine, `HUB_ALLOW_INSECURE_NO_AUTH=true` with `HUB_HOST=127.0.0.1` lets it run tokenless on
+loopback only.)
 
 Optional, and worth adding once the basics work:
 
@@ -156,11 +165,16 @@ Optional, and worth adding once the basics work:
 | `HUB_HEALTH_PORT` (default `HUB_PORT`+1) | Plain-HTTP health endpoint for Docker healthchecks. Its JSON also counts `staleReports` (receiver reports dropped because they were read before a command took effect: above zero is the rule working) and `echoBackstops` (a receiver left a command unconfirmed for 12 s: above zero is a client defect). |
 | `HUB_DEVICE_TTL_DAYS` | Drops devices unseen for N days at startup. `0` = keep forever. Set it to something once your picker fills with dead test devices. |
 | `HUB_DEBUG=true` | Per-frame logging at ~1 Hz. Very noisy. Turn it on when playback state misbehaves, off otherwise. |
+| `HUB_STATION_HISTORY` (default `1`) | `0` keeps the stations' play history in memory only, so a restart forgets what was played. |
+| `PREVIEW_URL`, `PREVIEW_PUBLIC_URL`, `PREVIEW_SECRET` | The optional preview sidecar, for hearing an album you don't own. Its setup is in `preview/README.md`; `hub/.env.example` explains each variable. |
+
+`hub/.env.example` lists every variable with what it does, and `hub/README.md` has the full table.
 
 The hub persists session + device state to `./data`. To reset a test to a clean slate, stop the
 container and delete that directory — the whole directory: once a mix or a saved-queue deletion
 exists there is a `state.json.bak` beside `state.json`, an fsynced copy the hub restores from when
-`state.json` is empty, missing or unreadable, so deleting `state.json` alone resets nothing. A
+`state.json` is empty, missing or unreadable, so deleting `state.json` alone resets nothing. The
+stations keep `state.json.history` and `state.json.stations` there too. A
 `state.json` the hub cannot parse is renamed to `state.json.corrupt-<UTC timestamp>` rather than
 overwritten; those files are yours to inspect and delete.
 
@@ -188,8 +202,17 @@ AUDIOMUSE_URL=http://audiomuse:8000
 AUDIOMUSE_TOKEN=<your audiomuse api token>
 ```
 
-The hub proxies a five-route whitelist on `/sonic/*` and injects the token and the Navidrome
-password server-side, so no phone or desktop ever holds them. Leave `AUDIOMUSE_URL` unset to disable.
+The hub proxies a whitelist of AudioMuse routes on `/sonic/*` and injects the token and the
+Navidrome password server-side, so no phone or desktop ever holds them. Leave `AUDIOMUSE_URL` unset
+to disable.
+
+With Tier 2 set, the hub also computes, on the same `/sonic/*` port:
+
+- **Stations**: radio, autoplay and custom radio. These also run on Navidrome's similar songs
+  alone when AudioMuse is down, if the hub has `NAVIDROME_URL`, `HUB_ND_USER` and `HUB_ND_PASS`.
+- **Moods**: Navic's mood chips and mixes, the queue's mood chips and the radio's mood filter.
+  They need AudioMuse's **CLAP** model loaded, because they are ranked by its text search
+  (developed against AudioMuse 3.6.3). The hub rebuilds the mood lists every six hours. With CLAP not loaded, the clients simply show no moods.
 
 > Each client also keeps an *older* direct-to-AudioMuse config (host + bearer token in client
 > settings) as a LAN fallback. Prefer the hub route. The direct fallback puts the API token on the
@@ -219,9 +242,13 @@ way the hub does — `docker compose pull && docker compose up -d`.
 On the hub:
 ```ini
 LBBOT_URL=http://lb-bot:8899
+# Optional: where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links.
+# Unset, it falls back to LBBOT_URL, and a Docker-internal name opens nowhere from a phone.
+LBBOT_WEB_URL=http://192.168.1.10:8899
 ```
-Unset = the entire discography/missing-album surface disappears from both clients. That is the
-intended "off" state and the artist pages should look untouched.
+Unset `LBBOT_URL` = the entire discography/missing-album surface disappears from both clients, and
+Navic's lb-bot pages with it. That is the intended "off" state and the artist pages should look
+untouched.
 
 On lb-bot, copy its **`.env.example`** to `.env` beside `docker-compose.yml` and fill it in —
 Compose reads it automatically:
@@ -289,20 +316,23 @@ for finding whole albums you're missing — just expect the gap-filling half to 
 
 ### Option A: download prebuilt (recommended for testing)
 
-Both clients are attached to this repository's **Releases** page, so you don't need Node, a JDK, or
-the Android SDK just to try the thing:
+You don't need Node, a JDK or the Android SDK just to try the thing:
 
-| Asset | What it is |
-|---|---|
-| `Feishin-portable-win-x64.zip` | Unzip anywhere, run `Feishin.exe`. No installer — see the note below. |
-| `Navic.apk` | Sideload it. Signed with a debug key, so Android will warn about an unknown source. |
+| Client | Where | What to take |
+|---|---|---|
+| **Navic** (Android) | [navic-gaps Releases](https://github.com/illuminator69/navic-gaps/releases) — the first alpha is [v.0.1.0](https://github.com/illuminator69/navic-gaps/releases/tag/v.0.1.0) | `Navic-gaps-<version>.apk`. Sideload it. |
+| **Feishin** (desktop) | this repository's [Releases](../../releases) | The build for your OS: Windows `.zip` (portable — unzip anywhere, run `Feishin.exe`), macOS `.dmg`, Linux `.AppImage`, `.deb` or `.tar.xz`. |
 
-Two things to expect, both benign and both consequences of not paying for code-signing certificates:
+What to expect, all consequences of not paying for code-signing certificates:
 
-- **Windows Defender / SmartScreen will complain** about the unsigned Feishin binary. This is also
-  why there's no installer at all — see Option B.
+- **Navic will not install over upstream Navic.** It keeps upstream's package name (`paige.navic`)
+  and is signed with the fork's own key, so Android refuses it as an update ("App not installed").
+  Uninstall upstream Navic first, which loses its login and downloads. Later navic-gaps releases
+  install over each other and keep the login.
 - **Android will warn** about installing from an unknown source, and you may need to allow it for
   whatever app you're sideloading from.
+- **Windows Defender / SmartScreen will complain** about the unsigned Feishin binary. Prefer the
+  portable `.zip` to the installer `.exe` — see Option B.
 
 Then skip to the configuration bullets at the end of each Option B subsection below — you still need
 to point each client at your hub.
@@ -316,20 +346,22 @@ to point each client at your hub.
 
 ### Option B: build from source
 
-### Feishin (Windows desktop)
+### Feishin (desktop)
 
 ```bash
 git clone https://github.com/illuminator69/feishin-gaps.git
 cd feishin-gaps
 pnpm install
 pnpm dev                                            # development
-pnpm run build && pnpm exec electron-builder --win --x64 --dir   # → dist/win-unpacked/Feishin.exe
+pnpm run build && pnpm exec electron-builder --win --x64 --dir   # Windows → dist/win-unpacked/Feishin.exe
 ```
 
-**Use the portable `--dir` build.** The NSIS installer produces a working exe, but Windows Defender
-quarantines the unsigned 223 MB binary during temp-extraction, even with install-folder exclusions.
-Copy `dist/win-unpacked/` wherever you like and run `Feishin.exe`. The real fix is code-signing,
-which isn't done.
+For macOS or Linux, use `--mac` or `--linux` in place of `--win`.
+
+**On Windows, use the portable `--dir` build.** The NSIS installer produces a working exe, but
+Windows Defender has quarantined the unsigned 223 MB binary during temp-extraction, even with
+install-folder exclusions. Copy `dist/win-unpacked/` wherever you like and run `Feishin.exe`. The
+real fix is code-signing, which isn't done.
 
 Then in Settings:
 - **Hub URL** — defaults to `ws://localhost:4790`; point it at your hub.
@@ -338,9 +370,9 @@ Then in Settings:
 - **Public server URL** — your public Navidrome URL, only if you're testing Chromecast (§2.3).
 
 If you touch the code: typecheck with
-`.\node_modules\.bin\tsc.cmd --noEmit -p tsconfig.web.json --composite false` (and the same for
-`tsconfig.node.json`). **Do not use `pnpm run typecheck`** — it re-checks deps and has broken the
-lockfile before.
+`./node_modules/.bin/tsc --noEmit -p tsconfig.web.json --composite false` (and the same for
+`tsconfig.node.json`; on Windows the binary is `node_modules\.bin\tsc.cmd`). **Do not use
+`pnpm run typecheck`** — it re-checks deps and has broken the lockfile before.
 
 ### Navic (Android)
 
@@ -356,9 +388,15 @@ library. The release task is `:androidApp:assembleRelease` (~6 min cold, ~12 MB 
 
 - **Test the release build, not debug.** Debug Compose is dramatically choppier and will send you
   chasing performance problems that don't exist.
-- With no `SIGNING_*` env vars, the APK is signed with the debug key. Fine for testing.
-- Configure hub URL + token under Settings → navi-connect. The hub URL now defaults to **empty** —
-  set it, or the client simply never connects (that's the intended off state, not a hang).
+- With no `SIGNING_*` env vars, the APK is signed with your machine's debug key. Fine for testing,
+  but it is not the released APK's key: a phone holding the release (or upstream Navic) has to
+  uninstall it first, and loses its login.
+- Then open the **avatar menu → Settings → navi-connect**: switch on **Enable navi-connect**, and
+  set the **Hub URL** (`ws://<hub host>:4790`), the **Token** (`HUB_TOKEN`) and a **Device name**.
+  The hub URL defaults to **empty** — set it, or the client simply never connects (that's the
+  intended off state, not a hang). The AudioMuse fields on that screen are the direct LAN fallback
+  from §4; leave them empty when the hub has AudioMuse.
+- Bug reports: the app keeps its own log under **Settings → Developer options → Logs**.
 - commonMain must still *compile* for iOS. iOS is otherwise out of scope — no features, no testing,
   and the iOS target is **currently unverified** because there's no Kotlin/Native toolchain here.
 
@@ -381,9 +419,11 @@ Do these in order. Each one only makes sense if the previous passed.
    *remote* session, not local playback.
 7. **Saved queues.** Play an album → exactly **one** card appears on **both** clients, named after
    the album. Reorder and replay it → still one card, count doesn't grow.
-8. **AudioMuse**, if configured. Instant Mix first (Tier 1), then autoplay modes (Tier 2).
+8. **AudioMuse**, if configured. Instant Mix first (Tier 1), then autoplay modes (Tier 2), then
+   moods: Navic's Home shows mood chips once the hub can reach CLAP.
 9. **Chromecast**, if configured. Appears as `📺 <name>` in every picker; casting is just a transfer.
-10. **lb-bot**, if configured. Artist page shows faded/dashed unowned albums inline with owned ones.
+10. **lb-bot**, if configured. Artist page shows faded/dashed unowned albums inline with owned ones,
+    and Navic's avatar menu lists Needs attention and Source history.
 
 > **Restart the hub and lb-bot before testing the lb-bot surface.** Several of the newer routes
 > silently do nothing against an older running hub — no error, just an empty result.
@@ -400,8 +440,14 @@ Navic (basic operation confirmed live).
 
 ### 8.2 Known bugs and limitations
 
+Each Navic release lists its own known issues in its
+[release notes](https://github.com/illuminator69/navic-gaps/releases); this section does not repeat
+them.
+
 **Packaging**
-- Feishin's NSIS installer is unusable — Defender quarantines the unsigned binary. Portable build only.
+- Feishin's NSIS installer is unreliable — Defender has quarantined the unsigned binary. Prefer the
+  portable build.
+- Navic cannot be installed beside upstream Navic, or over it: same package name, different key.
 
 **Playback**
 - **Navic:** starting *brand-new local* playback while another device is active is blocked by the
@@ -486,7 +532,7 @@ This is personal infrastructure with a single shared secret, and it was never de
 Some specifics worth knowing before you deploy it anywhere:
 
 - **`HUB_TOKEN` is the only authentication in the system.** It guards the WebSocket, the `/sonic/*`
-  proxy and the `/lb/*` proxy alike. Make it long and random. Anyone holding it controls your
+  proxy and the `/lb/*` proxy alike, and the hub will not start without one. Make it long and random. Anyone holding it controls your
   playback and can drive lb-bot's downloads.
 - **lb-bot's own API has no auth at all** and binds `0.0.0.0:8899`. Keep it off the public internet;
   reach it through the hub. The clients have no direct-LAN fallback for it precisely because of this.

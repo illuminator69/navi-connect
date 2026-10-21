@@ -9,8 +9,12 @@ receivers stream from Navidrome themselves. Protocol: [`../PROTOCOL.md`](../PROT
 
 ```bash
 cp .env.example .env        # set HUB_TOKEN + Navidrome creds for the mirror
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
+
+The compose file pulls the image CI publishes to GHCR on every push to `main`
+(`ghcr.io/illuminator69/navi-connect-hub`); the same two commands update it. To
+build locally instead, swap its `image:` line for `build: .`.
 
 Or, matching the bot's `docker run` style on Unraid:
 
@@ -28,17 +32,31 @@ Clients then connect to `ws://<unraid-host>:4790`.
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `HUB_TOKEN` | *(empty)* | shared secret; clients must send it in `hello`. **Set it.** |
+| `HUB_TOKEN` | *(empty)* | shared secret; clients must send it in `hello`. **Required**: the hub refuses to start without it |
+| `HUB_ALLOW_INSECURE_NO_AUTH` | *(unset)* | `true` lets the hub run with no token, and only when `HUB_HOST` is a loopback address. For local experiments |
+| `HUB_HOST` | `0.0.0.0` | listen address |
 | `HUB_PORT` | `4790` | listen port |
+| `HUB_HEALTH_PORT` | `HUB_PORT`+1 | plain-HTTP health endpoint, for Docker healthchecks |
 | `HUB_STATE` | `/data/state.json` | persisted session + device registry |
+| `HUB_DEVICE_TTL_DAYS` | `0` | drop devices unseen for this many days; `0` keeps them forever |
+| `HUB_DEBUG` | `false` | per-frame logging at ~1 Hz; very noisy |
 | `NAVIDROME_URL` | *(empty)* | your Navidrome base URL; required for the savePlayQueue mirror |
 | `HUB_MIRROR_PLAYQUEUE` | `true` | mirror the queue to Navidrome so unmodified Subsonic clients can resume |
 | `HUB_ND_USER` / `HUB_ND_PASS` | *(empty)* | Navidrome creds the mirror authenticates with (single-user); the AudioMuse proxy reuses them |
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
 | `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client |
+| `LBBOT_WEB_URL` | `LBBOT_URL` | where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links. Set it when `LBBOT_URL` is a Docker-internal name |
+| `PREVIEW_URL` | *(empty)* | the preview sidecar as the hub reaches it; unset disables `/preview/*` (`../preview/README.md`) |
+| `PREVIEW_PUBLIC_URL` | *(empty)* | the sidecar as a client or a Chromecast reaches it; in practice required with `PREVIEW_URL` |
+| `PREVIEW_SECRET` | *(empty)* | signs preview stream URLs; must match the sidecar's and must not be `HUB_TOKEN` |
+| `PREVIEW_TTL` | `21600` | seconds a signed preview stream URL stays valid |
 | `HUB_STATION_HISTORY` | `1` | `0` keeps the stations' play history (PROTOCOL §18.4) in memory only; otherwise it is written to `<HUB_STATE>.history` |
+| `PROXY_QUEUE_TIMEOUT_FAST` | `10` | seconds a proxied request may wait for a free slot before the hub answers 503 `busy` |
 | `HUB_SLEEP_MINUTE_S` | `60` | how many seconds one minute of the sleep timer lasts. Leave it alone: it exists so the tests can watch a timer run out in seconds |
+| `HUB_MOOD_RETRY_S` | `60` | how soon a mood list whose build failed is tried again. Also a test knob |
+
+`.env.example` explains each of these at more length.
 
 If the mirror creds are unset the hub still works fully; it just skips the
 Navidrome write.
@@ -56,7 +74,7 @@ each written at most every 30 s. To reset the hub, delete all of them, not
 ### AudioMuse Tier-2 proxy (`/sonic/*`)
 
 With `AUDIOMUSE_URL` set, the same port also answers plain HTTP on a whitelist of
-five AudioMuse routes, authenticated with `Authorization: Bearer $HUB_TOKEN` — so
+AudioMuse routes, authenticated with `Authorization: Bearer $HUB_TOKEN` — so
 no client holds the AudioMuse address, its token or the Navidrome password, and the
 core API needs no exposure of its own. Routes, limits and the probe contract:
 `../PROTOCOL.md` §14. Disabled (503) when `HUB_TOKEN` is empty, which would make it
@@ -85,13 +103,32 @@ curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/sonic/station/char
 the engine in-process against a real AudioMuse and Navidrome (read-only routes only)
 and prints every batch with why each track was chosen.
 
+A **custom radio** is a station seeded from up to eight artists, with a variety
+(`low`, `medium`, `high`) and an optional mood filter. It is saved as a "Mixed for
+You" recipe (`../PROTOCOL.md` §17.1).
+
+### Moods (`/sonic/mood/*`)
+
+Thirteen moods, each a list of your own songs ranked by AudioMuse's CLAP text search
+(`../PROTOCOL.md` §18.5). Ten of them have four tiles each for Navic's Home. All
+thirteen feed the queue's mood chips, and eight are offered as the radio's mood filter. The catalogue lives
+in `hub.py` (`MOODS`), so a prompt can be reworded without a client release. Each list
+is rebuilt every six hours. Enabled with `HUB_TOKEN` and `AUDIOMUSE_URL`, and needs
+CLAP loaded in AudioMuse. Otherwise the catalogue answers `configured: false` or
+`available: false`, and the clients show no moods.
+
+```bash
+curl -H "Authorization: Bearer $HUB_TOKEN" http://<host>:4790/sonic/mood/catalogue
+```
+
 ### lb-bot proxy (`/lb/*`)
 
-With `LBBOT_URL` set, the same port proxies a whitelist of lb-bot's library-gap
-routes: the artist discography read and scan, album editions/tracklist/sources,
-the download and its progress poll, and the per-album gap actions
-(`/lb/gap` + `auto`/`fetch`/`cancel`/`rescan`). Routes and rationale:
-`../PROTOCOL.md` §15.
+With `LBBOT_URL` set, the same port proxies a whitelist of lb-bot's routes:
+the artist discography read and scan, album editions/tracklist/sources, the
+download and its progress poll, the per-album gap actions (`/lb/gap` +
+`auto`/`fetch`/`cancel`/`rescan`), the index mirror, the overrides, the
+listening mirror, and the read-only Needs attention and Source history
+(`/lb/attention`, `/lb/activity`). Routes and rationale: `../PROTOCOL.md` §15.
 
 **This whitelist is the only access control that exists.** lb-bot's Flask API has
 no authentication at all and binds `0.0.0.0:8899`, and it exposes delete-file,
@@ -144,18 +181,14 @@ does on a slow link (the hub's HTTP routes are not relayed).
 
 ```bash
 pip install -r requirements.txt
-python tools/test_transfer.py     # asserts resume at the same index + position
-python tools/test_cmd_echo.py     # do.seq / report.applied, reconnect, the backstop
-python tools/test_act_ack.py      # act.cid / ack, refusals, acts held by a transfer
-python tools/test_device_rows.py  # hello.device.kind, deviceState.volume, across a restart
-python tools/test_volume_target.py  # act:volume with a target, its refusals, the echo untouched
-python tools/test_sleep_timer.py  # act:sleepTimer, running out, during a transfer, across a restart
-python tools/test_station_engine.py   # stations against a fake AudioMuse + Navidrome
-python tools/test_station_signals.py  # skips and play-throughs judged from the session
+for t in tools/test_*.py; do python "$t" || echo "FAILED: $t"; done
 ```
 
 Every `tools/test_*.py` is a script that starts its own hub on a free port and exits
-non-zero on failure.
+non-zero on failure. A few to start from: `test_transfer.py` (resume at the same
+index and position), `test_cmd_echo.py` (`do.seq` / `report.applied`, reconnect, the
+backstop), `test_act_ack.py` (`act.cid` / `ack`), `test_station_engine.py` (stations
+against a fake AudioMuse and Navidrome).
 
 ## What clients must implement
 

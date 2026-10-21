@@ -10,8 +10,11 @@ It sits on top of [Navidrome](https://navidrome.org) and needs nothing hosted by
 ### ▶ [**Setup & testing guide →**](TESTING-SETUP.md)
 
 **If you want to run this, start there, not here.** It covers prerequisites, step-by-step setup, a
-smoke test that isolates failures, and every known bug and caveat. Prebuilt clients are on the
-[Releases](../../releases) page — no toolchain required.
+smoke test that isolates failures, and every known bug and caveat. Prebuilt clients need no
+toolchain: **Navic** for Android is on
+[navic-gaps' Releases](https://github.com/illuminator69/navic-gaps/releases) (first alpha:
+[v.0.1.0](https://github.com/illuminator69/navic-gaps/releases/tag/v.0.1.0)), and **Feishin** for
+the desktop is on this repository's [Releases](../../releases).
 
 ---
 
@@ -68,6 +71,12 @@ sources are ready, and what it's working on.
   playing.
 - **Mixed for You, the same in both clients.** Radio around a song, Your mix (built from what you
   play most), a genre run, or more like one artist; plus Song Journey and text-to-music search.
+- **Custom radio and moods.** A radio can start from up to eight artists, with a variety setting
+  and a mood filter. Moods (Relax, Focus, Workout and others) are lists of your own songs that the
+  hub ranks with AudioMuse-AI's text search. Navic shows them on Home as chips, each with four mixes,
+  and offers mood chips in the queue.
+- **lb-bot on the phone.** Navic has lb-bot's Needs attention, Source history, Listening stats and
+  library tools in its avatar menu.
 - **Discover and Listening.** Rows of fresh releases, ListenBrainz playlists, rediscoveries and
   similar artists, and a listening-history page mirrored from ListenBrainz.
 - **Continue Listening across clients.** A shared, hub-owned queue history, so what you started on
@@ -98,8 +107,8 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 
 | Repo | What's in it |
 |---|---|
-| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the preview sidecar, the docs, and the [prebuilt releases](../../releases). |
-| **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic). Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. GPL-3.0. |
+| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the preview sidecar, the docs, and the [Feishin builds](../../releases). |
+| **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic), with its UI rebuilt around navi-connect. Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. Its APKs are on [its own Releases page](https://github.com/illuminator69/navic-gaps/releases). GPL-3.0. |
 | **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
 
