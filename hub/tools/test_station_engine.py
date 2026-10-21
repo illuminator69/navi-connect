@@ -155,7 +155,11 @@ def _near(item, n, radius=NEIGHBOURHOOD):
 # Fake AudioMuse
 # --------------------------------------------------------------------------- #
 AM = {"calls": [], "fail_min_n": None, "max_body": 0, "max_n": 0, "creds_seen": 0,
-      "slow": {}, "slow_fp": 0.0, "status": {}, "lock": threading.Lock()}
+      "slow": {}, "slow_fp": 0.0, "status": {}, "lock": threading.Lock(),
+      # CLAP (P7 moods): off unless a suite turns it on, so the station suites see the
+      # AudioMuse they always saw. `clap` is prompt -> ranked LIB ids; a prompt in
+      # `clap_fail` answers 500.
+      "clap_on": False, "clap": {}, "clap_fail": set()}
 
 
 class AudioMuse(http.server.BaseHTTPRequestHandler):
@@ -195,6 +199,11 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
             if item not in LIB:
                 return self._send(404, {"error": "Target track not found in index"})
             return self._send(200, [_row(o, d) for d, o in _near(item, n)])
+        if path == "/api/clap/stats":
+            if not AM["clap_on"]:
+                return self._send(404, {"error": "not found"})
+            return self._send(200, {"clap_enabled": True, "loaded": True,
+                                    "song_count": len(LIB)})
         if path == "/api/sonic_fingerprint/generate":
             if AM["slow_fp"]:
                 time.sleep(AM["slow_fp"])
@@ -235,6 +244,13 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         with AM["lock"]:
             AM["calls"].append((self.path, body))
+        if self.path == "/api/clap/search" and AM["clap_on"]:
+            q, limit = body.get("query"), int(body.get("limit") or 100)
+            if q in AM["clap_fail"]:
+                return self._send(500, {"error": "boom"})
+            ids = AM["clap"].get(q, [])[:limit]
+            return self._send(200, {"query": q, "count": len(ids),
+                                    "results": [_row(LIB[i], 0.1) for i in ids]})
         if self.path == "/api/alchemy":
             adds = [LIB[i["id"]] for i in body.get("items", [])
                     if i.get("op") == "add" and i.get("id") in LIB]

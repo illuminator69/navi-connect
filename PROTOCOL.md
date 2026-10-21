@@ -2605,6 +2605,7 @@ what these are not.
   "count": 50, "coverArtId": "",
   "seedIds": ["<artistId>", …],                                  // custom radio, ≤8 (below)
   "variety": "low|medium|high",                                  // custom radio (below)
+  "moodFilter": "pump-up",                                       // custom radio, P7 (§18.5)
   "createdAt": 0, "updatedAt": 0, "lastPlayedAt": 0 }
 ```
 
@@ -2639,7 +2640,9 @@ Your mix.
 a client that predates `seedIds` plays its first artist's radio instead of hiding the row. A client
 plays it as a `tracks` station seeded with `clamp(12 / artists, 1, 5)` songs of each artist,
 interleaved, and skips an artist the library no longer holds. Both keys are absent, never empty,
-on a recipe without them; `renameMix` keeps them. The clients' form for the other kinds is retired
+on a recipe without them; `renameMix` keeps them. A custom radio may also carry `moodFilter` (P7):
+a mood id of §18.5's catalogue, passed to `start` as the station's filter; anything else is
+dropped. The clients' form for the other kinds is retired
 (a Genre mix can no longer be created; an existing one still plays).
 
 ### 17.2 Acts
@@ -2721,7 +2724,8 @@ still answers (below, `configured: false`) and every other route answers `503 {f
       "description": "Wanders further, steered by what you skip and like." } ],
   "count": true,                              // P5: POST /sonic/station/count exists
   "varieties": ["low", "medium", "high"],     // P5: start takes `variety`
-  "filters": [] }                             // P5: custom-radio filters this hub obeys (none yet)
+  "filters": ["mood"],                        // P5: custom-radio filters this hub obeys (P7: "mood")
+  "moods": true }                             // P7: the mood service is available (§18.5)
 ```
 
 - `configured` is false when the engine is disabled. `available` is false when no tier answered
@@ -2732,6 +2736,9 @@ still answers (below, `configured: false`) and every other route answers `503 {f
 - `count`, `varieties` and `filters` (P5) are absent on an older hub: a client then draws no
   variety control, says the count is unavailable, and draws no filter. A client draws a filter only
   when its id is listed, so a later hub adds filters without a client release.
+- `moods` (P7) is true, and `filters` holds `"mood"`, only while the mood service is available
+  (AudioMuse answers and its CLAP index is loaded; §18.5). Absent or false: no mood chips on the
+  queue and no mood filter on the radio, with no gap.
 
 **`POST /sonic/station/start`**
 
@@ -2745,6 +2752,8 @@ still answers (below, `configured: false`) and every other route answers `503 {f
   "bindSession": "<savedQueueId>",  // optional: bind this station to the live session (below)
   "origin": "radio",         // radio | continue; absent or anything else = radio (below)
   "variety": "medium",       // low | medium | high; absent = medium (below)
+  "mood": "relax",           // P7: a mood as the station's source (§18.5); absent = none
+  "moodFilter": "pump-up",   // P7: or a mood as a filter on its pool; never both
   "deviceId": "<deviceId>" }
 ```
 
@@ -2791,6 +2800,9 @@ Answers:
 - Refusals:
   - `400 {code: "bad_seed" | "bad_character" | "bad_variety"}`. More than 12 seed ids is
     `bad_seed` (the length is checked before any id).
+  - `400 {code: "bad_mood"}`: `mood` or `moodFilter` is not a catalogue id, or both are given.
+    `409 {code: "mood_unavailable"}`: the mood's list cannot be had (AudioMuse down or its CLAP
+    index not loaded, Tier 1 only); no station is made.
   - `404 {code: "seed_unknown"}`: no tier knows a seed track or has anything near it: AudioMuse
     answers 404 (or an empty list) for every seed and Navidrome has no similar songs for it.
   - `503 {fallback: true}`: no tier is usable. Also Your mix on a hub whose AudioMuse is unset
@@ -2804,10 +2816,13 @@ radio's pick screen. Read-only: it creates no station and records nothing.
 
 ```jsonc
 { "seed": { "kind": "tracks", "ids": ["…"] (1–12) },   // or "track"; not yourMix
-  "character": "balanced" }                            // the only other key read
+  "character": "balanced",
+  "moodFilter": "pump-up" }                            // P7, optional (§18.5)
 ```
 
-Answers `200 {count, character, engine, anchors, unknown: [ids], partial}`:
+Answers `200 {count, character, moodFilter, engine, anchors, unknown: [ids], partial}`. With
+`moodFilter` the count is the pool **intersected** with the mood's list (its first 1000), and a
+mood that cannot be had is `409 {code: "mood_unavailable"}`:
 
 - `count` is the size of the union of the seeds' nearest lists cut at the character's first
   ceiling (150 / 400 / 1000; Tier 1: Navidrome's similar songs, at most 500 per seed), the seeds
@@ -2852,9 +2867,9 @@ servedElsewhere}`.
 
 ```jsonc
 { "stationId": "st_…", "trackId": "…",
-  "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character" | "stop",
-  "value": "explore",        // only for `character`
-  "apply": true }            // only for `character` and `stop`, hub with "stationEdits" (§18.2)
+  "kind": "like" | "unlike" | "dislike" | "skip" | "played" | "character" | "stop" | "mood",
+  "value": "explore",        // only for `character`, and for `mood` (a mood id, "" = All)
+  "apply": true }            // only for `character`, `mood` and `stop`, hub with "stationEdits" (§18.2)
 ```
 
 Answers `{rev, applied, ignored?}`, and with `apply`, `edited: {removed, added, from} | false`
@@ -2875,6 +2890,12 @@ and on `false` a `reason` (§18.2).
 - `unlike` takes a like back. `dislike` takes a like back, joins the subtract set and cools the
   track's artist at once (as that character's skip limit would). `played` on an unbound station
   also enters the play history (§18.4).
+- `mood` (P7, §18.5) makes the mood the station's source from its next batch, or with `""`
+  ("All") its own anchors again; with `apply` the unplayed tail is swapped as for `character`. Like
+  a character it starts a stopped station again, moves `rev` and keeps the character. `400
+  {code: "bad_mood"}` for an id the catalogue lacks, or for a station started with `moodFilter`
+  (a filtered radio's identity is its filter); `409 {code: "mood_unavailable"}` when the mood's
+  list cannot be had, and nothing changes.
 - `400 {code: "bad_signal"}` for an unknown `kind`, `400 {code: "bad_character"}` for a
   `character` signal whose `value` is not one of the three.
 - A signal that changes something moves `rev`, and so does a character change; repeating one that
@@ -2894,6 +2915,7 @@ and on `false` a `reason` (§18.2).
 
 `{ "t": "station", "stationId": "st_…", "seq": 25, "rev": 2, "character": "balanced",
 "exhausted": false, "stopped": false, "name": "Cinnamon Girl radio", "origin": "radio",
+"variety": "medium", "mood": null, "moodFilter": null,
 "seed": { "kind": "track", "ids": ["…"], "name": "Cinnamon Girl" } }` is
 broadcast to every client whenever a station's `seq`, `rev`, `character`, `exhausted` or
 `stopped` changes. It carries the seed so a device that adopted the station from the session can
@@ -3114,3 +3136,22 @@ rebuilt. A mood's merged list is stored only when all four of its searches answe
 three is never served. A failed build is tried again no sooner than 60 s later. All 13 are built
 once the stations have probed AudioMuse, so the first Home visit after a restart usually finds
 `ready`; the tiles do not wait for it.
+
+**A mood steering a station (Part B).** Two ways, never both on one station:
+
+- **Source** (`start {mood}` or the `mood` signal; the queue's chips): the station's gate is ONE
+  virtual anchor, `mood:<id>`, whose "nearest list" is the mood's merged list, cut at the
+  character's ceiling (Familiar 150, Blend 400, Discover 1000). A filter on the station's own pool
+  would leave a median of 5 songs at Blend (measured 2026-10-20, one seed, the first 600 of a
+  mood), so autoplay would run dry; as the source it cannot. The seed and the likes are still the
+  anchors for alchemy, and the spacing, cooling and history rules apply as ever. Explore's drift
+  and Navidrome (Tier 1) are not used: neither knows the mood. `""` returns to the anchors.
+- **Filter** (`start {moodFilter}`, a custom radio's recipe; P5's Tune screen): every candidate
+  must also be among the first 1000 of the mood's list. The live `count` is the honest answer to
+  how much is left (three artists at Blend: a median of 70). An empty intersection is
+  `exhausted`, never a relaxed filter.
+
+Both persist with the station and are echoed by `start`, `next` and the `station` frame (`mood`,
+`moodFilter`, null when unset). A mood whose list cannot be had during a batch (after a hub
+restart with AudioMuse down) makes the batch `partial` and empty: never unfiltered, never the
+seed's neighbours instead. A client that sends neither key gets exactly the station it got before.

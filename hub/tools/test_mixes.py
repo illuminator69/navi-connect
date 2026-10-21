@@ -263,7 +263,10 @@ async def test_custom_radio_fields():
         nine = [f"ar-{i}" for i in range(9)]
         await c.act(action="saveMix", id="mx_custom", name="A, B, C", kind="artist",
                     seedId="ar-0", seedIds=nine[:2] + [7, None, "", "x" * 129, "ar-1"]
-                    + nine[2:], variety="high", character="explore", count=50)
+                    + nine[2:], variety="high", character="explore", count=50,
+                    moodFilter="pump-up")
+        await c.act(action="saveMix", id="mx_bad_mood", name="Bad mood", kind="artist",
+                    seedId="ar-0", moodFilter="nope")
         await c.act(action="saveMix", id="mx_bad_v", name="Bad", kind="artist",
                     seedId="ar-0", seedIds="ar-0", variety="x")
         await c.act(action="saveMix", id="mx_plain", name="Plain", kind="artist",
@@ -274,6 +277,12 @@ async def test_custom_radio_fields():
             failures.append(f"seedIds/variety did not survive: {rec}")
         if bad is None or "seedIds" in bad or "variety" in bad:
             failures.append(f"a bad seedIds/variety was kept: {bad}")
+        # P7: a custom radio's mood filter, a mood id or nothing.
+        if rec is None or rec.get("moodFilter") != "pump-up":
+            failures.append(f"moodFilter did not survive: {rec}")
+        bad_mood = mix(c, "mx_bad_mood")
+        if bad_mood is None or "moodFilter" in bad_mood:
+            failures.append(f"moodFilter nope was kept: {bad_mood}")
         if plain is None or "seedIds" in plain or "variety" in plain \
                 or plain.get("character") != "close":
             failures.append(f"a recipe without the new fields changed: {plain}")
@@ -281,7 +290,8 @@ async def test_custom_radio_fields():
         await asyncio.sleep(0.4)
         rec = mix(c, "mx_custom")
         if rec is None or rec.get("name") != "Evening radio" \
-                or rec.get("seedIds") != nine[:8] or rec.get("variety") != "high":
+                or rec.get("seedIds") != nine[:8] or rec.get("variety") != "high" \
+                or rec.get("moodFilter") != "pump-up":
             failures.append(f"renameMix lost the custom radio's fields: {rec}")
         await c.ws.close()
     finally:

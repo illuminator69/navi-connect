@@ -519,6 +519,7 @@ MOOD_RETRY = float(os.environ.get("HUB_MOOD_RETRY_S", "60") or "60")
 MOOD_CALL_TIMEOUT = 20.0              # one CLAP search (0.9 s cold measured, 2.2 s first)
 MOOD_STATS_TTL = 600.0                # CLAP's "loaded" is re-asked at most this often...
 MOOD_STATS_RETRY = 15.0               # ...or this soon after AudioMuse did not answer
+MOOD_ANCHOR = "mood:"                 # a mood station's one, virtual, anchor (§18.5)
 
 
 def log(*a: Any) -> None:
@@ -2612,10 +2613,11 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
     ("POST", "/sonic/station/start"): {
         "method": "POST",
         "body": ("seed", "character", "count", "exclude", "bindSession", "deviceId",
-                 "origin", "variety"),
+                 "origin", "variety", "mood", "moodFilter"),
     },
     # Read-only: how many songs a seed set could draw from. Creates no station.
-    ("POST", "/sonic/station/count"): {"method": "POST", "body": ("seed", "character")},
+    ("POST", "/sonic/station/count"): {"method": "POST",
+                                       "body": ("seed", "character", "moodFilter")},
     ("POST", "/sonic/station/next"): {
         "method": "POST",
         "body": ("stationId", "after", "count", "exclude", "deviceId"),
@@ -2627,13 +2629,14 @@ STATION_ROUTES: dict[tuple[str, str], dict] = {
 
 # What this hub's routes take beyond §18's first version, so a client draws a control
 # only when the hub behind it obeys it (P5): the count route, the Artist variety
-# values, and the filters a custom radio may name (none yet; a later hub adds them
-# here and the clients draw them without a release).
+# values, and the filters a custom radio may name. `moods` and the "mood" filter
+# (P7, §18.5) are added by the probe itself while the mood service is available.
 _STATION_FEATURES_PROBE = {"count": True, "varieties": list(STATION_VARIETIES),
-                           "filters": []}
+                           "filters": [], "moods": False}
 
 _STATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-_STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character", "stop")
+_STATION_SIGNALS = ("like", "unlike", "dislike", "skip", "played", "character", "stop",
+                    "mood")
 # Why a station was started (§18.1): "radio" — the user asked for it, and it keeps
 # going with autoplay off — or "continue" — autoplay continued a queue, and it stops
 # when autoplay is turned off. Anything else is "radio".
@@ -2780,6 +2783,11 @@ class Station:
     engine: str = "tier2"
     origin: str = "radio"            # radio | continue (_STATION_ORIGINS)
     variety: str = "medium"          # Artist variety (STATION_VARIETIES), P5
+    # P7 (§18.5): a mood as the station's SOURCE (its gate is the mood's merged list,
+    # cut at the character's ceiling) or, for a custom radio, a FILTER on its own
+    # pool (the mood's first MOOD_GATE_DEPTH). Never both.
+    mood: Optional[str] = None
+    mood_filter: Optional[str] = None
     seq: int = 0                     # tracks served, ever
     rev: int = 0                     # moved by every signal and character change
     exhausted: bool = False
@@ -2857,7 +2865,7 @@ class Station:
         return {"t": "station", "stationId": self.id, "seq": self.seq, "rev": self.rev,
                 "character": self.character, "exhausted": self.exhausted,
                 "stopped": self.stopped, "name": self.name, "origin": self.origin,
-                "variety": self.variety,
+                "variety": self.variety, "mood": self.mood, "moodFilter": self.mood_filter,
                 # The seed too (≤12 ids and a name), so a device that adopted this
                 # station from the session can start it again as itself if the hub
                 # loses it (B-139), not as a new continuation of whatever plays.
@@ -2868,7 +2876,8 @@ class Station:
             "id": self.id, "seed": self.seed, "name": self.name,
             "character": self.character, "createdAt": self.created_at,
             "usedAt": self.used_at, "engine": self.engine, "origin": self.origin,
-            "variety": self.variety, "seq": self.seq,
+            "variety": self.variety, "mood": self.mood, "moodFilter": self.mood_filter,
+            "seq": self.seq,
             "rev": self.rev, "exhausted": self.exhausted, "stopped": self.stopped,
             "seedIds": self.seed_ids,
             "anchorMeta": self.anchor_meta, "likes": self.likes, "served": self.served,
@@ -2924,6 +2933,9 @@ class Station:
             engine="tier1" if d.get("engine") == "tier1" else "tier2",
             origin="continue" if d.get("origin") == "continue" else "radio",
             variety=d.get("variety") if d.get("variety") in STATION_VARIETIES else "medium",
+            mood=d.get("mood") if d.get("mood") in MOOD_BY_ID else None,
+            mood_filter=(d.get("moodFilter") if d.get("moodFilter") in MOOD_BY_ID
+                         and d.get("mood") not in MOOD_BY_ID else None),
             seq=_as_int(d.get("seq"), 0, 0), rev=_as_int(d.get("rev"), 0, 0),
             exhausted=bool(d.get("exhausted")), stopped=d.get("stopped") is True,
             seed_ids=strs(d.get("seedIds"), STATION_SEEDS_MAX), anchor_meta=meta,
@@ -3510,6 +3522,16 @@ class StationEngine:
         key = (item_id, depth)
         if key in b.lists:
             return b.lists[key]
+        if item_id.startswith(MOOD_ANCHOR):
+            # A mood station's one anchor (§18.5): its "nearest list" is the mood's merged
+            # list, held by the mood service in memory. None = it cannot be had, and the
+            # batch is partial: never a fall back to the seed's neighbours.
+            svc = self._moods()
+            mood_rows = await svc.merged(item_id[len(MOOD_ANCHOR):]) if svc is not None else None
+            if mood_rows is None:
+                b.failed = True
+            b.lists[key] = mood_rows[:depth] if mood_rows is not None else None
+            return b.lists[key]
         rows: Optional[list] = self._list_cached(item_id, depth)
         if rows is None:
             status, data = await self._am("similar_tracks", {
@@ -3609,7 +3631,9 @@ class StationEngine:
         """Every candidate the gate admits at this ceiling, best first, as
         (row, why, rank, hop). None = every anchor list failed."""
         depth = _station_depth(ceiling)
-        anchors = st.anchors()
+        # A mood station gates on the mood alone; its own anchors still feed alchemy
+        # and the spacing, cooling and history rules.
+        anchors = [MOOD_ANCHOR + st.mood] if st.mood else st.anchors()
         lists = await self._gather([self._nearest(a, depth, b) for a in anchors])
         answered = [(a, rows) for a, rows in zip(anchors, lists) if rows is not None]
         if not answered:
@@ -3628,12 +3652,13 @@ class StationEngine:
             near_lists.append(near)
         near_stream = self._round_robin(near_lists)
         # Your mix: the fingerprint's own top rows are tracks to play, first.
-        mix = [({**m, "dist": 0.0}, "near", 0, 1) for m in st.anchor_meta if m.get("mix")]
+        mix = [({**m, "dist": 0.0}, "near", 0, 1) for m in st.anchor_meta
+               if m.get("mix") and (not st.mood or m["id"] in gate)]
         sources: list[list] = [mix + near_stream]
 
         drift_gate: dict[str, tuple[int, dict]] = {}
         drift_stream: list = []
-        if tune.drift:
+        if tune.drift and not st.mood:
             src = [p for p in reversed(st.played) if st.hops.get(p) == 1]
             src = src[:STATION_DRIFT_SOURCES]
             dl = await self._gather([self._nearest(p, STATION_DRIFT_CEILING, b) for p in src])
@@ -3752,7 +3777,8 @@ class StationEngine:
             ceiling = min(top, int(math.ceil(ceiling * STATION_WIDEN)))
             out.append((f"ceiling {ceiling}", ceiling, STATION_HISTORY_DAYS))
         out.append(("history 3d", ceiling, STATION_HISTORY_RELAXED_DAYS))
-        if not tier1_primary and self.tier1_configured():
+        # Navidrome's similar songs know no mood: a mood station has no Tier 1 rung.
+        if not tier1_primary and self.tier1_configured() and not st.mood:
             out.append(("tier1", ceiling, STATION_HISTORY_RELAXED_DAYS))
         return out
 
@@ -3790,6 +3816,20 @@ class StationEngine:
             b.failed = True
             b.tier2_failed = True
         b.engine = "tier1" if tier1_primary else "tier2"
+        # A mood (§18.5) needs AudioMuse: without it the batch is partial and empty,
+        # never the station's neighbours unfiltered.
+        mood_filter: Optional[set] = None
+        if st.mood or st.mood_filter:
+            svc = self._moods()
+            if tier1_primary or svc is None:
+                b.failed = True
+                return []
+            if st.mood_filter:
+                filter_rows = await svc.merged(st.mood_filter)
+                if filter_rows is None:
+                    b.failed = True
+                    return []
+                mood_filter = {r["id"] for r in filter_rows}
         levels = self._levels(st, tier1_primary)
         li = 0
         while li < len(levels) and len(picked) < count and b.left() > 0:
@@ -3813,8 +3853,9 @@ class StationEngine:
                 if li == 1:
                     # Every anchor list failed at AudioMuse: this batch comes from
                     # Navidrome, and the answer says so (engine tier1, partial).
+                    # Not for a mood station: Navidrome knows no mood.
                     b.tier2_failed = True
-                    if not self.tier1_configured():
+                    if not self.tier1_configured() or st.mood:
                         break
                     tier1_primary = True
                     b.engine = "tier1"
@@ -3828,7 +3869,8 @@ class StationEngine:
                         and r["id"] not in hist_ids
                         and not (r["tk"] and (r["tk"] in hard_keys or r["tk"] in picked_keys
                                               or r["tk"] in hist_keys))
-                        and r["ak"] not in cooled)
+                        and r["ak"] not in cooled
+                        and (mood_filter is None or r["id"] in mood_filter))
 
             def take(c: tuple) -> None:
                 nonlocal prev
@@ -3942,6 +3984,36 @@ class StationEngine:
             st.cursors[iid] = i
         return exhausted, partial
 
+    # ----- moods (§18.5) -------------------------------------------------- #
+    def _moods(self) -> Optional["MoodService"]:
+        return getattr(self.hub, "moods", None)
+
+    def moods_usable(self) -> bool:
+        """A mood can steer a station now: the mood service says AudioMuse and CLAP are
+        there, and AudioMuse is not known to be down (Tier 1 knows no mood)."""
+        svc = self._moods()
+        return bool(svc is not None and svc.available() and self.tier2_configured()
+                    and self.tier2_ok is not False)
+
+    @staticmethod
+    def _parse_mood(raw: Any) -> tuple[bool, Optional[str]]:
+        """(valid, mood id or None). Absent, null and "" are no mood."""
+        if raw is None or raw == "":
+            return True, None
+        if isinstance(raw, str) and raw in MOOD_BY_ID:
+            return True, raw
+        return False, None
+
+    async def _mood_ready(self, mood_id: str) -> bool:
+        """The mood can be steered by now: usable, and its merged list is built (or is
+        built by this ask)."""
+        svc = self._moods()
+        return self.moods_usable() and svc is not None and await svc.merged(mood_id) is not None
+
+    _BAD_MOOD = {"code": "bad_mood", "error": "mood must be a mood id of /sonic/mood/catalogue"}
+    _MOOD_UNAVAILABLE = {"code": "mood_unavailable",
+                         "error": "moods need AudioMuse's CLAP search, which is not there now"}
+
     # ----- routes ------------------------------------------------------------ #
     async def route(self, path: str, body: dict) -> tuple[int, dict]:
         if path == "/sonic/station/characters":
@@ -3963,10 +4035,15 @@ class StationEngine:
             except asyncio.TimeoutError:
                 pass
         engine = self.engine_name()
+        svc = self._moods()
+        if svc is not None:
+            await svc.refresh_stats()
+        moods = bool(svc is not None and svc.available())
         return {"configured": True, "available": engine is not None, "engine": engine,
                 "default": STATION_DEFAULT_CHARACTER,
                 "characters": [dict(c) for c in STATION_CATALOGUE],
-                **_STATION_FEATURES_PROBE}
+                **_STATION_FEATURES_PROBE,
+                "moods": moods, "filters": ["mood"] if moods else []}
 
     @staticmethod
     def _parse_seed(raw: Any) -> Optional[dict]:
@@ -4047,7 +4124,7 @@ class StationEngine:
         return {"stationId": st.id, "seq": st.seq, "rev": st.rev,
                 "character": st.character, "engine": st.engine, "origin": st.origin,
                 "tracks": tracks, "exhausted": exhausted, "partial": partial,
-                "stopped": st.stopped}
+                "stopped": st.stopped, "mood": st.mood, "moodFilter": st.mood_filter}
 
     def _stopped_answer(self, st: Station) -> dict:
         """`next` on a stopped station: nothing, and not because nothing is left."""
@@ -4069,6 +4146,12 @@ class StationEngine:
         if variety not in STATION_VARIETIES:
             return 400, {"code": "bad_variety",
                          "error": f"variety must be one of {list(STATION_VARIETIES)}"}
+        ok_m, mood = self._parse_mood(body.get("mood"))
+        ok_f, mood_filter = self._parse_mood(body.get("moodFilter"))
+        if not ok_m or not ok_f or (mood and mood_filter):
+            return 400, dict(self._BAD_MOOD)
+        if (mood or mood_filter) and not await self._mood_ready(mood or mood_filter):
+            return 409, dict(self._MOOD_UNAVAILABLE)
         count = _as_int(body.get("count"), 20, 1, 50)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
@@ -4096,7 +4179,8 @@ class StationEngine:
                         if isinstance(t, dict) and isinstance(t.get("id"), str)}
         now = _now_ms()
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
-                     created_at=now, used_at=now, origin=origin, variety=variety)
+                     created_at=now, used_at=now, origin=origin, variety=variety,
+                     mood=mood, mood_filter=mood_filter)
         deadline = time.monotonic() + STATION_BUDGET_S
         if not await self._acquire(self._computing, deadline):
             return 503, {"fallback": True, "busy": True,
@@ -4160,6 +4244,7 @@ class StationEngine:
              f"engine {st.engine}, rungs {b.rungs}")
         answer = {**self._answer(st, tracks, exhausted, partial), "name": st.name,
                   "seed": st.seed, "bound": bound, "variety": st.variety}
+        answer.update(mood=st.mood, moodFilter=st.mood_filter)
         if debug:
             answer["_debug"] = {"rungs": b.rungs, "failed": b.failed,
                                 "timedOut": b.timed_out}
@@ -4182,6 +4267,16 @@ class StationEngine:
         if character not in STATION_CHARACTERS:
             return 400, {"code": "bad_character",
                          "error": f"character must be one of {list(STATION_CHARACTERS)}"}
+        ok_f, mood_filter = self._parse_mood(body.get("moodFilter"))
+        if not ok_f:
+            return 400, dict(self._BAD_MOOD)
+        filter_ids: Optional[set] = None
+        if mood_filter:
+            svc = self._moods()
+            rows = await svc.merged(mood_filter) if self.moods_usable() and svc else None
+            if rows is None:
+                return 409, dict(self._MOOD_UNAVAILABLE)
+            filter_ids = {r["id"] for r in rows}
         ids = seed["ids"]
         tune = STATION_TUNING[character]
         deadline = time.monotonic() + STATION_BUDGET_S
@@ -4216,7 +4311,12 @@ class StationEngine:
         if not answered:
             return 503, {"fallback": True, "error": "no tier answered"}
         pool = {r["id"] for rows in answered for r in rows} - set(ids)
-        return 200, {"count": len(pool), "character": character,
+        if filter_ids is not None:
+            if tier1:
+                # AudioMuse fell over during the count: a filtered count is not had.
+                return 409, dict(self._MOOD_UNAVAILABLE)
+            pool &= filter_ids
+        return 200, {"count": len(pool), "character": character, "moodFilter": mood_filter,
                      "engine": "tier1" if tier1 else "tier2", "anchors": len(answered),
                      "unknown": unknown, "partial": b.failed or b.timed_out}
 
@@ -4303,6 +4403,21 @@ class StationEngine:
                 self._bump(st)
                 self._changed(st)
             return 200, await self._maybe_edit(st, kind, body)
+        if kind == "mood":
+            # §18.5: the mood becomes the station's source ("" = All, its own anchors
+            # again). A filtered radio's identity is its filter: no mood on top of it.
+            ok, mood = self._parse_mood(body.get("value"))
+            if not ok or st.mood_filter is not None:
+                return 400, dict(self._BAD_MOOD)
+            if mood is not None and not await self._mood_ready(mood):
+                return 409, dict(self._MOOD_UNAVAILABLE)
+            # Like a character, a mood starts a stopped station again.
+            if mood != st.mood or st.stopped:
+                st.mood = mood
+                st.stopped = False
+                self._bump(st)
+                self._changed(st)
+            return 200, await self._maybe_edit(st, kind, body)
         if kind == "character":
             value = body.get("value")
             if value not in STATION_CHARACTERS:
@@ -4353,7 +4468,7 @@ class StationEngine:
 
     # ----- editing the bound station's queue (§18.2 `apply`) ---------------- #
     async def _maybe_edit(self, st: Station, kind: str, body: dict) -> dict:
-        """The answer to a `character` or `stop` signal, and the queue edit it asks
+        """The answer to a `character`, `mood` or `stop` signal, and the queue edit it asks
         for. Without `apply`, or for a station the session is not bound to, exactly
         the old answer: the signal alone."""
         answer: dict = {"rev": st.rev, "applied": True}
@@ -4443,7 +4558,7 @@ class StationEngine:
                         else "empty"}
             tracks: list[dict] = []
             b: Optional[_StationBatch] = None
-            if kind == "character" and not st.stopped:
+            if kind in ("character", "mood") and not st.stopped:
                 _cut, removed = plan
                 gone = set(removed)
                 keep = {t.get("id") for i, t in enumerate(hub.session.queue)
@@ -6593,6 +6708,9 @@ class Hub:
             rec["seedIds"] = seed_ids
         if raw.get("variety") in STATION_VARIETIES:
             rec["variety"] = raw["variety"]
+        # A custom radio's mood filter (P7, §18.5): a mood id, or nothing.
+        if raw.get("moodFilter") in MOOD_BY_ID:
+            rec["moodFilter"] = raw["moodFilter"]
         return rec
 
     def _mixes_list(self) -> list[dict]:
