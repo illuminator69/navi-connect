@@ -1204,11 +1204,13 @@ validate it again (http(s) only) and hide the link when it is empty. Added
 | `GET /lb/listening/unowned` | same | `period`, `kind`, `limit` | **never**, and never coalesced (§15.4) |
 | `GET /lb/listening/recent` | same | `before`, `limit` | **never** |
 | `POST /lb/listening/sync` | same | — (any body is dropped) | — |
+| `GET /lb/attention` | `GET /api/attention` | — | 20 s (fast pool; cleared by a settling `fill` push and by `/lb/notify`, §15.6) |
+| `GET /lb/activity` | `GET /api/activity` | — | 20 s (fast pool; cleared like `/lb/attention`, §15.6) |
 
 No upstream token is injected — lb-bot has none to inject.
 
 **Three slot pools.** Every route above shares `PROXY_MAX_INFLIGHT` (4) upstream slots
-per proxy, first come first served — except the routes marked *fast pool* (six, plus the two polled job routes of §15.5), which have
+per proxy, first come first served — except the routes marked *fast pool* (six, plus the two polled job routes of §15.5 and the two screen reads of §15.6), which have
 two slots of their own (`PROXY_FAST_INFLIGHT`), and the two marked *sync pool*, which
 have one (`PROXY_SYNC_INFLIGHT`, §15.3). A status poll used to queue behind four `album/sources`
 fan-outs (150 s each) until the handshake deadline dropped its socket with no
@@ -2371,6 +2373,53 @@ and `merges` beside the artist overrides, each with Undo.
 
 **Not measured, so not claimed:** what an album retag does to a Navidrome favourite, rating or play count. A
 move with unchanged tags keeps track and album ids; a retag to another release changes the album id.
+
+### 15.6 Needs attention and Source history — `/lb/attention`, `/lb/activity`
+
+Added 2026-10-21 (P6). Two **read-only** screen reads; **no write route comes with them**. The wire is additive:
+an lb-bot older than them answers `404` with no `code` (passed through untouched and never cached), and a
+client treats that as §15.5 does: the page lists what its own fill ledger holds and says in one muted sentence
+that the rest cannot be listed, never "Nothing to fix" or `0`. A hub older than them does not advertise them;
+clients gate on `GET /lb/attention` and `GET /lb/activity`.
+
+**`GET /lb/attention`** → `{version: 1, serverTime, counts, albums, folders, truncated}`.
+
+- `counts`: `{failedGaps, failedRequests, folders, foldersUnidentified, picks}`, the same numbers as lb-bot's
+  `/api/summary` (`gaps.failed`, `requests.failed`, `transfers.needsPlacement`, `transfers.unidentified`) plus
+  `picks`, the groups waiting at `picking`. **The to-fix number is `failedGaps + failedRequests + folders`**, lb-bot's
+  web UI's own (`needs.js`); it is not sent, every client adds the three. `picks`, `foldersUnidentified` and the
+  artists to check are listed, never counted into it.
+- `albums` (≤ 50; failed first, then picking, newest `updatedAt` first): `{kind: "gap"|"request", key, groupId,
+  releaseMbid, rgid, albumId, artist, album, coverUrl, state: "failed"|"picking", missingCount, total, updatedAt}`.
+  A request lb-bot cannot name (no ledger name, no review group covering its release) is left out.
+- `folders` (≤ 50): `{id, fileCount, formats, matchLabel, confidence, canConfirm, groupId, releaseMbid, identified}`.
+  `id` is lb-bot's 12-character folder id; `matchLabel` is "Artist — Album" or `""`. **Never a folder's `name` or
+  `path`** (host paths): a client says "Artist — Album · 11 files" or "Unidentified folder · 11 files", and files
+  one only in lb-bot's web UI (`webUrl + "/#/place/" + id`), because filing retags and moves files.
+- `truncated`: `{albums, folders}`, how many rows the caps cut; a client says "and N more in lb-bot".
+
+**`GET /lb/activity`** → `{version: 1, serverTime, requests, transfers}`.
+
+- `requests` (≤ 200, newest first): every row lb-bot's fill ledger still holds, live or terminal (it keeps a
+  `verified` row 6 h and a `failed` or `cancelled` one 24 h), as `{releaseMbid, rgid, groupId, albumId, artist,
+  album, state, percent, done, total, failureKind, reason, retryable, gapFill, updatedAt}`. `state` is the §15.2
+  ledger's server state. A client joins them with its own ledger by `releaseMbid`, else `groupId`; lb-bot's row
+  wins the state, the device's row keeps what lb-bot has forgotten. A row only lb-bot knows offers **Open album**
+  and nothing else (no Retry, no Cancel, no Dismiss).
+- `transfers` (≤ 100): `{id, kind, album, artist, groupId, state, pct, peer}`. Never a peer `filename`, a `path` or
+  the composed `title`.
+
+**What the hub does.** Both routes forward no parameter, are cached `LB_ATTENTION_TTL` (20 s) and coalesced
+(lb-bot answers from the same gap view `/api/summary` builds, about a second), ride the fast pool, and are
+dropped from the cache by a `fill` push whose `state` or `status` settles (`failed`, `cancelled`, `placed`,
+`verified`, `picking`, `complete`; not a progress push) and by `/lb/notify`. Belt and braces over lb-bot's own
+allowlist, the hub strips `folders[].name`, `.path`, `.identifyError`, `.coverUrl` and `transfers[].filename`,
+`.path`, `.title`. `/api/downloads` (its review rows carry Telegram credentials) and every placement or
+transfer write stay off the wire.
+
+**When a client reads them.** On `welcome`, on a `fill` or `lb` frame, when the avatar menu or either page
+opens, never more than once in 30 s unless a frame forces it (a failed state does), one read in flight at a
+time; nobody watching, no read.
 
 ---
 
