@@ -248,6 +248,9 @@ PROXY_CACHE_TTL = 60.0      # shared result cache — both clients asking the sa
                             # question cost one upstream call
 PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers (a
                             # release's tracklist and editions do not change)
+LB_ATTENTION_TTL = 20.0     # /lb/attention and /lb/activity (§15.6): lb-bot builds
+                            # its gap view to answer (~1 s), every client asks on
+                            # welcome and on fill frames, and a count 20 s old is fine
 # Entries, across every route of one proxy — not bytes. 64 was sized for
 # surfaces that ask one question per page open; a Discover screen asks several,
 # and rotates the artist it seeds its similar-artists row from, so each rotation
@@ -1416,6 +1419,39 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "strip": GAP_REPLY_STRIP_RULES,
         "timeout": PROXY_SLOW_TIMEOUT,
     },
+    # ---- P6: the phone's Needs attention and Source history (§15.6) ----
+    ("GET", "/lb/attention"): {
+        # lb-bot's own "to fix" (failed gaps + failed requests + folders waiting to
+        # be filed) with the rows behind it, capped at 50 albums and 50 folders.
+        # Read-only, and no write route comes with it: filing a folder retags and
+        # moves files, so a client links to lb-bot's web UI for that instead.
+        #
+        # Cached 20 s and coalesced because lb-bot answers it from the same gap
+        # view `/api/summary` builds (about a second on a 3,000-group library), and
+        # every client asks on welcome, on a fill frame and when a page opens. The
+        # cache is dropped by a terminal fill push and by `/lb/notify`
+        # (LB_ATTENTION_ROUTES), so the read a failed fill triggers is not the
+        # answer from before it failed. Fast pool: a screen's read must not queue
+        # behind a 150 s source search.
+        #
+        # `strip` is belt and braces: lb-bot's answer is an allowlist already, and
+        # a folder's `name`/`path` (host paths) must never reach a phone even from
+        # an lb-bot that got that wrong.
+        "method": "GET", "path": "/api/attention",
+        "params": (), "cache": True, "ttl": LB_ATTENTION_TTL,
+        "strip": (("folders", "name"), ("folders", "path"),
+                  ("folders", "identifyError"), ("folders", "coverUrl")),
+    },
+    ("GET", "/lb/activity"): {
+        # Every request lb-bot's fill ledger still holds (at most 200, terminal rows
+        # kept 6 to 24 h there) and the file-level transfers (at most 100). Same
+        # cache, pool and flush as attention. The transfer rows lose any peer
+        # filename or path lb-bot might have left on them.
+        "method": "GET", "path": "/api/activity",
+        "params": (), "cache": True, "ttl": LB_ATTENTION_TTL,
+        "strip": (("transfers", "filename"), ("transfers", "path"),
+                  ("transfers", "title")),
+    },
 }
 
 # The preview sidecar's CONTROL plane, and only that. There is no `/preview/stream`
@@ -1460,6 +1496,7 @@ PREVIEW_ROUTES: dict[tuple[str, str], dict] = {
 # PROXY_FAST_INFLIGHT); everything else shares the default one.
 for _fast in (("GET", "/lb/album/status"), ("GET", "/lb/fills"), ("GET", "/lb/gap"),
               ("GET", "/lb/listening/status"), ("GET", "/lb/artist/merge"),
+              ("GET", "/lb/attention"), ("GET", "/lb/activity"),
               ("POST", "/lb/album/cancel"), ("POST", "/lb/gap/cancel")):
     LB_ROUTES[_fast]["pool"] = "fast"
 # The index mirror's pulls take their own one-slot pool (PROXY_SYNC_INFLIGHT).
@@ -4435,6 +4472,10 @@ _LB_FILL_BOOL = ("retryable", "mp3WouldHelp", "allowMp3", "cancellable", "verify
 # "try another source" re-read within the 60 s TTL got the same list back,
 # with the peer that had just failed still at the top.
 _LB_FILL_TERMINAL = ("failed", "cancelled")
+# Every state that ends a fill or waits on the user: each one moves a row between
+# Source history's Running and Earlier, or the count behind the avatar (§15.6).
+# An album fill names it in `state`, a gap summary in `status` (`picking`, `complete`).
+_LB_FILL_SETTLED = _LB_FILL_TERMINAL + ("placed", "verified", "picking", "complete")
 # The third inbound path: lb-bot's library index moved (the mirror's live
 # trigger). `t: "index"` rather than `library` for the same reason as `fill`, and
 # more so — during a bulk build it arrives every 2 s, and a `library` frame at
@@ -4476,6 +4517,12 @@ LB_LIBRARY_ROUTES = {
     ("GET", "/lb/status"),
     ("GET", "/lb/overrides"),
 }
+
+# P6 (§15.6): the two screen reads whose answer a fill's ending or a landing makes
+# wrong. Dropped by a terminal fill push (the client re-reads on that frame, and a
+# 20 s-old cached count would still say the fill was running) and by `/lb/notify`.
+# Not on progress pushes: they arrive every few seconds and change no count.
+LB_ATTENTION_ROUTES = frozenset({("GET", "/lb/attention"), ("GET", "/lb/activity")})
 
 # One discography release row, in the exact shape GET /lb/artist/discography
 # returns it, so a client can patch its copy without re-reading the page.
@@ -4627,6 +4674,9 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
 
     if frame.get("kind") == "album" and frame.get("state") in _LB_FILL_TERMINAL:
         LB.invalidate({("GET", "/lb/album/sources")})
+    if (frame.get("state") in _LB_FILL_SETTLED
+            or frame.get("status") in _LB_FILL_SETTLED):
+        LB.invalidate(LB_ATTENTION_ROUTES)
     if HUB_INSTANCE is not None:
         await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
     dlog("LB fill ->", frame)
@@ -4684,7 +4734,7 @@ async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
     # re-read served from a cache filled a minute ago is the old "missing" answer —
     # which is exactly what made a landed album take a minute longer to show than
     # the frame announcing it.
-    LB.invalidate(LB_LIBRARY_ROUTES)
+    LB.invalidate(LB_LIBRARY_ROUTES | LB_ATTENTION_ROUTES)
 
     if HUB_INSTANCE is not None:
         await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
