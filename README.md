@@ -40,13 +40,24 @@ MusicBrainz tracklist, choose a quality, and only then go looking for sources.
 </p>
 
 The same surface on Android — note the mini-player reading **Playing on Feishin**: the phone is
-controlling a session running on the desktop.
+controlling a session running on the desktop. An artist's discography marks every release owned,
+partly owned or missing, and a partly owned album says which tracks it lacks and fills them in one
+tap.
 
 <p align="center">
-  <img src="docs/screenshots/navic-artist-missing-albums.png" width="290"
-       alt="Navic artist page with albums marked 7 missing, 3 missing and Not in your library" />
-  <img src="docs/screenshots/navic-missing-album-review.png" width="290"
-       alt="Navic bottom sheet showing edition options, tracklist, quality preference and Find sources" />
+  <img src="docs/screenshots/navic-discography.webp" width="240"
+       alt="Navic artist discography: each album marked Owned, Partly owned with a progress bar, or Missing" />
+  <img src="docs/screenshots/navic-album.webp" width="240"
+       alt="A partly owned album in Navic, washed in its cover's colours, with an 8 tracks missing card and a Fill gaps button" />
+  <img src="docs/screenshots/navic-album-missing-tracks.webp" width="240"
+       alt="The missing-tracks card unfolded: the eight missing tracks, the release they were measured against, Re-check and Open in lb-bot" />
+</p>
+
+Navic's Home: mood chips, a pill that resumes any saved queue, and the newest additions.
+
+<p align="center">
+  <img src="docs/screenshots/navic-home.webp" width="240"
+       alt="Navic Home: mood chips, a Continue listening pill over 20 saved queues, Recently added and Fresh rows" />
 </p>
 
 Behind it, lb-bot's own workspace handles the per-track gap filling — which tracks are absent, which
