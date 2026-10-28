@@ -14,7 +14,10 @@ route table cannot:
   - the GET is cached, and a successful POST evicts BOTH the cached override
     map and the cached discography, while a refused POST (409) evicts neither;
   - all three are advertised, which is what clients gate the surface on;
-  - lb-bot's 400 / 404 / 409 / 502 bodies reach the client with their status.
+  - lb-bot's 400 / 404 / 409 / 502 bodies reach the client with their status;
+  - (Worbus P1) a discography whose scan is running is never served from the
+    cache, and Scan now (`POST /lb/artist/discography`) drops the cached read, so
+    a page polling the scan's counts sees them move.
 
 Exits non-zero on failure.
 """
@@ -37,6 +40,8 @@ HITS: list[tuple[str, str, dict | None]] = []   # (method, path, json body)
 NEXT_POST: list[tuple[int, dict]] = [(200, {"ok": True})]
 GET_STATUS = [200]   # what GET /api/overrides answers (an older lb-bot: 404)
 REVISION = [1]   # bumped so a cached answer and a fresh one are distinguishable
+# Worbus P1: what GET /api/artist/discography adds to `rev` (None = today's body).
+DISCO: list[dict | None] = [None]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -58,7 +63,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ndArtistId": "nd1", "mbid": "m1", "name": "X", "tagMbid": "",
                 "setAt": 1.0 + REVISION[0]}]})
         elif path == "/api/artist/discography":
-            self._send(200, {"rev": REVISION[0]})
+            body = {"rev": REVISION[0]}
+            if DISCO[0] is not None:
+                body.update(DISCO[0])
+                scan = DISCO[0].get("scan")
+                if isinstance(scan, dict) and scan.get("state") == "running":
+                    scan["done"] = scan.get("done", 0) + 1   # a scan moves on each read
+            self._send(200, body)
         else:
             self._send(404, {})
 
@@ -69,6 +80,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path in ("/api/artist/override", "/api/artist/override/remove"):
             status, out = NEXT_POST[0]
             self._send(status, out)
+        elif self.path == "/api/artist/discography":
+            self._send(200, {"ok": True, "task_id": "t-scan"})
         else:
             self._send(404, {})
 
@@ -174,6 +187,50 @@ def main() -> int:
             if json.loads(disc).get("rev") != REVISION[0]:
                 failures.append(f"{route}: discography read after the POST was stale")
 
+        # --- Worbus P1: a running scan's discography is read fresh -----------
+        # scan_running_discography_not_cached: while `scan.state` is running,
+        # every read goes upstream and the counts move; once it is done, the
+        # answer is cached as before.
+        proxy._cache.clear()
+        DISCO[0] = {"indexed": False, "unresolved": False,
+                    "scan": {"state": "running", "done": 0, "total": 9}}
+        dones = []
+        for _ in range(3):
+            HITS.clear()
+            _s, _h, disc = get("/lb/artist/discography?nd_id=nd5")
+            dones.append(json.loads(disc).get("scan", {}).get("done"))
+            if not HITS:
+                failures.append("a discography with a running scan was served from the cache")
+        if dones != sorted(set(dones)) or len(dones) != 3:
+            failures.append(f"scan counts read through the hub did not move: {dones}")
+        DISCO[0] = {"indexed": True, "unresolved": False,
+                    "scan": {"state": "done", "done": 9, "total": 9}}
+        get("/lb/artist/discography?nd_id=nd5")
+        HITS.clear()
+        get("/lb/artist/discography?nd_id=nd5")
+        if HITS:
+            failures.append("a discography whose scan is done was not cached")
+
+        # scan_post_drops_cached_discography: the read a page opened with ("never
+        # scanned") must not answer the poll right after Scan now.
+        DISCO[0] = {"indexed": False, "unresolved": False,
+                    "scan": {"state": "", "done": 0, "total": 0}}
+        proxy._cache.clear()
+        get("/lb/artist/discography?nd_id=nd6")
+        HITS.clear()
+        get("/lb/artist/discography?nd_id=nd6")
+        if HITS:
+            failures.append("setup: the unscanned discography was not cached")
+        DISCO[0] = {"indexed": False, "unresolved": False,
+                    "scan": {"state": "running", "done": 0, "total": 0}}
+        status, _h, _b = post("/lb/artist/discography", {"nd_id": "nd6"})
+        HITS.clear()
+        _s, _h, disc = get("/lb/artist/discography?nd_id=nd6")
+        if status != 200 or not HITS or json.loads(disc).get("scan", {}).get("state") != "running":
+            failures.append(f"after Scan now ({status}) the discography read was "
+                            f"{'cached' if not HITS else 'fresh'}: {disc!r}")
+        DISCO[0] = None
+
         # --- a refused POST must NOT evict (nothing changed) ----------------
         NEXT_POST[0] = (409, {"error": "busy", "code": "busy"})
         get("/lb/overrides")
@@ -273,7 +330,8 @@ def main() -> int:
             print(f"FAIL - {f}")
         return 1
     print("PASS - lb override routes: reachable/body-allowlist/GET-cached/POST-evicts"
-          "-map-and-discography/409-evicts-nothing/error-bodies-pass-through/advertised")
+          "-map-and-discography/409-evicts-nothing/error-bodies-pass-through/advertised/"
+          "scan-running-discography-not-cached/scan-post-drops-cached-discography")
     return 0
 
 

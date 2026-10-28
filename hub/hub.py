@@ -1048,8 +1048,15 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": (), "cache": False, "coalesce": False,
     },
     ("GET", "/lb/artist/discography"): {
+        # Worbus P1: the answer carries the artist's scan state with counts
+        # (`scan: {state, done, total}`, any scan, the background worker's too)
+        # and `unresolved`. A page polls it every few seconds while a scan runs,
+        # and a 60 s cached copy froze those counts and, right after Scan now,
+        # still said "no scan". So an answer whose scan is `running` is never
+        # cached (`live_while_scanning`, LbProxy._cacheable), and the POST below
+        # drops the cached read. Upstream it is one SQLite read.
         "method": "GET", "path": "/api/artist/discography",
-        "params": ("nd_id", "mbid"), "cache": True,
+        "params": ("nd_id", "mbid"), "cache": True, "live_while_scanning": True,
     },
     ("POST", "/lb/artist/discography"): {
         "method": "POST", "path": "/api/artist/discography",
@@ -1665,6 +1672,10 @@ for _sync in (("GET", "/lb/index/changes"), ("GET", "/lb/index/keys")):
 LB_ROUTES[("POST", "/lb/wishlist")]["invalidates"] = {("GET", "/lb/wishlist")}
 LB_ROUTES[("POST", "/lb/wishlist/remove")]["invalidates"] = {("GET", "/lb/wishlist")}
 LB_ROUTES[("POST", "/lb/artist/release")]["invalidates"] = {("GET", "/lb/artist/discography")}
+# Worbus P1: Scan now. The page's next read must say "scanning", not hand back
+# the cached "never scanned" it opened with (a scan writes the index only when
+# it ends, so no index push clears that copy meanwhile).
+LB_ROUTES[("POST", "/lb/artist/discography")]["invalidates"] = {("GET", "/lb/artist/discography")}
 # I-019: an override changes which MBID the discography is read under, and the
 # set starts a rescan; both the map and the cached discography are stale at once.
 for _ovr in (("POST", "/lb/artist/override"), ("POST", "/lb/artist/override/remove")):
@@ -1804,6 +1815,11 @@ class HttpProxy:
 
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         return status, data, "application/json"
+
+    def _cacheable(self, spec: dict, data: bytes) -> bool:
+        """Hook: may this 200 answer of a cached route be stored? Always, here;
+        `LbProxy` declines a discography whose scan is still running."""
+        return True
 
     def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
         """Hook for a subclass to react to a proxied call's raw outcome, on EVERY
@@ -2071,7 +2087,7 @@ class HttpProxy:
         data = self._strip(spec, status, data)
         data = self._narrow_error(spec, status, data)
         if (spec.get("cache") and gen == self._cache_gen.get(route, 0)
-                and upstream_status == 200):
+                and upstream_status == 200 and self._cacheable(spec, data)):
             self._cache_put(key, status, data, ctype,
                             spec.get("ttl", PROXY_CACHE_TTL))
         # A write that succeeded makes its own read stale: adding to the wishlist
@@ -2376,6 +2392,19 @@ class LbProxy(HttpProxy):
         notices lb-bot going away."""
         if self.enabled:
             self._set_available(True)
+
+    def _cacheable(self, spec: dict, data: bytes) -> bool:
+        """A route marked `live_while_scanning` is not cached while its answer's
+        `scan.state` is `running` (Worbus P1: Scan now's counts). The substring
+        test comes first so an ordinary discography is not parsed twice."""
+        if not spec.get("live_while_scanning") or b'"running"' not in data:
+            return True
+        try:
+            payload = json.loads(data)
+        except Exception:  # noqa: BLE001 — not JSON: cache as before
+            return True
+        scan = payload.get("scan") if isinstance(payload, dict) else None
+        return not (isinstance(scan, dict) and scan.get("state") == "running")
 
     def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
         """B-005: a proxied call that reached the hub but not lb-bot says
