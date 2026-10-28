@@ -32,6 +32,11 @@ mirror can go quietly stale:
    has a short deadline, and a first-welcome wait that expired is not paid again.
    With lb-bot unconfigured, `welcome.lb.routes` and `/lb/status` agree (both
    empty).
+7. **lb-bot's downloads mode** (Worbus P1). `welcome.lb`, the `lb` frame and
+   `/lb/status` carry `downloads` exactly when lb-bot's last 200 health answer
+   said "on" or "off"; a change of it alone is broadcast once; a health answer
+   without it (an older lb-bot) leaves the key out, and any other value is never
+   relayed. An unreachable lb-bot keeps the mode it last reported.
 
 Real hub subprocesses against a stub lb-bot, plus in-process checks of the
 verdict machinery with the upstream call stubbed. Exits non-zero on failure.
@@ -64,7 +69,7 @@ sys.path.insert(0, HUB_DIR)
 hits: dict[str, int] = {}
 queries: dict[str, list[str]] = {}
 hits_lock = threading.Lock()
-mode = {"health": 200}   # what the stub's /api/health answers
+mode = {"health": 200, "downloads": None}   # what the stub's /api/health answers
 counter = {"n": 0}
 
 
@@ -89,7 +94,10 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             time.sleep(SLOW)
         elif path == "/api/index/changes":
             time.sleep(0.3)  # long enough for concurrent callers to overlap
-        self._send(200, {"path": path, "n": n, "ok": True, "epoch": "1-abc", "headSeq": 7})
+        body = {"path": path, "n": n, "ok": True, "epoch": "1-abc", "headSeq": 7}
+        if path == "/api/health" and mode["downloads"] is not None:
+            body["downloads"] = mode["downloads"]
+        self._send(200, body)
 
     def _send(self, status: int, payload: dict) -> None:
         raw = json.dumps(payload).encode()
@@ -241,6 +249,14 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
                             f"welcome {lb.get('webUrl')!r}, /lb/status {status_web!r}")
         if s == 200 and json.loads(b).get("upstreamReachable") is not True:
             failures.append(f"/lb/status reports lb-bot unreachable: {b[:120]!r}")
+        # downloads_relayed_on_welcome_and_frame (the welcome half; the frame
+        # half is in unit_checks) and lb_status_carries_downloads.
+        if lb.get("downloads") != "off":
+            failures.append(f"welcome.lb.downloads = {lb.get('downloads')!r} with lb-bot's "
+                            "health saying \"off\"")
+        if s == 200 and json.loads(b).get("downloads") != "off":
+            failures.append(f"/lb/status downloads = {json.loads(b).get('downloads')!r}, "
+                            "expected \"off\" (Navic's LbStatusProbe reads this route)")
 
         # ----- params whitelisted; uncached; uncoalesced ------------------- #
         with hits_lock:
@@ -383,6 +399,9 @@ async def phase_restart(port: int) -> list[str]:
     if (first.get("lb") or {}).get("available") is not False:
         failures.append(f"welcome.lb.available = {(first.get('lb') or {}).get('available')!r} "
                         "with lb-bot's port refusing connections")
+    if "downloads" in (first.get("lb") or {}):
+        failures.append("a restarted hub that never reached lb-bot advertised `downloads` "
+                        f"{(first.get('lb') or {}).get('downloads')!r}")
     ws, _w = await connect(port, "r-watch")
     await drain(ws, 0.3)
     s, _b, _e = await asyncio.to_thread(request, port, "/lb/index", "POST",
@@ -422,6 +441,13 @@ async def phase_old_lbbot(port: int) -> list[str]:
     s, b, _e = request(port, "/lb/status")
     if s != 200 or json.loads(b).get("upstreamReachable") is not True:
         failures.append(f"/lb/status against an old lb-bot = {s} {b[:120]!r}")
+    # health_without_downloads_omits_the_key, live: an lb-bot that says nothing
+    # about downloads is advertised exactly as before.
+    if "downloads" in (first.get("lb") or {}):
+        failures.append(f"an old lb-bot's welcome.lb carries downloads "
+                        f"{(first.get('lb') or {}).get('downloads')!r}")
+    if s == 200 and "downloads" in json.loads(b):
+        failures.append(f"an old lb-bot's /lb/status carries downloads: {b[:120]!r}")
     return failures
 
 
@@ -446,7 +472,10 @@ async def unit_checks() -> list[str]:
 
     def upstream(method, url, payload, token, timeout, label):
         timeouts.append(timeout)
-        return answers.pop(0), b'{"ok":true}', "application/json"
+        answer = answers.pop(0)
+        if isinstance(answer, tuple):
+            return answer[0], answer[1], "application/json"
+        return answer, b'{"ok":true}', "application/json"
 
     async def settle():
         for _ in range(3):
@@ -467,6 +496,8 @@ async def unit_checks() -> list[str]:
                             f"!= welcome.lb routes {info['routes']!r}")
 
         # ----- flips broadcast exactly once; unchanged never ------------- #
+        # (The stub's health says nothing about downloads, so these frames have
+        # no `downloads` key: the exact-dict asserts below also pin that.)
         hub.LbProxy.upstream = property(lambda self: "http://lb.invalid")
         hub._proxy_upstream_blocking = upstream
         lb = hub.LbProxy()
@@ -489,6 +520,79 @@ async def unit_checks() -> list[str]:
                 failures.append(f"step {i} ({kind} {status}): lb frames {frames!r}, expected {want!r}")
         if not lb.advertised_routes():
             failures.append("an enabled proxy advertised no routes")
+
+        # ----- Worbus P1: lb-bot's downloads mode ----------------------- #
+        # downloads_flip_broadcasts_once + downloads_relayed_on_welcome_and_frame
+        # (frame half) + health_without_downloads_omits_the_key. Each step's
+        # `want` is the frame's lb-bot part, or None for "no frame".
+        def body(obj) -> bytes:
+            return json.dumps(obj).encode()
+
+        lb = hub.LbProxy()
+        steps = [
+            ((200, body({"ok": True, "downloads": "on"})), {"available": True, "downloads": "on"}),
+            ((200, body({"ok": True, "downloads": "on"})), None),
+            # The mode alone changed (lb-bot restarted with its key removed between
+            # two probes): one frame, though `available` did not move.
+            ((200, body({"ok": True, "downloads": "off"})), {"available": True, "downloads": "off"}),
+            ((200, body({"ok": True, "downloads": "off"})), None),
+            # Unreachable: says nothing about the mode, which is kept...
+            ((503, body({"error": "x"})), {"available": False, "downloads": "off"}),
+            # ...so a push that marks it alive again advertises the mode it had.
+            ("alive", {"available": True, "downloads": "off"}),
+            # An lb-bot that stopped saying (downgraded): the key goes.
+            ((200, body({"ok": True})), {"available": True}),
+            ((200, body({"ok": True})), None),
+        ]
+        for i, (step, want_part) in enumerate(steps):
+            fake.frames.clear()
+            if step == "alive":
+                lb.mark_alive()
+            else:
+                answers.append(step)
+                await lb.probe()
+            await settle()
+            frames = [f for f in fake.frames if f.get("t") == "lb"]
+            want = ([] if want_part is None else
+                    [{"t": "lb", "routes": lb.advertised_routes(),
+                      "webUrl": "http://lb.invalid", **want_part}])
+            if frames != want:
+                failures.append(f"downloads step {i}: lb frames {frames!r}, expected {want!r}")
+            info = lb.welcome_info()
+            if frames and {"t": "lb", **info} != frames[-1]:
+                failures.append(f"downloads step {i}: the frame {frames[-1]!r} is not "
+                                f"welcome.lb {info!r}")
+
+        # garbage_downloads_ignored: never relayed, never a broadcast of its own.
+        garbage = [body({"ok": True, "downloads": "ON"}), body({"ok": True, "downloads": True}),
+                   body({"ok": True, "downloads": ["on"]}), body({"ok": True, "downloads": None}),
+                   body({"ok": True, "downloads": ""}), body(["on"]), b"downloads: on",
+                   body({"ok": True, "downloads": "on", "pad": "x" * getattr(hub, "LB_HEALTH_PARSE_MAX", 65536)})]
+        lb = hub.LbProxy()
+        answers.append(200)
+        await lb.probe()
+        await settle()
+        for raw in garbage:
+            fake.frames.clear()
+            answers.append((200, raw))
+            await lb.probe()
+            await settle()
+            info = lb.welcome_info()
+            if "downloads" in info or any(f.get("t") == "lb" for f in fake.frames):
+                failures.append(f"garbage downloads {raw[:60]!r} was relayed: welcome.lb "
+                                f"{info.get('downloads')!r}, {len(fake.frames)} frame(s)")
+        # From a reported "off", a garbage answer reads as "not reported": the key
+        # goes (once), it does not stick at the last valid value nor take the bad one.
+        answers.append((200, body({"downloads": "off"})))
+        await lb.probe()
+        await settle()
+        fake.frames.clear()
+        answers.append((200, body({"downloads": "maybe"})))
+        await lb.probe()
+        await settle()
+        if [f.get("downloads", "absent") for f in fake.frames if f.get("t") == "lb"] != ["absent"]:
+            failures.append("off -> garbage should broadcast one frame without downloads, got "
+                            f"{[f.get('downloads', 'absent') for f in fake.frames]!r}")
 
         # ----- the probe's own health call is short; the fallback is not -- #
         timeouts.clear()
@@ -586,12 +690,14 @@ async def run() -> list[str]:
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     port = _free_port()
     try:
+        mode["downloads"] = "off"
         proc = spawn(port, state, lb_url)
         try:
             await asyncio.sleep(1.5)
             failures += await phase_live(port, state, lb_url)
         finally:
             stop(proc)
+            mode["downloads"] = None
 
         proc = spawn(port, state, dead_url)
         try:
@@ -632,7 +738,9 @@ def main() -> int:
           "welcome-lb-and-lbIndex/lbIndex-survives-restart/inbound-marks-available/"
           "health-probe-falls-back-on-404/lb-frame-on-each-flip-only/short-probe-deadline/"
           "expired-welcome-wait-not-repeated/unconfigured-routes-agree/"
-          "push-leaves-unrelated-slow-reads-cacheable")
+          "push-leaves-unrelated-slow-reads-cacheable/"
+          "downloads-relayed-on-welcome-frame-and-status/downloads-flip-broadcasts-once/"
+          "health-without-downloads-omits-the-key/garbage-downloads-ignored")
     return 0
 
 

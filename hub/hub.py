@@ -2197,6 +2197,33 @@ class SonicProxy(HttpProxy):
         return 200, json.dumps(stats).encode(), "application/json"
 
 
+# Worbus P1: lb-bot's downloads mode, as its `/api/health` reports it. "on" iff
+# lb-bot has an slskd API key; fixed for lb-bot's process life. Read only from a
+# 200 body no larger than this (the probe's `/api/summary` fallback on an older
+# lb-bot can be megabytes and never carries the field; it is not parsed on the
+# event loop for nothing).
+LB_DOWNLOADS_VALUES = ("on", "off")
+LB_HEALTH_PARSE_MAX = 64 * 1024
+_LB_KEEP = object()   # `_set_available`'s "leave `downloads` as it is"
+
+
+def _lb_downloads_of(data: bytes) -> Optional[str]:
+    """`"on"`/`"off"` from a health body, or None: absent, not a string, any
+    other value, not JSON, not an object, or too large. None means "this lb-bot
+    did not say", which is what an older lb-bot says, and clients read the key's
+    absence as "on"."""
+    if not data or len(data) > LB_HEALTH_PARSE_MAX:
+        return None
+    try:
+        payload = json.loads(data)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("downloads")
+    return value if isinstance(value, str) and value in LB_DOWNLOADS_VALUES else None
+
+
 class LbProxy(HttpProxy):
     """lb-bot library-gap intelligence (design: ../DESIGN-lbbot-client-integration.md)."""
 
@@ -2211,6 +2238,12 @@ class LbProxy(HttpProxy):
         # lb-bot, and to True by any authenticated inbound push — lb-bot talking
         # to us is proof enough. Only ever through `_set_available`.
         self.available = False
+        # lb-bot's downloads mode from the last 200 health answer, or None when
+        # that answer did not carry a valid one (an older lb-bot). Kept while
+        # lb-bot is unreachable: the mode is fixed for lb-bot's process, and an
+        # inbound push that marks it alive again after a restart must not
+        # advertise "on" (absent) to clients until the next probe.
+        self.downloads: Optional[str] = None
         self._probed = asyncio.Event()
         self._announcing: set[asyncio.Task] = set()
 
@@ -2266,9 +2299,14 @@ class LbProxy(HttpProxy):
     def welcome_info(self) -> dict:
         """`welcome.lb` and the `lb` frame: the probe's answer, without a client
         having to ask for it."""
-        return {"available": bool(self.enabled and self.available),
+        info = {"available": bool(self.enabled and self.available),
                 "routes": self.advertised_routes(),
                 "webUrl": self.web_url()}
+        # Worbus P1: present only when lb-bot's health reported it. Absent is an
+        # older lb-bot or hub, and every client reads that as "on".
+        if self.enabled and self.downloads is not None:
+            info["downloads"] = self.downloads
+        return info
 
     def web_url(self) -> str:
         """lb-bot's web UI for a person to open, or "" while the proxy is off.
@@ -2281,32 +2319,56 @@ class LbProxy(HttpProxy):
         url = LBBOT_WEB_URL or self.upstream
         return url if url.startswith(("http://", "https://")) else ""
 
-    def _set_available(self, value: bool) -> None:
-        """The one way the verdict moves. A CHANGE is broadcast as `t: "lb"`
-        (ruling R18): `welcome.lb` is a connect-time snapshot, and a client that
-        trusts it and stops probing would otherwise never hear lb-bot come up or
-        go away while it stays connected. An unchanged verdict sends nothing —
-        the probe runs every 60 s and most of its answers are "same as before".
+    def _set_available(self, value: bool, downloads: Any = _LB_KEEP) -> None:
+        """The one way the verdict moves, and the one broadcaster of `t: "lb"`.
+        A CHANGE of `welcome_info()` is broadcast (ruling R18): `welcome.lb` is a
+        connect-time snapshot, and a client that trusts it and stops probing
+        would otherwise never hear lb-bot come up or go away, or (Worbus P1) its
+        downloads mode appear or change, while it stays connected. An unchanged
+        object sends nothing: the probe runs every 60 s and most of its answers
+        are "same as before".
+
+        `downloads` is "on", "off" or None (the health answer had no valid
+        value); left out, it keeps what it was, which is what every caller does
+        that did not read a 200 health body.
 
         Scheduled rather than awaited because `augment` and the inbound handlers
         call this synchronously; the frame is built NOW, so two quick flips
         still reach clients in the order they happened.
         """
         value = bool(value)
-        if value == self.available:
-            return
+        before = self.welcome_info()
+        was, old_downloads = self.available, self.downloads
         self.available = value
-        log(f"lbbot {'available' if value else 'UNAVAILABLE'} (hub verdict changed)")
+        if downloads is not _LB_KEEP:
+            self.downloads = downloads
+        after = self.welcome_info()
+        if after == before:
+            return
+        if value != was:
+            log(f"lbbot {'available' if value else 'UNAVAILABLE'} (hub verdict changed)")
+        if self.downloads != old_downloads:
+            log(f"lbbot downloads: {old_downloads or 'not reported'} -> "
+                f"{self.downloads or 'not reported'}")
         hub = HUB_INSTANCE
         if hub is None:
             return
-        frame = {"t": "lb", **self.welcome_info()}
+        frame = {"t": "lb", **after}
         try:
             task = asyncio.get_running_loop().create_task(hub._broadcast(frame))  # noqa: SLF001
         except RuntimeError:  # no loop (an import-time caller): nobody to tell
             return
         self._announcing.add(task)
         task.add_done_callback(self._announcing.discard)
+
+    def _note_health(self, status: int, data: bytes) -> None:
+        """A health answer (the probe's own, or a client's `/lb/status` read that
+        went upstream): a 200 is lb-bot up and states its downloads mode; any
+        other status is lb-bot unreachable and says nothing about the mode."""
+        if status == 200:
+            self._set_available(True, _lb_downloads_of(data))
+        else:
+            self._set_available(False)
 
     def mark_alive(self) -> None:
         """An authenticated inbound push from lb-bot: it is up, whatever the last
@@ -2355,15 +2417,19 @@ class LbProxy(HttpProxy):
         """`/lb/status` is the liveness probe, and only the reachability verdict is
         passed on — neither `/api/health`'s body nor (on an older lb-bot) the
         summary's, a large object about the Fill-gaps workspace no client renders.
-        `routes` is `advertised_routes()`.
+        `routes` is `advertised_routes()`. Worbus P1: plus `downloads`, exactly
+        as `welcome.lb` carries it (present only when lb-bot's health said).
         """
-        self._set_available(status == 200)
-        return 200, json.dumps({
+        self._note_health(status, data)
+        answer = {
             "configured": True,
             "upstreamReachable": status == 200,
             "routes": self.advertised_routes(),
             "webUrl": self.web_url(),
-        }).encode(), "application/json"
+        }
+        if self.downloads is not None:
+            answer["downloads"] = self.downloads
+        return 200, json.dumps(answer).encode(), "application/json"
 
     async def probe(self) -> bool:
         """The hub's own liveness check: the `/lb/status` upstream and its 404
@@ -2376,9 +2442,9 @@ class LbProxy(HttpProxy):
             return False
         spec = self.routes[("GET", "/lb/status")]
         try:
-            status, _data, _ctype = await self._fetch(spec, spec["path"], [], None,
-                                                      timeout=LB_PROBE_TIMEOUT)
-            self._set_available(status == 200)
+            status, data, _ctype = await self._fetch(spec, spec["path"], [], None,
+                                                     timeout=LB_PROBE_TIMEOUT)
+            self._note_health(status, data)
         except Exception as e:  # noqa: BLE001 — a probe must never kill its loop
             log("lbbot probe failed:", e)
             self._set_available(False)

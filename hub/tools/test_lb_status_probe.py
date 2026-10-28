@@ -204,9 +204,46 @@ async def run_failure_propagation() -> list[str]:
     return failures
 
 
+async def run_downloads() -> list[str]:
+    """Worbus P1, `lb_status_carries_downloads`: Navic's LbStatusProbe reads
+    `/lb/status`, so it carries lb-bot's downloads mode exactly as `welcome.lb`
+    does: present only when the health answer said "on"/"off"."""
+    failures: list[str] = []
+    probe = ("GET", "/lb/status")
+    spec = hub.LB_ROUTES[probe]
+    original = hub._proxy_upstream_blocking
+    original_upstream = type(hub.LB).upstream
+    type(hub.LB).upstream = property(lambda self: "http://lb.invalid")
+    try:
+        for health, want in (({"ok": True, "downloads": "off"}, "off"),
+                             ({"ok": True, "downloads": "on"}, "on"),
+                             ({"ok": True}, None),
+                             ({"ok": True, "downloads": "sometimes"}, None)):
+            hub.LB._cache.clear()
+            raw = json.dumps(health).encode()
+            hub._proxy_upstream_blocking = lambda *a, raw=raw, **k: (200, raw, "application/json")
+            s, b, _c = await hub.LB.call(probe, spec, [], None)
+            got = json.loads(b)
+            if want is None and "downloads" in got:
+                failures.append(f"/lb/status for health {health!r} carries downloads "
+                                f"{got['downloads']!r}; expected the key absent")
+            elif want is not None and got.get("downloads") != want:
+                failures.append(f"/lb/status for health {health!r}: downloads "
+                                f"{got.get('downloads')!r}, expected {want!r}")
+            if got.get("downloads") != hub.LB.welcome_info().get("downloads"):
+                failures.append(f"/lb/status and welcome.lb disagree on downloads for {health!r}")
+    finally:
+        hub._proxy_upstream_blocking = original
+        type(hub.LB).upstream = original_upstream
+        hub.LB._cache.clear()
+        hub.LB.downloads = None
+    return failures
+
+
 def main() -> int:
     failures = asyncio.run(run())
     failures += asyncio.run(run_failure_propagation())
+    failures += asyncio.run(run_downloads())
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -214,7 +251,7 @@ def main() -> int:
     print("PASS - lb status probe: failure-not-cached/success-cached/refused-is-502-down/"
           "timeout-is-504-busy/write-invalidates-its-read/"
           "other-route-down-flips-verdict/other-route-busy-only-drops-status-cache/"
-          "tooLarge-is-not-a-failure")
+          "tooLarge-is-not-a-failure/lb-status-carries-downloads")
     return 0
 
 
