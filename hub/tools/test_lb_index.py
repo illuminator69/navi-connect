@@ -37,6 +37,12 @@ mirror can go quietly stale:
    said "on" or "off"; a change of it alone is broadcast once; a health answer
    without it (an older lb-bot) leaves the key out, and any other value is never
    relayed. An unreachable lb-bot keeps the mode it last reported.
+8. **lb-bot's index-build progress** (Worbus P1). A push's `progress`
+   (`{unindexed, total, current}`) is kept in the hint, so it reaches
+   `welcome.lbIndex`, the `index` frame and state.json (and survives a restart);
+   a push that only moves `progress` is still stored and broadcast. A malformed
+   `progress` is dropped and the push accepted; a push without one is exactly
+   what it was before (and leaves the hint without one).
 
 Real hub subprocesses against a stub lb-bot, plus in-process checks of the
 verdict machinery with the upstream call stubbed. Exits non-zero on failure.
@@ -206,6 +212,16 @@ def static_checks() -> list[str]:
         failures.append(f"PROXY_SYNC_INFLIGHT = {getattr(hub, 'PROXY_SYNC_INFLIGHT', None)!r}, expected 1")
     if hub.LB_ROUTES[("GET", "/lb/status")].get("path") != "/api/health":
         failures.append("/lb/status still probes /api/summary rather than /api/health")
+    # A hand-edited state.json goes through the same validation as a push.
+    for stored, want in (
+            ({"seq": 1, "epoch": "e", "progress": {"unindexed": 2, "total": 3, "current": "x"}},
+             {"seq": 1, "epoch": "e", "progress": {"unindexed": 2, "total": 3, "current": "x"}}),
+            ({"seq": 1, "epoch": "e", "progress": {"unindexed": "2", "total": 3}},
+             {"seq": 1, "epoch": "e"}),
+            ({"seq": 1, "epoch": "e", "progress": None}, {"seq": 1, "epoch": "e"})):
+        if hub._lb_index_hint(stored) != want:
+            failures.append(f"state.json's lbIndex {stored!r} loads as "
+                            f"{hub._lb_index_hint(stored)!r}, expected {want!r}")
     return failures
 
 
@@ -385,6 +401,68 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
             persisted = json.load(f).get("lbIndex")
         if persisted != {"seq": 42, "epoch": "1-deadbeef"}:
             failures.append(f"the first push was not persisted at once: {persisted!r}")
+
+        # ----- Worbus P1: index-build progress ----------------------------- #
+        # (The push above, with no `progress`, is `push_without_progress_unchanged`:
+        # its frame, welcome and state.json copies are exactly {seq, epoch}.)
+        async def push_and_frames(body_in: dict) -> tuple[int, list[dict]]:
+            w, _f = await connect(port, "progress-watch")
+            await drain(w, 0.3)
+            st, _bb, _ee = await bg(port, "/lb/index", "POST", body_in)
+            got = await drain(w, 0.6)
+            await w.close()
+            return st, [f for f in got if f.get("t") == "index"]
+
+        # progress_kept_in_hint_welcome_and_frame: the head did not move, only
+        # the progress did; unknown keys go and `current` is cut at 200.
+        long_name = "A" + "b" * 300
+        st, idx = await push_and_frames({"seq": 42, "epoch": "1-deadbeef",
+                                         "progress": {"unindexed": 12, "total": 40,
+                                                      "current": long_name, "path": "/m"}})
+        want_prog = {"unindexed": 12, "total": 40, "current": long_name[:200]}
+        if st != 200 or idx != [{"t": "index", "seq": 42, "epoch": "1-deadbeef",
+                                 "progress": want_prog}]:
+            failures.append(f"a progress-only push answered {st} with index frames {idx!r}, "
+                            f"expected one carrying {want_prog!r}")
+        got = (await welcome_of(port, "w-prog")).get("lbIndex")
+        if got != {"seq": 42, "epoch": "1-deadbeef", "progress": want_prog}:
+            failures.append(f"welcome.lbIndex after a progress push = {got!r}")
+
+        # malformed_progress_dropped_push_accepted: each is a 200, the head is
+        # taken, and the hint (welcome, frame) carries no progress.
+        malformed = [("a string", "12 of 40"), ("a list", [12, 40]),
+                     ("negative unindexed", {"unindexed": -1, "total": 40, "current": ""}),
+                     ("bool unindexed", {"unindexed": True, "total": 40, "current": ""}),
+                     ("string total", {"unindexed": 1, "total": "40", "current": ""}),
+                     ("float total", {"unindexed": 1, "total": 40.0, "current": ""}),
+                     ("missing total", {"unindexed": 1, "current": "x"}),
+                     ("numeric current", {"unindexed": 1, "total": 40, "current": 7}),
+                     ("a count past int32", {"unindexed": 2**31, "total": 2**31, "current": ""})]
+        for i, (what, prog) in enumerate(malformed):
+            st, idx = await push_and_frames({"seq": 50 + i, "epoch": "1-deadbeef",
+                                             "progress": prog})
+            if st != 200 or idx != [{"t": "index", "seq": 50 + i, "epoch": "1-deadbeef"}]:
+                failures.append(f"a push with {what} progress answered {st}, frames {idx!r}; "
+                                "expected 200 and a frame without progress")
+        got = (await welcome_of(port, "w-bad")).get("lbIndex")
+        if got != {"seq": 50 + len(malformed) - 1, "epoch": "1-deadbeef"}:
+            failures.append(f"welcome.lbIndex after malformed progress = {got!r}")
+
+        # A missing or null `current` is "", not malformed.
+        st, idx = await push_and_frames({"seq": 60, "epoch": "1-deadbeef",
+                                         "progress": {"unindexed": 0, "total": 40,
+                                                      "current": None}})
+        if idx != [{"t": "index", "seq": 60, "epoch": "1-deadbeef",
+                    "progress": {"unindexed": 0, "total": 40, "current": ""}}]:
+            failures.append(f"a null `current` was not read as \"\": {idx!r}")
+
+        # The state the restart phase reads back (progress_survives_restart_from_state).
+        # Same epoch, so this one is saved by the throttle or the graceful stop.
+        st, _idx = await push_and_frames({"seq": 42, "epoch": "1-deadbeef",
+                                          "progress": {"unindexed": 3, "total": 40,
+                                                       "current": "Zed"}})
+        if st != 200:
+            failures.append(f"the last progress push answered {st}")
     finally:
         pool.shutdown(wait=False)
     return failures
@@ -394,8 +472,11 @@ async def phase_restart(port: int) -> list[str]:
     """lbIndex survives a restart; lb-bot down, then an inbound push revives it."""
     failures: list[str] = []
     first = await welcome_of(port, "r1")
-    if first.get("lbIndex") != {"seq": 42, "epoch": "1-deadbeef"}:
-        failures.append(f"lbIndex did not survive a hub restart: {first.get('lbIndex')!r}")
+    # progress_survives_restart_from_state: the last push before the restart had it.
+    if first.get("lbIndex") != {"seq": 42, "epoch": "1-deadbeef",
+                                "progress": {"unindexed": 3, "total": 40, "current": "Zed"}}:
+        failures.append(f"lbIndex (with progress) did not survive a hub restart: "
+                        f"{first.get('lbIndex')!r}")
     if (first.get("lb") or {}).get("available") is not False:
         failures.append(f"welcome.lb.available = {(first.get('lb') or {}).get('available')!r} "
                         "with lb-bot's port refusing connections")
@@ -421,6 +502,8 @@ async def phase_restart(port: int) -> list[str]:
     second = await welcome_of(port, "r2")
     if (second.get("lb") or {}).get("available") is not True:
         failures.append("an authenticated inbound push did not mark lb-bot available")
+    # Pushes without `progress` (an older lb-bot, or a build that ended) leave
+    # the hint without one: the bar goes rather than sticking at its last count.
     if second.get("lbIndex") != {"seq": 44, "epoch": "1-deadbeef"}:
         failures.append(f"welcome.lbIndex after the second push = {second.get('lbIndex')!r}")
     return failures
@@ -740,7 +823,9 @@ def main() -> int:
           "expired-welcome-wait-not-repeated/unconfigured-routes-agree/"
           "push-leaves-unrelated-slow-reads-cacheable/"
           "downloads-relayed-on-welcome-frame-and-status/downloads-flip-broadcasts-once/"
-          "health-without-downloads-omits-the-key/garbage-downloads-ignored")
+          "health-without-downloads-omits-the-key/garbage-downloads-ignored/"
+          "progress-kept-in-hint-welcome-and-frame/malformed-progress-dropped-push-accepted/"
+          "push-without-progress-unchanged/progress-survives-restart-from-state")
     return 0
 
 

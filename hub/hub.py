@@ -5424,6 +5424,13 @@ LB_INDEX_PATH = "/lb/index"
 LB_INDEX_INVALIDATES = frozenset({("GET", "/lb/artist/discography"),
                                   ("GET", "/lb/overrides")})
 _LB_INDEX_EPOCH_MAX = 64
+# Worbus P1: the optional `progress` an index push carries, lb-bot's first-run
+# index build ({unindexed, total, current}). `current` is an artist's name, cut
+# like every other relayed string; the counts must fit a 32-bit int, because
+# that is what a client parses them into (a value past it would fail the whole
+# `welcome` there, not just the bar).
+_LB_PROGRESS_CURRENT_MAX = 200
+_LB_PROGRESS_COUNT_MAX = 2**31 - 1
 _LB_NOTIFY_STR_MAX = 200
 _LB_NOTIFY_IDS_MAX = 16
 _LB_NOTIFY_RENAME = {"release_mbid": "releaseMbid", "nd_artist_id": "ndArtistId"}
@@ -5520,9 +5527,40 @@ def _lb_fill_frame(payload: dict) -> Optional[dict]:
     return frame
 
 
+def _lb_index_progress(raw: Any) -> Optional[dict]:
+    """`{unindexed, total, current}` or None. `unindexed` and `total` are ints
+    from 0 to `_LB_PROGRESS_COUNT_MAX` (not a bool); `current` is a str cut at
+    `_LB_PROGRESS_CURRENT_MAX` characters, and a missing or null one reads as
+    "". Anything else, or a field missing, makes the whole progress malformed:
+    None, so the hint carries none. Unknown keys are dropped."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for key in ("unindexed", "total"):
+        value = raw.get(key)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or not 0 <= value <= _LB_PROGRESS_COUNT_MAX):
+            return None
+        out[key] = value
+    current = raw.get("current")
+    if current is None:
+        current = ""
+    if not isinstance(current, str):
+        return None
+    out["current"] = current[:_LB_PROGRESS_CURRENT_MAX]
+    return out
+
+
 def _lb_index_hint(raw: Any) -> Optional[dict]:
-    """`{seq, epoch}` or None. Used on the inbound body AND on state.json's copy,
-    so a hand-edited or older file cannot put a malformed hint into `welcome`."""
+    """`{seq, epoch, progress?}` or None. Used on the inbound body AND on
+    state.json's copy, so a hand-edited or older file cannot put a malformed hint
+    into `welcome`.
+
+    `progress` (Worbus P1) is kept only when it is well formed
+    (`_lb_index_progress`); a malformed one is dropped and the rest of the hint
+    stands, never a 400, because the head it rides with is still true. The hint
+    is what the LAST push said: a push without `progress` leaves none, which is
+    how lb-bot ends the bar (and what an older lb-bot always sends)."""
     if not isinstance(raw, dict):
         return None
     seq, epoch = raw.get("seq"), raw.get("epoch")
@@ -5530,7 +5568,11 @@ def _lb_index_hint(raw: Any) -> Optional[dict]:
         return None
     if not isinstance(epoch, str) or not epoch or len(epoch) > _LB_INDEX_EPOCH_MAX:
         return None
-    return {"seq": seq, "epoch": epoch}
+    hint: dict = {"seq": seq, "epoch": epoch}
+    progress = _lb_index_progress(raw.get("progress"))
+    if progress is not None:
+        hint["progress"] = progress
+    return hint
 
 
 async def _handle_lb_index(protocol: Any, raw_path: str, headers: Any,
@@ -5538,7 +5580,10 @@ async def _handle_lb_index(protocol: Any, raw_path: str, headers: Any,
     """lb-bot's index head moved: remember it and tell every client to pull.
 
     The frame carries no rows — a client pulls `/lb/index/changes` from its own
-    cursor, so a push it missed costs nothing but latency. Deliberately does NOT
+    cursor, so a push it missed costs nothing but latency. It does carry the
+    build's `progress` when the push did (Worbus P1), and a push that only moved
+    `progress`, with the head unchanged, is stored and broadcast like any other:
+    that is how the Home bar moves between head changes. Deliberately does NOT
     touch `LB_LIBRARY_ROUTES`: the one cache it drops is the discography read,
     which is the clients' fallback path when they have no mirror.
     """
