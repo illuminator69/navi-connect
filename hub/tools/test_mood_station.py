@@ -5,8 +5,8 @@ through a real hub subprocess and its HTTP proxy path, against test_station_engi
 fake AudioMuse and Navidrome with its fake CLAP switched on.
 
 The library gains cluster M: 1,200 tracks by 400 artists (three each), far from
-everything, so nothing reaches them as a neighbour. The moods' lists (each mood's
-first prompt; the other three answer nothing, so a merged list is that prompt's):
+everything, so nothing reaches them as a neighbour. The moods' lists (all four
+prompts of a mood answer the same list, so the merged list is that list):
 
   relax    M0-M9, then L00_1..L04_1 (five of the seed's neighbours), then M10-M1199
   upbeat   L01_2..L39_2 (39 of the seed's neighbours), then M200-M1199
@@ -80,8 +80,12 @@ def first_prompt(mood_id):
 
 def setup_clap():
     AM["clap_on"] = True
-    AM["clap"] = {first_prompt("relax"): RELAX, first_prompt("upbeat"): UPBEAT,
-                  first_prompt("focus"): FOCUS, first_prompt("pump-up"): PUMP}
+    # All four of a mood's prompts answer the same list: a search that answers no rows
+    # is a failed search (2026-10-24), so "the other three answer nothing" would leave
+    # the mood unbuilt. Four equal lists merge to the list itself.
+    AM["clap"] = {p: ids for mood_id, ids in (("relax", RELAX), ("upbeat", UPBEAT),
+                                              ("focus", FOCUS), ("pump-up", PUMP))
+                  for p in hubmod.MOOD_BY_ID[mood_id]["prompts"]}
     AM["clap_fail"] = {first_prompt("downbeat")}
 
 

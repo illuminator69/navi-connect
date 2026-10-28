@@ -14,10 +14,14 @@ Serves a stub lb-bot and drives the real `LbProxy.handle`, proving:
     for 20 s, and two concurrent reads cost one upstream call;
   - both ride the fast pool: with every default slot held by a slow
     `album/sources` search, they still answer at once;
+  - a non-200 answer reaches the client as `{error, code}` only, `error` cut at 200
+    characters; a non-JSON or list body becomes `{"error": "lb-bot answered <status>"}`;
+    the 404 with no `code` is untouched;
   - an lb-bot older than the routes (bare 404) reaches the client as that same
     bare 404, no `code` added, and is not cached; a refused upstream is 502 `down`;
   - a terminal fill push and `/lb/notify` drop both cached answers; a progress
-    push does not;
+    push does not; a fill that starts (`searching`) does too, seen as a second read
+    reaching lb-bot;
   - both are advertised, and the route table still has no `/api/downloads` and
     no write route onto the placements or transfers.
 
@@ -44,12 +48,38 @@ HITS: list[tuple[str, str, dict]] = []
 HITS_LOCK = threading.Lock()
 STATUS = [200]      # what /api/attention and /api/activity answer
 BODY_404 = [b'{"error": "not found"}']
+ERR_BODY = [None]       # the raw body a non-200, non-404 answer carries, when set
 SLOW_SOURCES = [0.0]
 SLOW_READ = [0.0]
 
 # Never anywhere in either answer. A folder's `coverUrl` (lb-bot's own cover route)
 # is checked on the folders alone: an album row's Cover Art Archive URL is allowed.
 FORBIDDEN = {"name", "path", "identifyError", "filename", "title"}
+
+# The shapes lb-bot's producers write (`_attention_view`, `_activity_view` in
+# listenbrainz_bot.py; PROTOCOL §15.6), as field -> type, for the fixtures below. A
+# fixture with another shape tests a view lb-bot never sends: it had `formats` as a
+# list and `confidence` as a number (live 2026-10-22: a string, and a word).
+CONFIDENCE_WORDS = ("unknown", "likely", "possible")
+ATTENTION_TYPES = {
+    "counts": {"failedGaps": int, "failedRequests": int, "folders": int,
+               "foldersUnidentified": int, "picks": int},
+    "albums": {"kind": str, "key": str, "groupId": str, "releaseMbid": str, "rgid": str,
+               "albumId": str, "artist": str, "album": str, "coverUrl": str, "state": str,
+               "missingCount": int, "total": int, "updatedAt": float},
+    "folders": {"id": str, "fileCount": int, "formats": str, "matchLabel": str,
+                "confidence": str, "canConfirm": bool, "groupId": str, "releaseMbid": str,
+                "identified": bool},
+    "truncated": {"albums": int, "folders": int},
+}
+ACTIVITY_TYPES = {
+    "requests": {"releaseMbid": str, "rgid": str, "groupId": str, "albumId": str,
+                 "artist": str, "album": str, "state": str, "percent": int, "done": int,
+                 "total": int, "failureKind": str, "reason": str, "retryable": bool,
+                 "gapFill": bool, "updatedAt": float},
+    "transfers": {"id": str, "kind": str, "album": str, "artist": str, "groupId": str,
+                  "state": str, "pct": int, "peer": str},
+}
 
 ATTENTION = {
     "version": 1, "serverTime": 1761000000.0,
@@ -60,8 +90,8 @@ ATTENTION = {
                 "coverUrl": "https://coverartarchive.org/x.jpg", "state": "failed",
                 "missingCount": 3, "total": 11, "updatedAt": 1761000000.0}],
     # an lb-bot that got its allowlist wrong: the hub must still drop these
-    "folders": [{"id": "abcdef012345", "fileCount": 11, "formats": ["flac"],
-                 "matchLabel": "", "confidence": 0, "canConfirm": False,
+    "folders": [{"id": "abcdef012345", "fileCount": 11, "formats": "FLAC",
+                 "matchLabel": "", "confidence": "unknown", "canConfirm": False,
                  "groupId": "", "releaseMbid": "", "identified": False,
                  "name": "Some.Folder-2001", "path": "/downloads/Some.Folder-2001",
                  "identifyError": "no match in /downloads/x", "coverUrl": "/api/x"}],
@@ -100,7 +130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if STATUS[0] == 404:
                 self._send(404, BODY_404[0])
             elif STATUS[0] != 200:
-                self._send(STATUS[0], b'{"error": "x"}')
+                self._send(STATUS[0], ERR_BODY[0] or b'{"error": "x"}')
             else:
                 body = ATTENTION if path == "/api/attention" else ACTIVITY
                 self._send(200, json.dumps(body).encode())
@@ -144,6 +174,29 @@ def walk_keys(node, out: set[str]) -> set[str]:
     return out
 
 
+def shape_problems(name: str, body: dict, types: dict) -> list[str]:
+    """Every documented key present, with the documented type (a bool is not an int)."""
+    out = []
+    for key, fields in types.items():
+        node = body.get(key)
+        rows = [node] if isinstance(node, dict) else node
+        if not isinstance(rows, list):
+            out.append(f"{name}.{key} is {type(node).__name__}")
+            continue
+        for row in rows:
+            for field, want in fields.items():
+                if field not in row:
+                    out.append(f"{name}.{key}.{field} is missing")
+                elif type(row[field]) is not want:
+                    out.append(f"{name}.{key}.{field} is {type(row[field]).__name__}, "
+                               f"lb-bot sends {want.__name__}")
+    for f in body.get("folders") or []:
+        if f.get("confidence") not in CONFIDENCE_WORDS:
+            out.append(f"{name}.folders.confidence {f.get('confidence')!r} is not a word of "
+                       f"{CONFIDENCE_WORDS}")
+    return out
+
+
 def hits(path: str) -> int:
     with HITS_LOCK:
         return sum(1 for h in HITS if h[1] == path)
@@ -158,6 +211,10 @@ def main() -> int:
     hub.LBBOT_URL = f"http://127.0.0.1:{port}"
     auth = {"Authorization": f"Bearer {hub.TOKEN}"}
     failures: list[str] = []
+
+    # fixture_shapes_match_the_documented_types
+    failures += shape_problems("ATTENTION", ATTENTION, ATTENTION_TYPES)
+    failures += shape_problems("ACTIVITY", ACTIVITY, ACTIVITY_TYPES)
 
     try:
         proxy = hub.LbProxy()
@@ -199,7 +256,8 @@ def main() -> int:
                     failures.append(f"{route} answer still contains {secret!r}")
             if route == "/lb/attention":
                 f = (data.get("folders") or [{}])[0]
-                if f.get("fileCount") != 11 or f.get("id") != "abcdef012345":
+                if f.get("fileCount") != 11 or f.get("id") != "abcdef012345" \
+                        or f.get("formats") != "FLAC" or f.get("confidence") != "unknown":
                     failures.append(f"attention folder lost an allowed field: {f}")
                 if data.get("counts", {}).get("folders") != 16:
                     failures.append(f"attention counts did not survive: {data.get('counts')}")
@@ -267,6 +325,57 @@ def main() -> int:
                 STATUS[0] = 200
             if status != 503:
                 failures.append(f"{route}: an lb-bot 503 should pass through, got {status}")
+
+        # --- error bodies are narrowed to {error, code} (H5) ------------------------
+        # lb-bot's 500 body is str(e): it can carry a path, a trace or a token. Only
+        # `error` (cut at 200 characters) and `code` leave the hub; a 404 with no
+        # `code` stays exactly what it was, because the clients' "older lb-bot" rule
+        # is a 404 with no code.
+        leaky = json.dumps({"error": "x", "trace": "/config/lb_bot_state.json line 4",
+                            "token": "t0ken", "chat_id": 42}).encode()
+        for route in ("/lb/attention", "/lb/activity"):
+            cases = (
+                ("a_500_body_is_narrowed", 500, leaky, {"error": "x"}),
+                ("a_code_survives", 409, json.dumps({"error": "x", "code": "busy", "trace": "t"})
+                 .encode(), {"error": "x", "code": "busy"}),
+                ("a_long_error_is_cut", 500, json.dumps({"error": "e" * 5000}).encode(),
+                 {"error": "e" * 200}),
+                ("a_non_json_body", 502, b"<html>/config/secret.py</html>",
+                 {"error": "lb-bot answered 502"}),
+                ("a_list_body", 500, b'["/config/x"]', {"error": "lb-bot answered 500"}),
+                ("an_object_with_no_error", 500, b'{"trace": "/config/x"}',
+                 {"error": "lb-bot answered 500"}),
+                ("a_non_string_error", 500, b'{"error": {"path": "/config/x"}}',
+                 {"error": "lb-bot answered 500"}),
+            )
+            for name, code, raw, want in cases:
+                ERR_BODY[0] = raw
+                STATUS[0] = code
+                try:
+                    proxy._cache.clear()
+                    status, _h, body = get(route)
+                finally:
+                    STATUS[0] = 200
+                    ERR_BODY[0] = None
+                try:
+                    got = json.loads(body)
+                except Exception:  # noqa: BLE001
+                    got = body
+                if status != code or got != want:
+                    failures.append(f"{route} {name}: {status} {body!r}, expected {code} {want}")
+            # a_404_without_code_still_reads_older: the same bytes, no code added.
+            for raw in (b'{"error": "not found"}', b'{"error":"not found"}'):
+                BODY_404[0] = raw
+                STATUS[0] = 404
+                try:
+                    proxy._cache.clear()
+                    status, _h, body = get(route)
+                finally:
+                    STATUS[0] = 200
+                    BODY_404[0] = b'{"error": "not found"}'
+                if status != 404 or body != raw:
+                    failures.append(f"{route} a_404_without_code_still_reads_older: "
+                                    f"{status} {body!r} for {raw!r}")
 
         # --- fast pool in practice: every default slot held by a slow search ------
         async def held():
@@ -337,6 +446,30 @@ def main() -> int:
         if hub.LB._cache:
             failures.append("/lb/notify should drop both cached answers")
 
+        # --- a fill that STARTS drops both answers; its progress does not (H3) -------
+        # Real reads through the proxy under test, so "dropped" is seen as a second
+        # request reaching the stub, not as an emptied cache.
+        saved_lb = hub.LB
+        hub.LB = proxy
+        try:
+            for state, extra, want in (("searching", {}, 2),
+                                       ("downloading", {"percent": 40}, 1)):
+                proxy._cache.clear()
+                HITS.clear()
+                get("/lb/attention")
+                get("/lb/activity")
+                asyncio.run(push("/lb/fill", {"kind": "album", "key": "r1", "state": state,
+                                              **extra}))
+                get("/lb/attention")
+                get("/lb/activity")
+                for upstream in ("/api/attention", "/api/activity"):
+                    if hits(upstream) != want:
+                        failures.append(
+                            f"a {state!r} push: {upstream} reached lb-bot {hits(upstream)} "
+                            f"times, expected {want}")
+        finally:
+            hub.LB = saved_lb
+
         # --- advertised; nothing unsafe in the table ---------------------------------
         adv = proxy.advertised_routes()
         for want in ("GET /lb/attention", "GET /lb/activity"):
@@ -360,6 +493,7 @@ def main() -> int:
         return 1
     print("PASS - lb attention/activity: auth/no-params/strip-walk/cached-20s/coalesced"
           "/fast-pool/404-passes-uncached/502-down/settling-push-and-notify-flush"
+          "/searching-push-flushes-progress-does-not/error-bodies-narrowed/fixture-shapes"
           "/advertised/no-downloads-no-writes")
     return 0
 

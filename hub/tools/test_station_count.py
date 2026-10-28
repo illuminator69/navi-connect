@@ -28,7 +28,12 @@ Cases:
      catalogue's labels are Familiar / Blend / Discover;
   6. nothing configured: count is 503 fallback;
   7. the body whitelist: count reads `seed` and `character` only (an unlisted
-     `variety` is dropped, not obeyed), and start reads `variety`.
+     `variety` is dropped, not obeyed), and start reads `variety`;
+  8. `reach` (2026-10-24, in-process): the pool at the ladder's top, asked only when
+     `count` is under STATION_COUNT_WIDEN_BELOW (30): a filtered count of 20 with 120
+     reachable says 120; a roomy count says reach == count and asks nothing deeper;
+     nothing matching is 0 and 0; an unfiltered count keeps its shape; the old keys
+     are all still there; a slow deeper list is `partial`, never an error.
 
 Exits non-zero on failure.
 """
@@ -319,6 +324,8 @@ async def tier1_suite(failures):
             failures.append(f"Tier 1 count: {st_} {r}")
         if not asked or max(asked) > 500:
             failures.append(f"Tier 1 count asked Navidrome for {asked}")
+        if r.get("reach", -1) < r.get("count", 0):
+            failures.append(f"Tier 1 count: reach under count: {r}")
     finally:
         stop(proc)
         unlink_all(state)
@@ -389,9 +396,128 @@ async def whitelist_checks(failures):
             setattr(hubmod, k, v)
 
 
+class _Reach:
+    """AudioMuse as `count` sees it: every item's nearest list is N0000.., cut at `n`."""
+
+    def __init__(self, hubmod):
+        self.asked: list[tuple[str, int]] = []
+        self.slow_above = None          # a list deeper than this takes `slow_s`
+        self.slow_s = 1.0
+        self.fail_deep: set = set()     # items whose list deeper than the first ceiling is a 500
+        self.hubmod = hubmod
+
+    async def call(self, route, spec, params, body):
+        if route[1] != "station:similar_tracks":
+            return 404, b"{}", "application/json"
+        q = dict(params)
+        n = int(q["n"])
+        self.asked.append((q["item_id"], n))
+        if self.slow_above is not None and n > self.slow_above:
+            await asyncio.sleep(self.slow_s)
+        if q["item_id"] in self.fail_deep and n > 150:
+            return 500, b'{"error": "boom"}', "application/json"
+        # Seeds named A... have N neighbours, any other seed's are M (so two seeds differ).
+        pre = "M" if q["item_id"].startswith("B") else "N"
+        rows = [{"item_id": f"{pre}{i:04d}", "title": f"Near {i}", "author": f"Near Artist {pre}{i}",
+                 "distance": 0.1 + i * 0.001} for i in range(1000)][:n]
+        return 200, json.dumps(rows).encode(), "application/json"
+
+
+async def reach_checks(failures):
+    """Case 8: `reach`, at the function, with a fake AudioMuse and a primed mood list."""
+    import tempfile
+    from test_mood_deadline import StubHub
+    import hub as hubmod
+    saved = {k: getattr(hubmod, k) for k in ("AUDIOMUSE_URL", "STATE_PATH", "STATION_BUDGET_S")}
+    saved_call = hubmod.SONIC.call
+    hubmod.AUDIOMUSE_URL = "http://audiomuse.invalid"
+    hubmod.STATE_PATH = os.path.join(tempfile.mkdtemp(prefix="reach-"), "state.json")
+
+    def engine(filter_positions):
+        hub = StubHub()
+        eng = hubmod.StationEngine(hub)
+        hub.stations = eng
+        eng.tier2_ok = True
+        hub.moods._stats_ok = True
+        ids = [f"N{i:04d}" if isinstance(i, int) else i for i in filter_positions]
+        rows = [hubmod._station_row({"item_id": i, "title": f"F {i}", "author": f"F Artist {i}"})
+                for i in ids]
+        now = time.monotonic()
+        for p in hubmod.MOOD_BY_ID["relax"]["prompts"]:
+            hub.moods._searches[p] = (now, rows)
+        return eng
+
+    async def count(eng, seeds=("S0000",), **extra):
+        return await eng.count({"seed": {"kind": "tracks", "ids": list(seeds)},
+                                "character": "close", **extra})
+
+    try:
+        fake = _Reach(hubmod)
+        hubmod.SONIC.call = fake.call
+        # reach_widens_when_count_is_low: 20 match in the first 150, 120 in the first 1000.
+        eng = engine(list(range(20)) + list(range(150, 250)))
+        status, a = await count(eng, moodFilter="relax")
+        if (status, a.get("count"), a.get("reach")) != (200, 20, 120):
+            failures.append(f"reach_widens_when_count_is_low: {status} {a}")
+        if a.get("partial"):
+            failures.append(f"reach_widens_when_count_is_low: partial {a}")
+        # reach_equals_count_when_roomy: 100 match in the first 150; nothing deeper asked.
+        fake.asked.clear()
+        eng = engine(list(range(100)))
+        status, a = await count(eng, moodFilter="relax")
+        if (status, a.get("count"), a.get("reach")) != (200, 100, 100):
+            failures.append(f"reach_equals_count_when_roomy: {status} {a}")
+        if any(n > hubmod._station_depth(150) for _i, n in fake.asked):
+            failures.append(f"reach_equals_count_when_roomy: asked deeper: {fake.asked}")
+        # reach_zero_is_zero: nothing in the filter is near the seed at any depth.
+        eng = engine([f"Z{i:04d}" for i in range(50)])
+        status, a = await count(eng, moodFilter="relax")
+        if (status, a.get("count"), a.get("reach")) != (200, 0, 0):
+            failures.append(f"reach_zero_is_zero: {status} {a}")
+        # reach_for_an_unfiltered_count: 12 seeds, one shape, reach == count (roomy).
+        fake.asked.clear()
+        eng = engine([])
+        seeds = [f"S{i:04d}" for i in range(12)]
+        status, a = await count(eng, seeds=seeds)
+        if status != 200 or a.get("reach") != a.get("count") or a.get("count") != 150:
+            failures.append(f"reach_for_an_unfiltered_count: {status} {a}")
+        # old_clients_ignore_reach: the keys they read are all still there.
+        old = {"count", "character", "moodFilter", "engine", "anchors", "unknown", "partial"}
+        if not old <= set(a):
+            failures.append(f"old_clients_ignore_reach: missing {sorted(old - set(a))}")
+        # reach_obeys_the_budget: the deeper list is slow; the answer is partial, with
+        # the count it had, not an error.
+        hubmod.STATION_BUDGET_S = 0.3
+        fake.slow_above = hubmod._station_depth(150)
+        fake.slow_s = 1.0
+        eng = engine(list(range(20)) + list(range(150, 250)))
+        t0 = time.monotonic()
+        status, a = await count(eng, moodFilter="relax")
+        took = time.monotonic() - t0
+        if status != 200 or a.get("count") != 20 or a.get("reach") != 20 \
+                or a.get("partial") is not True or took > 0.9:
+            failures.append(f"reach_obeys_the_budget: {status} {a} in {took:.2f}s")
+        await asyncio.sleep(1.2)       # the slow list lands in the background
+        # A seed whose deeper list failed keeps its first-ceiling list in the union:
+        # A's 10 matches in its first 150, B's 10 there plus 50 deeper.
+        hubmod.STATION_BUDGET_S = saved["STATION_BUDGET_S"]
+        fake.slow_above = None
+        fake.fail_deep = {"A0000"}
+        eng = engine(list(range(10)) + [f"M{i:04d}" for i in range(10)]
+                     + [f"M{i:04d}" for i in range(150, 200)])
+        status, a = await count(eng, seeds=("A0000", "B0000"), moodFilter="relax")
+        if (status, a.get("count"), a.get("reach"), a.get("partial")) != (200, 20, 70, True):
+            failures.append(f"reach_with_one_failed_deeper_list: {status} {a}")
+    finally:
+        hubmod.SONIC.call = saved_call
+        for k, v in saved.items():
+            setattr(hubmod, k, v)
+
+
 async def main():
     failures: list[str] = []
     await whitelist_checks(failures)
+    await reach_checks(failures)
     await engine_suite(failures)
     await tier1_suite(failures)
     if failures:
@@ -404,7 +530,9 @@ async def main():
           "restart-keeps-variety/12-seeds/13-bad_seed/dupes-collapse/250KB-fast/"
           "every-seed-artist-capped/count-union/close<=balanced<=explore/one-unknown/"
           "seed_unknown/bad-character+seed/cached-recount/500-partial/variety-not-a-key/"
-          "no-station-left/tier1-500/unconfigured-503/whitelists/variety-table")
+          "no-station-left/tier1-500/unconfigured-503/whitelists/variety-table/"
+          "reach-widens-when-low/reach=count-when-roomy/reach-zero/unfiltered-shape/"
+          "old-keys-kept/reach-obeys-the-budget")
 
 
 if __name__ == "__main__":

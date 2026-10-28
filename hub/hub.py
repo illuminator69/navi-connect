@@ -253,6 +253,7 @@ PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers 
 LB_ATTENTION_TTL = 20.0     # /lb/attention and /lb/activity (§15.6): lb-bot builds
                             # its gap view to answer (~1 s), every client asks on
                             # welcome and on fill frames, and a count 20 s old is fine
+LB_SCREEN_ERROR_KEYS = ("error", "code", "down", "busy")   # what a failed screen read forwards
 # Entries, across every route of one proxy — not bytes. 64 was sized for
 # surfaces that ask one question per page open; a Discover screen asks several,
 # and rotates the artist it seeds its similar-artists row from, so each rotation
@@ -366,6 +367,7 @@ STATION_VARIETIES = ("low", "medium", "high")
 # The count route (§18.1): its own slots, so a pick screen counting never holds a
 # `start` back, and never more than this many counts computing at once.
 STATION_COUNT_INFLIGHT = 2
+STATION_COUNT_WIDEN_BELOW = 30        # a count under this also reports `reach` (the client's "runs out quickly")
 STATION_EXCLUDE_MAX = 1000
 STATION_HISTORY_MAX = 2000
 STATION_HISTORY_DAYS = 14
@@ -1570,6 +1572,8 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "timeout": PROXY_SLOW_TIMEOUT,
     },
     # ---- P6: the phone's Needs attention and Source history (§15.6) ----
+    # `error_keys` (both routes): a non-200 answer is cut down to those keys (HttpProxy._narrow_error).
+    # `error` and `code` are lb-bot's; `down` and `busy` are the flags the hub's own 502/504 carry.
     ("GET", "/lb/attention"): {
         # lb-bot's own "to fix" (failed gaps + failed requests + folders waiting to
         # be filed) with the rows behind it, capped at 50 albums and 50 folders.
@@ -1591,6 +1595,7 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": (), "cache": True, "ttl": LB_ATTENTION_TTL,
         "strip": (("folders", "name"), ("folders", "path"),
                   ("folders", "identifyError"), ("folders", "coverUrl")),
+        "error_keys": LB_SCREEN_ERROR_KEYS,
     },
     ("GET", "/lb/activity"): {
         # Every request lb-bot's fill ledger still holds (at most 200, terminal rows
@@ -1601,6 +1606,7 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         "params": (), "cache": True, "ttl": LB_ATTENTION_TTL,
         "strip": (("transfers", "filename"), ("transfers", "path"),
                   ("transfers", "title")),
+        "error_keys": LB_SCREEN_ERROR_KEYS,
     },
 }
 
@@ -1803,6 +1809,30 @@ class HttpProxy:
         B-005 (a failed call on any lb-bot route should be reflected by the next
         `/lb/status`, not just the probe route's own next call)."""
         return
+
+    @staticmethod
+    def _narrow_error(spec: dict, status: int, data: bytes) -> bytes:
+        """The second lock on a screen route's failure (`spec["error_keys"]`): lb-bot's
+        500 body is `str(e)`, which can carry a path, a trace or a token, and `_strip`
+        runs on a 200 only. A non-200 answer keeps just those keys, `error` cut at
+        200 characters; anything else (not JSON, a list, no usable `error`) becomes
+        `{"error": "lb-bot answered <status>"}`. A body that already is that shape is
+        returned byte for byte, so a 404 with no `code` stays what the clients' "older
+        lb-bot" rule reads."""
+        keys = spec.get("error_keys")
+        if not keys or status == 200:
+            return data
+        plain = json.dumps({"error": f"lb-bot answered {status}"}).encode()
+        try:
+            payload = json.loads(data)
+        except Exception:  # noqa: BLE001 — not JSON
+            return plain
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), str):
+            return plain
+        out = {k: payload[k] for k in keys
+               if k in payload and isinstance(payload[k], (str, int, float, bool))}
+        out["error"] = payload["error"][:200]
+        return data if out == payload else json.dumps(out).encode()
 
     @staticmethod
     def _strip(spec: dict, status: int, data: bytes) -> bytes:
@@ -2029,6 +2059,7 @@ class HttpProxy:
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
         data = self._strip(spec, status, data)
+        data = self._narrow_error(spec, status, data)
         if (spec.get("cache") and gen == self._cache_gen.get(route, 0)
                 and upstream_status == 200):
             self._cache_put(key, status, data, ctype,
@@ -3165,6 +3196,8 @@ class StationEngine:
         self._probe_lock = asyncio.Lock()
         self._t1_cache: dict[tuple[str, str], tuple[float, list]] = {}
         self._bg: set = set()
+        # mood id -> the one `MoodService.merged` build asks are waiting on.
+        self._mood_builds: dict[str, asyncio.Future] = {}
         self._load_history()
         self._load_stations()
 
@@ -3392,6 +3425,43 @@ class StationEngine:
             return None
         return task.result()
 
+    async def _merged_within(self, mood_id: str, b: Optional[_StationBatch] = None,
+                             limit_s: Optional[float] = None) -> Optional[list]:
+        """A mood's merged list, waited for no longer than the request's budget (§18.5).
+        None = not had in time or not at all; when it ran out of time `b.timed_out` is
+        set. With no batch the wait is `limit_s`, else STATION_BUDGET_S, read now.
+
+        The build is NOT cancelled when the wait ends: it finishes in the background
+        and is in the mood service's memory for the next ask. A cancel would raise
+        CancelledError into every request coalesced on one of its searches. Asks for
+        one mood share one build, so a burst of timed-out asks adds no tasks."""
+        svc = self._moods()
+        if svc is None:
+            return None
+        fut = self._mood_builds.get(mood_id)
+        if fut is None or fut.done():
+            fut = asyncio.ensure_future(svc.merged(mood_id))
+            self._mood_builds[mood_id] = fut
+
+            def landed(f: asyncio.Future, mid: str = mood_id) -> None:
+                if self._mood_builds.get(mid) is f:
+                    del self._mood_builds[mid]
+                if not f.cancelled():
+                    f.exception()   # retrieved, so an ask that gave up is not logged
+            fut.add_done_callback(landed)
+        if b is not None:
+            left = max(0.0, b.left())
+            if limit_s is not None:
+                left = min(left, limit_s)
+        else:
+            left = STATION_BUDGET_S if limit_s is None else limit_s
+        done, _pending = await asyncio.wait({fut}, timeout=left)
+        if not done:
+            if b is not None:
+                b.timed_out = True
+            return None
+        return fut.result()
+
     @staticmethod
     def _tier2_verdict(status: int, raw: bytes) -> Optional[bool]:
         """What one AudioMuse answer says about AudioMuse: True reachable, False
@@ -3563,8 +3633,7 @@ class StationEngine:
             # A mood station's one anchor (§18.5): its "nearest list" is the mood's merged
             # list, held by the mood service in memory. None = it cannot be had, and the
             # batch is partial: never a fall back to the seed's neighbours.
-            svc = self._moods()
-            mood_rows = await svc.merged(item_id[len(MOOD_ANCHOR):]) if svc is not None else None
+            mood_rows = await self._merged_within(item_id[len(MOOD_ANCHOR):], b)
             if mood_rows is None:
                 b.failed = True
             b.lists[key] = mood_rows[:depth] if mood_rows is not None else None
@@ -3862,7 +3931,7 @@ class StationEngine:
                 b.failed = True
                 return []
             if st.mood_filter:
-                filter_rows = await svc.merged(st.mood_filter)
+                filter_rows = await self._merged_within(st.mood_filter, b)
                 if filter_rows is None:
                     b.failed = True
                     return []
@@ -4041,11 +4110,18 @@ class StationEngine:
             return True, raw
         return False, None
 
-    async def _mood_ready(self, mood_id: str) -> bool:
+    async def _mood_ready(self, mood_id: str, b: _StationBatch) -> bool:
         """The mood can be steered by now: usable, and its merged list is built (or is
-        built by this ask)."""
-        svc = self._moods()
-        return self.moods_usable() and svc is not None and await svc.merged(mood_id) is not None
+        built by this ask) inside the request's budget. If the budget ran out
+        `b.timed_out` says so, and the build goes on."""
+        return self.moods_usable() and await self._merged_within(mood_id, b) is not None
+
+    def _mood_unavailable(self, b: _StationBatch) -> dict:
+        """The 409 body: `building` only when the list was not built in time (§18.5)."""
+        body = dict(self._MOOD_UNAVAILABLE)
+        if b.timed_out:
+            body["building"] = True
+        return body
 
     _BAD_MOOD = {"code": "bad_mood", "error": "mood must be a mood id of /sonic/mood/catalogue"}
     _MOOD_UNAVAILABLE = {"code": "mood_unavailable",
@@ -4187,8 +4263,11 @@ class StationEngine:
         ok_f, mood_filter = self._parse_mood(body.get("moodFilter"))
         if not ok_m or not ok_f or (mood and mood_filter):
             return 400, dict(self._BAD_MOOD)
-        if (mood or mood_filter) and not await self._mood_ready(mood or mood_filter):
-            return 409, dict(self._MOOD_UNAVAILABLE)
+        # The request's budget runs from here: the mood's list, then the ladder.
+        deadline = time.monotonic() + STATION_BUDGET_S
+        b = _StationBatch(deadline)
+        if (mood or mood_filter) and not await self._mood_ready(mood or mood_filter, b):
+            return 409, self._mood_unavailable(b)
         count = _as_int(body.get("count"), 20, 1, 50)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
@@ -4218,12 +4297,10 @@ class StationEngine:
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
                      created_at=now, used_at=now, origin=origin, variety=variety,
                      mood=mood, mood_filter=mood_filter)
-        deadline = time.monotonic() + STATION_BUDGET_S
         if not await self._acquire(self._computing, deadline):
             return 503, {"fallback": True, "busy": True,
                          "error": "the hub is computing two stations already"}
         try:
-            b = _StationBatch(deadline)
             if seed["kind"] == "yourMix":
                 outcome, anchors = await self._mix_anchors(b)
                 if outcome == "unavailable":
@@ -4307,21 +4384,20 @@ class StationEngine:
         ok_f, mood_filter = self._parse_mood(body.get("moodFilter"))
         if not ok_f:
             return 400, dict(self._BAD_MOOD)
+        deadline = time.monotonic() + STATION_BUDGET_S
+        b = _StationBatch(deadline)
         filter_ids: Optional[set] = None
         if mood_filter:
-            svc = self._moods()
-            rows = await svc.merged(mood_filter) if self.moods_usable() and svc else None
+            rows = await self._merged_within(mood_filter, b) if self.moods_usable() else None
             if rows is None:
-                return 409, dict(self._MOOD_UNAVAILABLE)
+                return 409, self._mood_unavailable(b)
             filter_ids = {r["id"] for r in rows}
         ids = seed["ids"]
         tune = STATION_TUNING[character]
-        deadline = time.monotonic() + STATION_BUDGET_S
         if not await self._acquire(self._counting, deadline):
             return 503, {"fallback": True, "busy": True,
                          "error": "the hub is counting two seed sets already"}
         try:
-            b = _StationBatch(deadline)
             tier1 = not self.tier2_configured() or (
                 self.tier2_ok is False and self.tier1_configured())
             lists: list[Optional[list]] = []
@@ -4338,6 +4414,25 @@ class StationEngine:
                 b.found.clear()
                 n = min(tune.ceiling, STATION_TIER1_MAX)
                 lists = await self._gather([self._tier1_list(i, n, b) for i in ids])
+
+            def pool_of(ls: list) -> set:
+                got = {r["id"] for rows in ls if rows for r in rows} - set(ids)
+                return got & filter_ids if filter_ids is not None else got
+
+            # `reach` (§18.1): the pool at the ladder's top, which is where a station
+            # that runs short really draws from (`_levels` widens up to ceiling_max).
+            # Asked only when the first ceiling's count is small; a roomy radio costs
+            # nothing more. The deeper lists are fetched once per seed (the first
+            # ceiling's lists are a prefix of them); Tier 1's are already in hand.
+            wide: Optional[list] = None
+            if len(pool_of(lists)) < STATION_COUNT_WIDEN_BELOW:
+                if tier1:
+                    top = min(tune.ceiling_max, STATION_TIER1_MAX)
+                    wide = await self._gather([self._tier1_list(i, top, b) for i in ids])
+                elif tune.ceiling_max > tune.ceiling:
+                    deep = _station_depth(tune.ceiling_max)
+                    wide = await self._gather([self._nearest(i, deep, b) for i in ids])
+                    wide = [r[:tune.ceiling_max] if r is not None else None for r in wide]
         finally:
             self._counting.release()
         unknown = [i for i, rows in zip(ids, lists) if rows is not None and not rows]
@@ -4347,13 +4442,17 @@ class StationEngine:
                          "error": "no tier holds any of the seed tracks"}
         if not answered:
             return 503, {"fallback": True, "error": "no tier answered"}
-        pool = {r["id"] for rows in answered for r in rows} - set(ids)
-        if filter_ids is not None:
-            if tier1:
-                # AudioMuse fell over during the count: a filtered count is not had.
-                return 409, dict(self._MOOD_UNAVAILABLE)
-            pool &= filter_ids
-        return 200, {"count": len(pool), "character": character, "moodFilter": mood_filter,
+        if filter_ids is not None and tier1:
+            # AudioMuse fell over during the count: a filtered count is not had.
+            return 409, dict(self._MOOD_UNAVAILABLE)
+        pool = pool_of(answered)
+        reach = len(pool)
+        if wide is not None:
+            # A seed whose deeper list failed keeps its first-ceiling list.
+            both = [w if w is not None else lst for w, lst in zip(wide, lists)]
+            reach = max(reach, len(pool_of(both)))
+        return 200, {"count": len(pool), "reach": reach, "character": character,
+                     "moodFilter": mood_filter,
                      "engine": "tier1" if tier1 else "tier2", "anchors": len(answered),
                      "unknown": unknown, "partial": b.failed or b.timed_out}
 
@@ -4446,8 +4545,9 @@ class StationEngine:
             ok, mood = self._parse_mood(body.get("value"))
             if not ok or st.mood_filter is not None:
                 return 400, dict(self._BAD_MOOD)
-            if mood is not None and not await self._mood_ready(mood):
-                return 409, dict(self._MOOD_UNAVAILABLE)
+            mb = _StationBatch(time.monotonic() + STATION_BUDGET_S)
+            if mood is not None and not await self._mood_ready(mood, mb):
+                return 409, self._mood_unavailable(mb)
             # Like a character, a mood starts a stopped station again.
             if mood != st.mood or st.stopped:
                 st.mood = mood
@@ -4937,6 +5037,12 @@ class MoodService:
                     rows = _clap_rows(json.loads(raw or b"null"))
                 except Exception:  # noqa: BLE001 — not JSON: a failed search
                     rows = None
+                if rows is not None and not rows:
+                    # A 200 with nothing in it (CLAP index still loading, a prompt
+                    # it could not embed) is not an answer: stored, it would make
+                    # an empty "ready" mood and a station with no songs.
+                    rows = None
+                    log("moods: a search answered no rows")
             if rows is None:
                 self._note_failure(status, raw)
                 dlog(f"moods: a search failed ({status})")
@@ -5208,6 +5314,11 @@ _LB_FILL_TERMINAL = ("failed", "cancelled")
 # Source history's Running and Earlier, or the count behind the avatar (§15.6).
 # An album fill names it in `state`, a gap summary in `status` (`picking`, `complete`).
 _LB_FILL_SETTLED = _LB_FILL_TERMINAL + ("placed", "verified", "picking", "complete")
+# A fill that BEGINS also moves what the screens count: a Retry or a new request turns
+# a failed row into a live one, and a cancel ends it. Progress pushes (`downloading`,
+# `placing` with a percent) arrive every few seconds and change no count, so they do
+# not flush.
+_LB_FILL_BEGINS = ("searching",)
 # The third inbound path: lb-bot's library index moved (the mirror's live
 # trigger). `t: "index"` rather than `library` for the same reason as `fill`, and
 # more so — during a bulk build it arrives every 2 s, and a `library` frame at
@@ -5406,7 +5517,7 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
 
     if frame.get("kind") == "album" and frame.get("state") in _LB_FILL_TERMINAL:
         LB.invalidate({("GET", "/lb/album/sources")})
-    if (frame.get("state") in _LB_FILL_SETTLED
+    if (frame.get("state") in _LB_FILL_SETTLED + _LB_FILL_BEGINS
             or frame.get("status") in _LB_FILL_SETTLED):
         LB.invalidate(LB_ATTENTION_ROUTES)
     if HUB_INSTANCE is not None:

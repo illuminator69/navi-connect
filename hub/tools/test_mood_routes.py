@@ -33,6 +33,11 @@ Cases:
      station probe still answers;
   7. in-process: `_mood_merge` interleaves by rank, keeps the first sighting, caps
      per artist; with the cap at 99 the dominant artist floods the list.
+  8. an empty CLAP answer (200, no rows) is a failed search, in-process: nothing is
+     stored, the mood is not built and `ready` stays false, it is asked again after
+     MOOD_RETRY (at once with 0), one empty prompt of four stores no merge, and a mood
+     station start on an all-empty CLAP is 409 mood_unavailable, never a 200 with
+     `exhausted` and no tracks;
 
 Exits non-zero on failure.
 """
@@ -548,10 +553,92 @@ async def inprocess_checks(failures):
         hubmod.SONIC.call, hubmod.AUDIOMUSE_URL, hubmod.MOOD_RETRY = real, old_url, old_retry
 
 
+async def empty_checks(failures):
+    """Case 8: a 200 whose `results` is empty is not an answer. The hub says so in its
+    log; that output is captured here and checked, not left on the console."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await _empty_checks(failures)
+    if "moods: a search answered no rows" not in buf.getvalue():
+        failures.append("empty answer: the hub did not log it")
+
+
+async def _empty_checks(failures):
+    from test_mood_deadline import StubHub     # the engine's stand-in hub
+    calls: list[str] = []
+    empty: set = set()
+    rows = [{"item_id": f"E{i:03d}", "title": f"E {i}", "author": f"Artist {i}"}
+            for i in range(30)]
+
+    async def fake_call(route, spec, params, body):
+        if route[1] == "station:score":
+            return 200, json.dumps({"item_id": dict(params).get("id", "L00_0"),
+                                    "title": "Seed", "author": "Seed Artist"}).encode(), \
+                "application/json"
+        calls.append(body["query"])
+        if body["query"] in empty:
+            return 200, b'{"results": []}', "application/json"
+        return 200, json.dumps({"results": rows}).encode(), "application/json"
+
+    real = hubmod.SONIC.call
+    saved = {k: getattr(hubmod, k) for k in ("AUDIOMUSE_URL", "MOOD_RETRY", "STATE_PATH")}
+    hubmod.SONIC.call, hubmod.AUDIOMUSE_URL, hubmod.MOOD_RETRY = fake_call, "http://x", 60.0
+    hubmod.STATE_PATH = os.path.join(tempfile.mkdtemp(prefix="mood-empty-"), "state.json")
+    prompts = hubmod.MOOD_BY_ID["relax"]["prompts"]
+    try:
+        # empty_answer_is_a_failed_search
+        empty.update(prompts)
+        svc = hubmod.MoodService(None)
+        if await svc._fetch(prompts[0]) is not None:
+            failures.append("empty answer: _fetch returned a list for a 200 with no rows")
+        if svc._searches:
+            failures.append(f"empty answer: stored {list(svc._searches)}")
+        if await svc.merged("relax") is not None or svc.ready():
+            failures.append("empty answer: a mood was built from empty searches")
+        # empty_is_asked_again
+        n = len(calls)
+        if await svc.merged("relax") is not None or len(calls) != n:
+            failures.append(f"empty answer: asked again inside MOOD_RETRY ({len(calls) - n})")
+        hubmod.MOOD_RETRY = 0.0
+        empty.clear()
+        got = await svc.merged("relax")
+        if not got or len(calls) == n:
+            failures.append(f"empty answer: not asked again at MOOD_RETRY 0: {got and len(got)}")
+        # one_empty_prompt_of_four_stores_no_merge
+        hubmod.MOOD_RETRY = 60.0
+        calls.clear()
+        empty.add(prompts[3])
+        svc = hubmod.MoodService(None)
+        if await svc.merged("relax") is not None or "relax" in svc._merged:
+            failures.append("empty answer: three good prompts and one empty stored a merge")
+        if prompts[3] in svc._searches or not all(p in svc._searches for p in prompts[:3]):
+            failures.append(f"empty answer: stored searches {list(svc._searches)}")
+        # a_station_does_not_start_with_zero_rows
+        empty.update(prompts)
+        hub = StubHub()
+        eng = hubmod.StationEngine(hub)
+        hub.stations = eng
+        eng.tier2_ok = True
+        hub.moods._stats_ok = True
+        status, body = await eng.start({"seed": {"kind": "track", "ids": ["L00_0"]},
+                                        "character": "close", "mood": "relax"})
+        if status != 409 or body.get("code") != "mood_unavailable" or "building" in body:
+            failures.append(f"empty answer: a mood start on an empty CLAP: {status} {body}")
+        if eng.stations:
+            failures.append("empty answer: a station was made from zero rows")
+    finally:
+        hubmod.SONIC.call = real
+        for k, v in saved.items():
+            setattr(hubmod, k, v)
+
+
 async def main():
     failures: list[str] = []
     unit_checks(failures)
     await inprocess_checks(failures)
+    await empty_checks(failures)
     await main_suite(failures)
     await failure_suite(failures)
     await unconfigured_suite(failures)

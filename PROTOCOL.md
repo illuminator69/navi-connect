@@ -2412,9 +2412,16 @@ clients gate on `GET /lb/attention` and `GET /lb/activity`.
 **What the hub does.** Both routes forward no parameter, are cached `LB_ATTENTION_TTL` (20 s) and coalesced
 (lb-bot answers from the same gap view `/api/summary` builds, about a second), ride the fast pool, and are
 dropped from the cache by a `fill` push whose `state` or `status` settles (`failed`, `cancelled`, `placed`,
-`verified`, `picking`, `complete`; not a progress push) and by `/lb/notify`. Belt and braces over lb-bot's own
+`verified`, `picking`, `complete`) **or whose `state` begins a fill (`searching`)**, so a Retry, a new request
+or a cancel reads through within one frame instead of up to 20 s; not by a progress push (`downloading`,
+`placing` with a percent: they arrive every few seconds and move no count); and by `/lb/notify`. Belt and braces over lb-bot's own
 allowlist, the hub strips `folders[].name`, `.path`, `.identifyError`, `.coverUrl` and `transfers[].filename`,
-`.path`, `.title`. `/api/downloads` (its review rows carry Telegram credentials) and every placement or
+`.path`, `.title`. **A failed read forwards only its error** (2026-10-24): lb-bot's `500` body is `str(e)` and the
+strip above runs on a `200` only, so a non-200 answer from either route is cut to `{error, code}` (plus the
+`down` and `busy` flags the hub's own `502`/`504` carry), `error` at 200 characters; a body that is not a JSON
+object with a string `error` becomes `{"error": "lb-bot answered <status>"}`. A `404` that already is
+`{error}` with no `code` is passed byte for byte, so "an lb-bot older than the routes" still reads as a 404
+with no `code`. `/api/downloads` (its review rows carry Telegram credentials) and every placement or
 transfer write stay off the wire.
 
 **When a client reads them.** On `welcome`, on a `fill` or `lb` frame, when the avatar menu or either page
@@ -2851,7 +2858,9 @@ Answers:
     `bad_seed` (the length is checked before any id).
   - `400 {code: "bad_mood"}`: `mood` or `moodFilter` is not a catalogue id, or both are given.
     `409 {code: "mood_unavailable"}`: the mood's list cannot be had (AudioMuse down or its CLAP
-    index not loaded, Tier 1 only); no station is made.
+    index not loaded, Tier 1 only); no station is made. **`building: true`** (additive, §18.5) is
+    added when the list is not built within the 12 s budget: the build goes on, and asking again
+    shortly finds it.
   - `404 {code: "seed_unknown"}`: no tier knows a seed track or has anything near it: AudioMuse
     answers 404 (or an empty list) for every seed and Navidrome has no similar songs for it.
   - `503 {fallback: true}`: no tier is usable. Also Your mix on a hub whose AudioMuse is unset
@@ -2869,7 +2878,7 @@ radio's pick screen. Read-only: it creates no station and records nothing.
   "moodFilter": "pump-up" }                            // P7, optional (§18.5)
 ```
 
-Answers `200 {count, character, moodFilter, engine, anchors, unknown: [ids], partial}`. With
+Answers `200 {count, reach, character, moodFilter, engine, anchors, unknown: [ids], partial}`. With
 `moodFilter` the count is the pool **intersected** with the mood's list (its first 1000), and a
 mood that cannot be had is `409 {code: "mood_unavailable"}`:
 
@@ -2878,6 +2887,14 @@ mood that cannot be had is `409 {code: "mood_unavailable"}`:
   themselves left out, **before** the 14-day play filter and the spacing rule. It is a pool, not a
   queue length, and `variety` does not change it, so a client asks again only when the seeds or the
   character change.
+- **`reach`** (additive, 2026-10-24; absent from an older hub, which a client reads as "reach = count") is the
+  same pool at the **ladder's top** (§18.3: the rank ceiling ×1.5 up to 1000, or 2000 for Explore; Tier 1's
+  500). `count` stops where the ladder starts, so a radio whose first ceiling is small ("will run out
+  quickly") may draw from a much larger pool when it is short (measured: a filtered radio counted 22 and the
+  station served 50). The hub works `reach` out **only when `count` is under 30**, and otherwise it equals
+  `count`, so a roomy radio costs nothing extra. A deeper list that was slow or failed leaves that seed at
+  its first-ceiling list (`reach` is never below `count`) and the answer `partial`. It is the same
+  intersection with `moodFilter`.
 - `anchors` is how many seeds answered rows; `unknown` names the seeds no tier holds (they add
   nothing, the rest still count). `partial: true` means a list failed and the number may be low; a
   client never shows such a number as complete.
@@ -3071,7 +3088,8 @@ never on `/` (AC/DC). A station never serves two versions of one song either.
 A batch that comes up short widens before it gives up: deeper into the lists, the rank ceiling
 ×1.5 (up to 1000, or 2000 for Explore), the history window down to 3 days, played-through
 tracks' neighbours, similar artists, then Tier 1 (Navidrome, at most 500 per anchor). Only when
-all of those **answered** and the batch is still empty is it `exhausted`. A source that failed
+all of those **answered** and the batch is still empty is it `exhausted`. (`/sonic/station/count`'s `reach` is
+the pool at the top of this ladder's ceilings, §18.1.) A source that failed
 (AudioMuse down, a timeout) makes the answer `partial`, never `exhausted`.
 
 - Played-through neighbours and similar artists are Explore's sources from the first batch. On
@@ -3114,7 +3132,9 @@ for a radio. It is that user's mix, whoever asks.
   bad file never stops the hub.
 - **Limits:**
   - A request has 12 s from its arrival; what is found by then is answered with
-    `partial: true`.
+    `partial: true`. **A mood's list is inside that budget** (`start`, `count` and the `mood`
+    signal wait for it too): a list not built in time is `409 mood_unavailable` with
+    `building: true`, not a held request (§18.5).
   - One computation per station at a time, two stations computing at once. A request that waits
     out its 12 s for either is answered without computing: `next` with no tracks and
     `partial: true`, `start` with `503 {fallback: true, busy: true}`.
@@ -3179,10 +3199,25 @@ drops what it does not hold.
 list holds the song within its first 600 (`MOOD_FOR_SONG_RANK`), best rank first. `ready: false`
 and no moods while the lists are building, or after a build that failed.
 
+**A mood ask never outlasts the station budget** (2026-10-24). `start {mood | moodFilter}`,
+`count {moodFilter}` and the `mood` signal wait for the mood's merged list at most `STATION_BUDGET_S`
+(12 s) from their arrival. A list not built by then answers **`409 {code: "mood_unavailable",
+building: true}`** (`building` is additive: absent on an older hub, and absent on a 409 that is a
+failure, not a build in progress). The build is not cancelled: it finishes in the background and is in
+memory for the next ask, so asking again shortly gets the station. Before this, a restart's first ask
+held the request for the whole build (27 and 31 s measured; CLAP takes 4 s a search and 13 moods are
+52 searches, one at a time) and a plain `start` meanwhile answered `503 busy`. A client renders
+`mood_unavailable` as it always did (the unavailable line with a retry) and need not read `building`;
+it is there for logs and a later "still building" line. A station already running whose filter's list
+cannot be had inside a batch's budget is `partial` and empty, as before (below).
+
 **Building.** One search per prompt (`/api/clap/search`, `limit` 600), one at a time in the
 stations' pool, single-flight per prompt. A list lives 6 h and a stale one is served while it is
 rebuilt. A mood's merged list is stored only when all four of its searches answered: a merge of
-three is never served. A failed build is tried again no sooner than 60 s later. All 13 are built
+three is never served. **A search that answers 200 with no rows is a failed search** (2026-10-24):
+nothing is stored, `ready` stays false and `catalogue.ready` says so until every merged list holds
+rows, the mood is asked again after the same 60 s, and a `start` on it is `409 mood_unavailable`
+(no `building`), never a `200` with `exhausted: true` and no tracks. A failed build is tried again no sooner than 60 s later. All 13 are built
 once the stations have probed AudioMuse, so the first Home visit after a restart usually finds
 `ready`; the tiles do not wait for it.
 
