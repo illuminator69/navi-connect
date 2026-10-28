@@ -2219,6 +2219,17 @@ class LbProxy(HttpProxy):
         return LBBOT_URL
 
     @property
+    def upstream_token(self) -> str:
+        """The hub is lb-bot's trusted service caller (Worbus P1): every call,
+        the probe included, carries `Authorization: Bearer <HUB_TOKEN>`. It is
+        the one shared secret, the same value lb-bot already sends the hub as
+        `LB_BOT_HUB_TOKEN` on its pushes, so a stranger sets one secret, not two.
+        lb-bot behind its login answers 401 to a call without it; an older
+        lb-bot ignores the header. Never logged: `_proxy_upstream_blocking`
+        puts it in a header only, and `_url_for_log` prints no headers."""
+        return TOKEN
+
+    @property
     def disabled_reason(self) -> str:
         return ("LBBOT_URL is unset" if not LBBOT_URL
                 else "HUB_TOKEN is empty (refusing to run as an open relay)")
