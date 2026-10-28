@@ -232,9 +232,10 @@ With Tier 2 set, the hub also computes, on the same `/sonic/*` port:
 lb-bot is a **separate repository**, not part of this one. It indexes each artist's full
 MusicBrainz discography, knows what your library is missing, and can acquire it from Soulseek.
 
-Its own Flask API **has no authentication and binds `0.0.0.0:8899`**. Because of that there is
-deliberately **no direct-LAN fallback** in the clients: they reach it only through the hub, or not at
-all. Don't expose port 8899 beyond your LAN.
+The clients reach it **only through the hub**, or not at all: there is deliberately no direct-LAN
+fallback. Since Worbus P1 (2026-10-28) lb-bot's web UI and API sit behind your Navidrome login (an older
+lb-bot has no authentication at all), and the hub calls it as a trusted service with
+`Authorization: Bearer <HUB_TOKEN>`. Don't expose port 8899 beyond your LAN either way.
 
 lb-bot also publishes a prebuilt image to **GHCR** (`ghcr.io/<owner>/lb-bot`), so it updates the same
 way the hub does — `docker compose pull && docker compose up -d`.
@@ -262,12 +263,12 @@ The variables that matter:
 
 | Variable | Notes |
 |---|---|
-| `NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD` | Library truth + placement oracle |
-| `SLSKD_URL`, `SLSKD_API_KEY` | slskd → Options → API Keys |
+| `NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD` | **Required.** Library truth + placement oracle |
+| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` | **Required** (since Worbus P1). The hub's **http://** address (not the `ws://` one clients use) and the same token as `HUB_TOKEN` — one secret for both directions. lb-bot accepts the hub's calls with it, and pushes the index progress, landings and fill moves to the hub with it. Without them there is no index bar on Home, Scan now waits for the 15-minute mirror pull, and an lb-bot behind its login refuses the hub. lb-bot names any of these five that is missing in its start-up log. |
+| `SLSKD_URL`, `SLSKD_API_KEY` | Optional: downloading. With `SLSKD_API_KEY` empty, downloading is off (`downloads: "off"`, PROTOCOL §15.7): no slskd call is made and the clients show no download action. Read at start, so changing it needs a restart. slskd → Options → API Keys |
 | `MBZ_CONTACT` | **Required by the MusicBrainz ToS.** A contact email. |
 | `LISTENBRAINZ_USER` | Playlist/fresh-release sources |
-| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Its Telegram control surface |
-| `LB_BOT_HUB_URL`, `LB_BOT_HUB_TOKEN` | **Set these.** The hub's **http://** address (not the `ws://` one clients use) and the same token as `HUB_TOKEN`. Without them a finished download won't push a refresh to open client pages — you'll see it on the next manual read instead. |
+| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Optional: its Telegram control surface. lb-bot runs without it |
 | `LASTFM_API_KEY`, `SPOTIFY_CLIENT_ID/SECRET` | Optional enrichment |
 
 **Deployment gotchas that will bite you** (all from lb-bot's own docs):

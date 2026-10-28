@@ -45,7 +45,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `HUB_ND_USER` / `HUB_ND_PASS` | *(empty)* | Navidrome creds the mirror authenticates with (single-user); the AudioMuse proxy reuses them |
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
-| `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client |
+| `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client. The hub calls it with `Authorization: Bearer <HUB_TOKEN>`, so lb-bot's `LB_BOT_HUB_TOKEN` must be this `HUB_TOKEN` (and its `LB_BOT_HUB_URL` this hub's http:// address; both required on lb-bot since Worbus P1) |
 | `LBBOT_WEB_URL` | `LBBOT_URL` | where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links. Set it when `LBBOT_URL` is a Docker-internal name |
 | `PREVIEW_URL` | *(empty)* | the preview sidecar as the hub reaches it; unset disables `/preview/*` (`../preview/README.md`) |
 | `PREVIEW_PUBLIC_URL` | *(empty)* | the sidecar as a client or a Chromecast reaches it; in practice required with `PREVIEW_URL` |
@@ -130,12 +130,24 @@ download and its progress poll, the per-album gap actions (`/lb/gap` +
 listening mirror, and the read-only Needs attention and Source history
 (`/lb/attention`, `/lb/activity`). Routes and rationale: `../PROTOCOL.md` §15.
 
-**This whitelist is the only access control that exists.** lb-bot's Flask API has
-no authentication at all and binds `0.0.0.0:8899`, and it exposes delete-file,
-trash and preference-writing routes — so there is deliberately no direct-LAN
-fallback in any client, no wildcard in the table, and `/api/tasks*` and the
-whole-library `/api/gaps` list stay off it. Disabled (503) when `HUB_TOKEN` is
-empty, for the same reason as the AudioMuse proxy.
+**This whitelist is what a device can reach.** lb-bot exposes delete-file, trash
+and preference-writing routes, so there is deliberately no direct-LAN fallback in
+any client, no wildcard in the table, and `/api/tasks*` and the whole-library
+`/api/gaps` list stay off it. Since Worbus P1 (2026-10-28) lb-bot itself sits behind
+the Navidrome login, and the hub calls it as its trusted service caller with
+`Authorization: Bearer <HUB_TOKEN>` (lb-bot holds the same value as
+`LB_BOT_HUB_TOKEN`; an older lb-bot has no authentication and ignores the header).
+If the two differ, lb-bot answers 401 to every proxied call while `/lb/status` still
+reads it as available; the hub's log then says `lbbot refused the hub's call (401)`.
+Through the hub every device acts as that one admin caller, so the whitelist stays
+the boundary. Disabled (503) when `HUB_TOKEN` is empty, for the same reason as the
+AudioMuse proxy.
+
+The hub also relays lb-bot's **downloads mode** (`welcome.lb.downloads`, the `lb`
+frame and `/lb/status`: `"on"` or `"off"`, absent from an older lb-bot) and its
+first-run **index progress** (`lbIndex.progress` and the `index` frame); with
+downloading off, lb-bot's download routes answer `409 downloads_off`, passed on
+unchanged. `../PROTOCOL.md` §15.7.
 
 `GET /lb/status` answers even when `LBBOT_URL` is unset, and lists the routes this
 hub can proxy — a client that ships ahead of the hub can then say so instead of

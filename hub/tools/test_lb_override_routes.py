@@ -17,7 +17,11 @@ route table cannot:
   - lb-bot's 400 / 404 / 409 / 502 bodies reach the client with their status;
   - (Worbus P1) a discography whose scan is running is never served from the
     cache, and Scan now (`POST /lb/artist/discography`) drops the cached read, so
-    a page polling the scan's counts sees them move.
+    a page polling the scan's counts sees them move;
+  - (Worbus P1, H4) the new fields need no route-table change: a scan by
+    `{nd_id}` alone reaches lb-bot as `{nd_id}`, `unresolved` and `scan`'s counts
+    and the album meta's `findIt` survive the relay as lb-bot sent them, and a
+    download route's 409 `downloads_off` reaches the client as is, uncached.
 
 Exits non-zero on failure.
 """
@@ -42,6 +46,15 @@ GET_STATUS = [200]   # what GET /api/overrides answers (an older lb-bot: 404)
 REVISION = [1]   # bumped so a cached answer and a fresh one are distinguishable
 # Worbus P1: what GET /api/artist/discography adds to `rev` (None = today's body).
 DISCO: list[dict | None] = [None]
+# Worbus P1 (H4): lb-bot's album meta with Find-it links, and its downloads-off refusal.
+FIND_IT = [{"service": "spotify", "kind": "confirmed", "url": "https://open.spotify.com/album/x"},
+           {"service": "bandcamp", "kind": "search",
+            "url": "https://bandcamp.com/search?q=A%20B&item_type=a"}]
+META_ALBUM = {"found": True, "rgid": "rg1", "links": [], "findIt": FIND_IT}
+DOWNLOADS_OFF = {"code": "downloads_off", "error": "Downloading is not set up on this server."}
+DOWNLOADS_OFF_PATHS = ("/api/album/sources", "/api/album/download", "/api/groups/g1/sources",
+                       "/api/gaps/g1/auto", "/api/gaps/g1/fetch",
+                       "/api/groups/g1/sources/0/files")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -62,6 +75,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"artists": [{
                 "ndArtistId": "nd1", "mbid": "m1", "name": "X", "tagMbid": "",
                 "setAt": 1.0 + REVISION[0]}]})
+        elif path == "/api/meta/album":
+            self._send(200, META_ALBUM)
+        elif path in DOWNLOADS_OFF_PATHS:
+            self._send(409, DOWNLOADS_OFF)
         elif path == "/api/artist/discography":
             body = {"rev": REVISION[0]}
             if DISCO[0] is not None:
@@ -82,6 +99,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(status, out)
         elif self.path == "/api/artist/discography":
             self._send(200, {"ok": True, "task_id": "t-scan"})
+        elif self.path in DOWNLOADS_OFF_PATHS:
+            self._send(409, DOWNLOADS_OFF)
         else:
             self._send(404, {})
 
@@ -231,6 +250,50 @@ def main() -> int:
                             f"{'cached' if not HITS else 'fresh'}: {disc!r}")
         DISCO[0] = None
 
+        # --- Worbus P1 (H4): the new fields ride the existing routes ---------
+        # nd_id_scan_passes: Scan now for an artist with no MBID.
+        HITS.clear()
+        status, _h, body = post("/lb/artist/discography", {"nd_id": "nd7", "evil": 1})
+        sent = posts()
+        if status != 200 or json.loads(body).get("task_id") != "t-scan":
+            failures.append(f"a scan by nd_id alone answered {status} {body!r}")
+        if not sent or sent[0][1] != "/api/artist/discography" or sent[0][2] != {"nd_id": "nd7"}:
+            failures.append(f"a scan by nd_id reached lb-bot as {sent!r}, expected {{nd_id}} only")
+        # unresolved and the scan counts pass through as lb-bot sent them.
+        proxy._cache.clear()
+        DISCO[0] = {"indexed": True, "releases": [], "unresolved": True,
+                    "scan": {"state": "done", "done": 0, "total": 0, "taskId": "t-scan"}}
+        _s, _h, disc = get("/lb/artist/discography?nd_id=nd7")
+        got = json.loads(disc)
+        if got.get("unresolved") is not True or got.get("scan") != DISCO[0]["scan"]:
+            failures.append(f"unresolved/scan did not survive the relay: {got!r}")
+        DISCO[0] = None
+        # findIt_survives on the album meta (a 6 h cached route).
+        _s, _h, meta = get("/lb/meta/album?rgid=rg1")
+        if json.loads(meta).get("findIt") != FIND_IT:
+            failures.append(f"findIt did not survive /lb/meta/album: {meta[:200]!r}")
+        _s, _h, meta = get("/lb/meta/album?rgid=rg1")
+        if json.loads(meta).get("findIt") != FIND_IT:
+            failures.append(f"findIt did not survive /lb/meta/album's cache: {meta[:200]!r}")
+        # downloads_off_409_relayed: the code reaches the client and the refusal
+        # is not cached.
+        proxy._cache.clear()
+        for method, route, args in (
+                ("GET", "/lb/album/sources?rgid=rg1", None),
+                ("POST", "/lb/album/download", {"rgid": "rg1", "release_mbid": "m1"}),
+                ("POST", "/lb/gap/search", {"group_id": "g1"}),
+                ("POST", "/lb/gap/auto", {"group_id": "g1"}),
+                ("POST", "/lb/gap/fetch", {"group_id": "g1", "sourceId": 0}),
+                ("GET", "/lb/gap/source-files?group_id=g1&source_index=0", None)):
+            for attempt in range(2):
+                HITS.clear()
+                status, _h, body = get(route) if method == "GET" else post(route, args)
+                if status != 409 or json.loads(body) != DOWNLOADS_OFF:
+                    failures.append(f"{method} {route}: lb-bot's 409 downloads_off came back as "
+                                    f"{status} {body[:120]!r}")
+                if not HITS:
+                    failures.append(f"{method} {route}: the 409 was answered from the cache")
+
         # --- a refused POST must NOT evict (nothing changed) ----------------
         NEXT_POST[0] = (409, {"error": "busy", "code": "busy"})
         get("/lb/overrides")
@@ -331,7 +394,9 @@ def main() -> int:
         return 1
     print("PASS - lb override routes: reachable/body-allowlist/GET-cached/POST-evicts"
           "-map-and-discography/409-evicts-nothing/error-bodies-pass-through/advertised/"
-          "scan-running-discography-not-cached/scan-post-drops-cached-discography")
+          "scan-running-discography-not-cached/scan-post-drops-cached-discography/"
+          "nd_id-scan-passes/unresolved-and-scan-counts-pass/findIt-survives/"
+          "downloads-off-409-relayed")
     return 0
 
 

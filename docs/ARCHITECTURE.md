@@ -302,9 +302,11 @@ keeps it working locally but sets `previewCastable: false`, which both clients m
 ### lb-bot — library-gap intelligence
 A separate self-hosted service (its own repository) that indexes each artist's full
 MusicBrainz discography, knows which releases the library lacks, and can acquire one from Soulseek
-and place it. Reached **only through the hub** (`<hub>/lb/*`, `PROTOCOL.md` §15,
-its own Flask API has no authentication and binds
-`0.0.0.0:8899`, so unlike AudioMuse there is deliberately **no direct-LAN fallback**. `LBBOT_URL`
+and place it (downloading is an opt-in mode since Worbus P1: off without an slskd key, `PROTOCOL.md`
+§15.7). Reached **only through the hub** (`<hub>/lb/*`, `PROTOCOL.md` §15), so unlike AudioMuse there is
+deliberately **no direct-LAN fallback**. lb-bot's own web UI and API sit behind the Navidrome login since
+Worbus P1 (before it they had no authentication at all); the hub calls them as a trusted service with
+`Authorization: Bearer <HUB_TOKEN>`, the same secret lb-bot sends back as `LB_BOT_HUB_TOKEN`. `LBBOT_URL`
 unset = the whole surface hides. Whitelisted routes cover the instant discography read, the
 explicit "index this artist" scan, album editions/tracklist/similar, the one-tap download, a
 scoped download-status poll, and the per-album gap actions below.
