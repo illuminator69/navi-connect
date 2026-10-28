@@ -2219,6 +2219,11 @@ class SonicProxy(HttpProxy):
 # lb-bot can be megabytes and never carries the field; it is not parsed on the
 # event loop for nothing).
 LB_DOWNLOADS_VALUES = ("on", "off")
+# How often the hub may say, in its log, that lb-bot refused its token (401).
+# lb-bot's `/api/health` stays open behind its login, so the probe reads such an
+# lb-bot as available while every proxied route answers 401: without this line
+# the only symptom is clients failing route by route.
+LB_REFUSED_LOG_INTERVAL = 600.0
 LB_HEALTH_PARSE_MAX = 64 * 1024
 _LB_KEEP = object()   # `_set_available`'s "leave `downloads` as it is"
 
@@ -2260,6 +2265,7 @@ class LbProxy(HttpProxy):
         # inbound push that marks it alive again after a restart must not
         # advertise "on" (absent) to clients until the next probe.
         self.downloads: Optional[str] = None
+        self._refused_logged_at = -math.inf
         self._probed = asyncio.Event()
         self._announcing: set[asyncio.Task] = set()
 
@@ -2427,7 +2433,19 @@ class LbProxy(HttpProxy):
         Checks the `down`/`busy` flag, not just the status code: a 502 also covers
         `tooLarge` (lb-bot answered fine, its body was just oversize) — not a
         reachability signal, and must not flip the verdict or drop the cache.
+
+        Worbus P1: a 401 is lb-bot behind its login refusing the hub's bearer,
+        i.e. its `LB_BOT_HUB_TOKEN` is not this `HUB_TOKEN`. The 401 is relayed to
+        the client as it came; the hub says why in its log, at most once per
+        `LB_REFUSED_LOG_INTERVAL`, naming the setting and never the value.
         """
+        if upstream_status == 401:
+            now = time.monotonic()
+            if now - self._refused_logged_at >= LB_REFUSED_LOG_INTERVAL:
+                self._refused_logged_at = now
+                log("lbbot refused the hub's call (401): lb-bot's LB_BOT_HUB_TOKEN must "
+                    "be this hub's HUB_TOKEN")
+            return
         if upstream_status not in (502, 504):
             return
         try:

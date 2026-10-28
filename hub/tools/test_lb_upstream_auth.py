@@ -16,6 +16,11 @@ A real hub subprocess against a stub lb-bot that records the header it gets:
   route and a POST route all carry `Bearer <HUB_TOKEN>`, and all three answer.
 - `old_lbbot_ignores_it`: the stub requires nothing (an lb-bot from before the
   login). The same calls answer exactly what the stub says, as they did before.
+- `refused_token_is_named_in_the_log` (in-process): an lb-bot whose
+  `LB_BOT_HUB_TOKEN` differs answers 401 on every route while its open
+  `/api/health` reads it as up. The 401 reaches the client unchanged, and the
+  hub's log says which setting to fix, once per `LB_REFUSED_LOG_INTERVAL`,
+  without the token.
 
 Exits non-zero on failure.
 """
@@ -173,6 +178,38 @@ def case_old_lbbot_ignores_it(port: int) -> list[str]:
     return failures
 
 
+def case_refused_token_is_named_in_the_log() -> list[str]:
+    sys.path.insert(0, HUB_DIR)
+    os.environ.setdefault("HUB_TOKEN", TOKEN)
+    import hub  # noqa: PLC0415 — in-process half, after the subprocess one
+    failures: list[str] = []
+    lines: list[str] = []
+    original_log, original_call = hub.log, hub._proxy_upstream_blocking
+    original_up = type(hub.LB).upstream
+    hub.log = lambda *a: lines.append(" ".join(str(x) for x in a))
+    hub._proxy_upstream_blocking = lambda *a, **k: (
+        401, b'{"code":"signin_required"}', "application/json")
+    type(hub.LB).upstream = property(lambda self: "http://lb.invalid")
+    route = ("GET", "/lb/wishlist")
+    try:
+        lb = hub.LbProxy()
+        answers = [asyncio.run(lb.call(route, hub.LB_ROUTES[route], [], None))
+                   for _ in range(3)]
+    finally:
+        hub.log, hub._proxy_upstream_blocking = original_log, original_call
+        type(hub.LB).upstream = original_up
+    if any(a[:2] != (401, b'{"code":"signin_required"}') for a in answers):
+        failures.append(f"refused_token_is_named_in_the_log: the 401 was not relayed as is: "
+                        f"{[a[:2] for a in answers]!r}")
+    named = [ln for ln in lines if "LB_BOT_HUB_TOKEN" in ln]
+    if len(named) != 1:
+        failures.append(f"refused_token_is_named_in_the_log: {len(named)} log lines name the "
+                        f"setting after three refused calls, expected 1: {lines!r}")
+    if any(hub.TOKEN in ln for ln in lines):
+        failures.append("refused_token_is_named_in_the_log: the log carries the token itself")
+    return failures
+
+
 def main() -> int:
     upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeLbBot)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
@@ -192,6 +229,7 @@ def main() -> int:
         time.sleep(0.3)
         failures += case_probe_and_routes_send_bearer(port)
         failures += case_old_lbbot_ignores_it(port)
+        failures += case_refused_token_is_named_in_the_log()
     finally:
         proc.terminate()
         try:
@@ -208,7 +246,8 @@ def main() -> int:
         print(f"FAIL - {f}")
     if failures:
         return 1
-    print("PASS - lb upstream auth: probe_and_routes_send_bearer/old_lbbot_ignores_it")
+    print("PASS - lb upstream auth: probe_and_routes_send_bearer/old_lbbot_ignores_it/"
+          "refused_token_is_named_in_the_log")
     return 0
 
 
