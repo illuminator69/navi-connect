@@ -325,6 +325,8 @@ STATION_TRAIL_MAX = 20                # artist keys kept for the spacing rule
 # One request's budget, end to end. Under Feishin's 15 s IPC timeout and Navic's
 # 20 s; what is found by then is answered with `partial: true`.
 STATION_BUDGET_S = 12.0
+MOOD_LATE_S = 2.0                     # a start whose mood list lands with less budget left
+                                      # than this answers 409 `building`, not a thin station
 STATION_CALL_TIMEOUT = 8.0            # one AudioMuse or Navidrome call
 STATION_COMPUTING_MAX = 2             # stations computing at once
 STATION_CALLS_PER_REQUEST = 2         # upstream calls in flight for one request
@@ -1815,7 +1817,8 @@ class HttpProxy:
         """The second lock on a screen route's failure (`spec["error_keys"]`): lb-bot's
         500 body is `str(e)`, which can carry a path, a trace or a token, and `_strip`
         runs on a 200 only. A non-200 answer keeps just those keys, `error` cut at
-        200 characters; anything else (not JSON, a list, no usable `error`) becomes
+        200 characters and `code` at 64, `down`/`busy` only as booleans; anything else
+        (not JSON, a list, no usable `error`) becomes
         `{"error": "lb-bot answered <status>"}`. A body that already is that shape is
         returned byte for byte, so a 404 with no `code` stays what the clients' "older
         lb-bot" rule reads."""
@@ -1829,8 +1832,15 @@ class HttpProxy:
             return plain
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), str):
             return plain
-        out = {k: payload[k] for k in keys
-               if k in payload and isinstance(payload[k], (str, int, float, bool))}
+        out = {}
+        for k in keys:
+            v = payload.get(k)
+            if k in ("down", "busy"):
+                keep = isinstance(v, bool)      # the hub's own 502/504 flags, nothing else
+            else:
+                keep = isinstance(v, (str, int, float, bool))
+            if keep:
+                out[k] = v[:64] if k == "code" and isinstance(v, str) else v
         out["error"] = payload["error"][:200]
         return data if out == payload else json.dumps(out).encode()
 
@@ -4268,6 +4278,11 @@ class StationEngine:
         b = _StationBatch(deadline)
         if (mood or mood_filter) and not await self._mood_ready(mood or mood_filter, b):
             return 409, self._mood_unavailable(b)
+        if (mood or mood_filter) and b.left() < MOOD_LATE_S:
+            # The list landed with almost none of the budget left (§18.4): a ladder
+            # with that little time makes a thin `partial` station, or fails every tier
+            # and answers 503. The list is in memory now: the next ask is served whole.
+            return 409, {**self._MOOD_UNAVAILABLE, "building": True}
         count = _as_int(body.get("count"), 20, 1, 50)
         exclude = self._parse_exclude(body.get("exclude"))
         device = _as_str(body.get("deviceId"), 128)
@@ -5042,7 +5057,7 @@ class MoodService:
                     # it could not embed) is not an answer: stored, it would make
                     # an empty "ready" mood and a station with no songs.
                     rows = None
-                    log("moods: a search answered no rows")
+                    dlog("moods: a search answered no rows")
             if rows is None:
                 self._note_failure(status, raw)
                 dlog(f"moods: a search failed ({status})")

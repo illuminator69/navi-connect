@@ -60,7 +60,7 @@ FORBIDDEN = {"name", "path", "identifyError", "filename", "title"}
 # listenbrainz_bot.py; PROTOCOL §15.6), as field -> type, for the fixtures below. A
 # fixture with another shape tests a view lb-bot never sends: it had `formats` as a
 # list and `confidence` as a number (live 2026-10-22: a string, and a word).
-CONFIDENCE_WORDS = ("unknown", "likely", "possible")
+CONFIDENCE_WORDS = ("unknown", "likely", "possible", "exact")
 ATTENTION_TYPES = {
     "counts": {"failedGaps": int, "failedRequests": int, "folders": int,
                "foldersUnidentified": int, "picks": int},
@@ -328,9 +328,9 @@ def main() -> int:
 
         # --- error bodies are narrowed to {error, code} (H5) ------------------------
         # lb-bot's 500 body is str(e): it can carry a path, a trace or a token. Only
-        # `error` (cut at 200 characters) and `code` leave the hub; a 404 with no
-        # `code` stays exactly what it was, because the clients' "older lb-bot" rule
-        # is a 404 with no code.
+        # `error` (cut at 200 characters), `code` (cut at 64) and the booleans `down` /
+        # `busy` leave the hub; a 404 with no `code` stays exactly what it was, because
+        # the clients' "older lb-bot" rule is a 404 with no code.
         leaky = json.dumps({"error": "x", "trace": "/config/lb_bot_state.json line 4",
                             "token": "t0ken", "chat_id": 42}).encode()
         for route in ("/lb/attention", "/lb/activity"):
@@ -347,6 +347,17 @@ def main() -> int:
                  {"error": "lb-bot answered 500"}),
                 ("a_non_string_error", 500, b'{"error": {"path": "/config/x"}}',
                  {"error": "lb-bot answered 500"}),
+                ("down_and_busy_survive_as_booleans", 502,
+                 json.dumps({"error": "x", "down": True, "busy": False}).encode(),
+                 {"error": "x", "down": True, "busy": False}),
+                ("a_non_boolean_busy_is_dropped", 500,
+                 json.dumps({"error": "x", "busy": "/config/lb_bot_state.json: locked"}).encode(),
+                 {"error": "x"}),
+                ("a_non_boolean_down_is_dropped", 500,
+                 json.dumps({"error": "x", "down": 1}).encode(), {"error": "x"}),
+                ("a_long_code_is_cut", 409,
+                 json.dumps({"error": "x", "code": "c" * 500}).encode(),
+                 {"error": "x", "code": "c" * 64}),
             )
             for name, code, raw, want in cases:
                 ERR_BODY[0] = raw

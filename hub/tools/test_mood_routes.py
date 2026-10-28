@@ -555,14 +555,25 @@ async def inprocess_checks(failures):
 
 async def empty_checks(failures):
     """Case 8: a 200 whose `results` is empty is not an answer. The hub says so in its
-    log; that output is captured here and checked, not left on the console."""
+    diagnostic log (dlog, HUB_DEBUG only: while CLAP loads it would repeat once per mood
+    per retry); that output is captured here and checked, not left on the console."""
     import contextlib
     import io
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        await _empty_checks(failures)
-    if "moods: a search answered no rows" not in buf.getvalue():
-        failures.append("empty answer: the hub did not log it")
+    line = "moods: a search answered no rows"
+    old_debug = hubmod.DEBUG
+    try:
+        for debug in (False, True):
+            hubmod.DEBUG = debug
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                await _empty_checks(failures)
+            said = line in buf.getvalue()
+            if debug and not said:
+                failures.append("empty answer: the hub did not log it under HUB_DEBUG")
+            if not debug and said:
+                failures.append("empty answer: the hub logged it without HUB_DEBUG (log, not dlog)")
+    finally:
+        hubmod.DEBUG = old_debug
 
 
 async def _empty_checks(failures):

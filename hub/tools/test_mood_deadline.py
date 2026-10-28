@@ -14,7 +14,8 @@ Cases:
                              budget; the build finishes in the background (4 searches),
                              a second start answers 200 with relax's rows and asks
                              no fifth search
-  plain_start_not_blocked    a plain start answers 200 while mood asks are building
+  plain_start_not_blocked    two `next` calls on mood-filter stations hold both computing slots
+                             while the list builds; a plain start is not answered 503 busy
   filter_branch_bounded      a radio with moodFilter: start -> 409 + building; the
                              ladder's own filter branch -> empty and partial, never the
                              neighbours unfiltered
@@ -24,6 +25,9 @@ Cases:
   follower_not_cancelled     two asks for one building mood: neither is handed a
                              CancelledError, and the build still lands
   failure_is_not_building    a refused search answers 409 without `building`
+  late_landing               a mood list that lands with less than MOOD_LATE_S of the budget
+                             left: start answers 409 + building, not a thin partial station;
+                             a list landing early, or already built, is served
 
 Exits non-zero on failure.
 """
@@ -155,17 +159,25 @@ async def case_start_within_budget(failures, fake):
 
 
 async def case_plain_start_not_blocked(failures, fake):
+    """The live cause of the 503: two `next` calls on mood-filter stations whose list is
+    still building hold both _computing slots (the wait is INSIDE the slot), and a plain
+    start then found "computing two stations already". Only "not 503 busy" is asserted:
+    the slots' budget and the plain start's are equal, so how many tracks it gets is a race."""
     hub, eng, svc = make_engine()
-    moods = [asyncio.ensure_future(eng.start(start_body(mood="relax"))) for _ in range(3)]
-    moods.append(asyncio.ensure_future(eng.count(
-        {"seed": {"kind": "track", "ids": ["L00_0"]}, "moodFilter": "relax"})))
+    held = []
+    for n in range(2):
+        st = station(f"held{n}", mood_filter="relax")
+        eng.stations[st.id] = st
+        held.append(asyncio.ensure_future(eng.next({"stationId": st.id, "after": 0})))
     await asyncio.sleep(0.05)
+    if eng._computing._value != 0:
+        failures.append(f"plain_start_not_blocked: the two nexts do not hold the slots "
+                        f"({eng._computing._value} free) - the case does not reproduce")
     (status, body), took = await timed(eng.start(start_body()))
-    if status != 200 or not body.get("tracks"):
-        failures.append(f"plain_start_not_blocked: {status} {str(body)[:160]}")
-    if took > BUDGET + 0.5:
-        failures.append(f"plain_start_not_blocked: took {took:.2f} s")
-    await asyncio.gather(*moods, return_exceptions=True)
+    if status == 503 and body.get("busy"):
+        failures.append(f"plain_start_not_blocked: 503 busy while two nexts wait on a "
+                        f"building mood: {str(body)[:160]}")
+    await asyncio.gather(*held, return_exceptions=True)
     await drain(svc)
 
 
@@ -262,6 +274,35 @@ async def case_failure(failures, fake):
     await drain(svc)
 
 
+async def case_late_landing(failures, fake):
+    """A list that lands with almost none of the budget left is not served as a thin
+    station: `start` answers 409 mood_unavailable + building (the list is in memory for
+    the next ask). MOOD_LATE_S is shortened to 0.2 s of the 0.3 s budget; four serial
+    searches of 0.05 s land the list at about 0.2 s, i.e. with 0.1 s left."""
+    hubmod.MOOD_LATE_S = 0.2
+    fake.delay = 0.05
+    for key, extra in (("mood", {"mood": "relax"}), ("moodFilter", {"moodFilter": "relax"})):
+        hub, eng, svc = make_engine()
+        res, took = await timed(eng.start(start_body(**extra)))
+        expect_building(failures, f"late_landing ({key})", res, took)
+        if "relax" not in svc._merged:
+            failures.append(f"late_landing ({key}): the list did not land in the case")
+        # Control: a list that is already built leaves the whole budget, so it serves.
+        (status, body), took = await timed(eng.start(start_body(**extra)))
+        # (a filter's rows are Mxxx, the neighbours Nxxx: a filtered station can be empty)
+        if status != 200 or (key == "mood" and not body.get("tracks")):
+            failures.append(f"late_landing ({key}): a built list was not served: "
+                            f"{status} {str(body)[:160]}")
+        await drain(svc)
+    # Control: a list that lands early (nothing slow) leaves more than MOOD_LATE_S.
+    fake.delay = 0.0
+    hub, eng, svc = make_engine()
+    (status, body), took = await timed(eng.start(start_body(mood="relax")))
+    if status != 200 or not body.get("tracks"):
+        failures.append(f"late_landing: an early list was answered {status} {str(body)[:160]}")
+    await drain(svc)
+
+
 async def drain(svc, limit=20.0):
     """Until nothing builds in the background."""
     end = time.monotonic() + limit
@@ -275,8 +316,10 @@ async def main():
     hubmod.STATE_PATH = os.path.join(tempfile.mkdtemp(prefix="mood-deadline-"), "state.json")
     hubmod.AUDIOMUSE_URL = "http://audiomuse.invalid"
     hubmod.STATION_BUDGET_S = BUDGET
+    hubmod.MOOD_LATE_S = 0.0     # only case_late_landing turns the rule on
     for case in (case_start_within_budget, case_plain_start_not_blocked, case_filter_branch,
-                 case_nearest, case_count, case_signal, case_follower, case_failure):
+                 case_nearest, case_count, case_signal, case_follower, case_failure,
+                 case_late_landing):
         fake = Fake()
         hubmod.SONIC.call = fake.call
         try:
@@ -290,7 +333,7 @@ async def main():
         sys.exit(1)
     print("PASS - mood deadline: start-409-building-inside-budget+build-lands+second-start-200-"
           "no-fifth-search/plain-start-not-blocked/filter-branch+nearest+count+signal-bounded/"
-          "follower-not-cancelled/failure-is-not-building")
+          "follower-not-cancelled/failure-is-not-building/late-landing-409")
 
 
 if __name__ == "__main__":
