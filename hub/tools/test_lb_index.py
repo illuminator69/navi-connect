@@ -133,11 +133,12 @@ def request(port: int, path: str, method: str = "GET", body=None,
         return None, repr(e).encode(), time.monotonic() - started
 
 
-def spawn(port: int, state: str, lbbot_url: str):
+def spawn(port: int, state: str, lbbot_url: str, **extra: str):
     env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_HEALTH_PORT": str(_free_port()), "HUB_HOST": "127.0.0.1",
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state,
-           "PROXY_QUEUE_TIMEOUT_FAST": str(QUEUE_TIMEOUT), "LBBOT_URL": lbbot_url}
+           "PROXY_QUEUE_TIMEOUT_FAST": str(QUEUE_TIMEOUT), "LBBOT_URL": lbbot_url,
+           **extra}
     return subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR)
 
 
@@ -416,6 +417,13 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
         # progress_kept_in_hint_welcome_and_frame: the head did not move, only
         # the progress did; unknown keys go and `current` is cut at 200.
         long_name = "A" + "b" * 300
+        # progress_only_push_invalidates_nothing (review finding 3): the head
+        # did not move, so no cached read is stale; the frame still goes out.
+        request(port, "/lb/artist/discography?nd_id=a1")
+        request(port, "/lb/overrides")
+        with hits_lock:
+            disco_before = hits.get("/api/artist/discography", 0)
+            ovr_before = hits.get("/api/overrides", 0)
         st, idx = await push_and_frames({"seq": 42, "epoch": "1-deadbeef",
                                          "progress": {"unindexed": 12, "total": 40,
                                                       "current": long_name, "path": "/m"}})
@@ -427,6 +435,13 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
         got = (await welcome_of(port, "w-prog")).get("lbIndex")
         if got != {"seq": 42, "epoch": "1-deadbeef", "progress": want_prog}:
             failures.append(f"welcome.lbIndex after a progress push = {got!r}")
+        request(port, "/lb/artist/discography?nd_id=a1")
+        request(port, "/lb/overrides")
+        with hits_lock:
+            if (hits.get("/api/artist/discography", 0), hits.get("/api/overrides", 0)) != (
+                    disco_before, ovr_before):
+                failures.append("a progress-only push (same seq and epoch) dropped the "
+                                "discography or override cache")
 
         # malformed_progress_dropped_push_accepted: each is a 200, the head is
         # taken, and the hint (welcome, frame) carries no progress.
@@ -447,6 +462,11 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
         got = (await welcome_of(port, "w-bad")).get("lbIndex")
         if got != {"seq": 50 + len(malformed) - 1, "epoch": "1-deadbeef"}:
             failures.append(f"welcome.lbIndex after malformed progress = {got!r}")
+        # ...and a push whose seq moved still drops them.
+        request(port, "/lb/artist/discography?nd_id=a1")
+        with hits_lock:
+            if hits.get("/api/artist/discography", 0) != disco_before + 1:
+                failures.append("pushes whose seq moved left the discography cache in place")
 
         # A missing or null `current` is "", not malformed.
         st, idx = await push_and_frames({"seq": 60, "epoch": "1-deadbeef",
@@ -531,6 +551,83 @@ async def phase_old_lbbot(port: int) -> list[str]:
                         f"{(first.get('lb') or {}).get('downloads')!r}")
     if s == 200 and "downloads" in json.loads(b):
         failures.append(f"an old lb-bot's /lb/status carries downloads: {b[:120]!r}")
+    return failures
+
+
+HARD_KILL_THROTTLE = 3.0   # HUB_LB_INDEX_SAVE_S for phase_hard_kill
+
+
+async def wait_listening(port: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        # A whole HTTP request: a bare connect makes the hub log an EOFError.
+        status, _b, _e = await asyncio.to_thread(request, port, "/lb/status", timeout=1)
+        if status is not None:
+            return
+        await asyncio.sleep(0.1)
+
+
+async def phase_hard_kill(port: int, lb_url: str) -> list[str]:
+    """Review finding 2: the hint on disk after a crash (SIGKILL, no graceful
+    flush), with LB_INDEX_SAVE_THROTTLE scaled to HARD_KILL_THROTTLE.
+
+    final_progress_saved_at_once: a build's last pushes land inside one throttle
+    window, the last saying `unindexed: 0`; killed at once, the restarted hub
+    must not show the count from the first of them. trailing_save_after_burst:
+    a throttled push that is not an edge is on disk one window later."""
+    failures: list[str] = []
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    os.unlink(state)   # a hub with no state file yet
+    epoch = "9-hardkill"
+
+    def push(seq: int, unindexed: int) -> None:
+        s, b, _e = request(port, "/lb/index", "POST",
+                           {"seq": seq, "epoch": epoch,
+                            "progress": {"unindexed": unindexed, "total": 10,
+                                         "current": f"a{seq}"}})
+        if s != 200:
+            failures.append(f"hard-kill push seq {seq} answered {s} {b[:80]!r}")
+
+    try:
+        proc = spawn(port, state, lb_url, HUB_LB_INDEX_SAVE_S=str(HARD_KILL_THROTTLE))
+        try:
+            await wait_listening(port)
+            push(1, 5)    # a new epoch: saved at once
+            push(2, 3)    # throttled
+            push(3, 0)    # the build's end, inside the same window
+        finally:
+            proc.kill()   # SIGKILL: no graceful flush
+            proc.wait(timeout=5)
+        proc = spawn(port, state, lb_url, HUB_LB_INDEX_SAVE_S=str(HARD_KILL_THROTTLE))
+        try:
+            await wait_listening(port)
+            got = (await welcome_of(port, "hk1")).get("lbIndex")
+            want = {"seq": 3, "epoch": epoch,
+                    "progress": {"unindexed": 0, "total": 10, "current": "a3"}}
+            if got != want:
+                failures.append(f"final_progress_saved_at_once: after a SIGKILL the restarted "
+                                f"hub's lbIndex is {got!r}, expected {want!r}")
+            push(4, 0)    # the first push of a process: saved at once (leading edge)
+            push(5, 2)    # throttled, not an edge (a count that moved): trailing save
+            await asyncio.sleep(HARD_KILL_THROTTLE + 1.0)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        proc = spawn(port, state, lb_url, HUB_LB_INDEX_SAVE_S=str(HARD_KILL_THROTTLE))
+        try:
+            await wait_listening(port)
+            got = (await welcome_of(port, "hk2")).get("lbIndex")
+            if (got or {}).get("seq") != 5:
+                failures.append(f"trailing_save_after_burst: a throttled push was not on disk "
+                                f"{HARD_KILL_THROTTLE + 1.0:.0f} s later: lbIndex {got!r}")
+        finally:
+            stop(proc)
+    finally:
+        for path in (state, state + ".bak", state + ".tmp"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     return failures
 
 
@@ -677,6 +774,47 @@ async def unit_checks() -> list[str]:
             failures.append("off -> garbage should broadcast one frame without downloads, got "
                             f"{[f.get('downloads', 'absent') for f in fake.frames]!r}")
 
+        # ----- missing_config_logged_on_change (review nit 7) ------------ #
+        # lb-bot's `missingConfig` is logged once each time it changes, names
+        # only; never relayed, never a broadcast of its own.
+        lines: list[str] = []
+        original_log = hub.log
+        hub.log = lambda *a: lines.append(" ".join(str(x) for x in a))
+        try:
+            lb = hub.LbProxy()
+            seq = [({"ok": True, "downloads": "on"}, 0),               # older: no list
+                   ({"ok": True, "downloads": "on", "missingConfig": []}, 0),
+                   ({"ok": True, "downloads": "on",
+                     "missingConfig": ["LB_BOT_HUB_URL", "NAVIDROME_PASSWORD"]}, 1),
+                   ({"ok": True, "downloads": "on",
+                     "missingConfig": ["NAVIDROME_PASSWORD", "LB_BOT_HUB_URL"]}, 0),
+                   ({"ok": True, "downloads": "on",
+                     "missingConfig": ["NAVIDROME_PASSWORD", "hunter2=secret", 7,
+                                       "LB_BOT_HUB_URL"]}, 0),
+                   ({"ok": True, "downloads": "on", "missingConfig": ["NAVIDROME_PASSWORD"]}, 1),
+                   ({"ok": True, "downloads": "on"}, 0),               # stopped saying
+                   ({"ok": True, "downloads": "on", "missingConfig": []}, 1)]
+            for i, (health, want) in enumerate(seq):
+                lines.clear()
+                fake.frames.clear()
+                answers.append((200, body(health)))
+                await lb.probe()
+                await settle()
+                said = [ln for ln in lines if "required settings" in ln]
+                if len(said) != want:
+                    failures.append(f"missingConfig step {i}: {len(said)} log line(s) {said!r}, "
+                                    f"expected {want}")
+                if any("hunter2" in ln or "secret" in ln for ln in lines):
+                    failures.append(f"missingConfig step {i}: a non-name entry reached the log")
+                if "missingConfig" in lb.welcome_info() or any(
+                        "missingConfig" in f for f in fake.frames):
+                    failures.append(f"missingConfig step {i}: relayed on the wire")
+                if i == 2 and said and not ("LB_BOT_HUB_URL" in said[0]
+                                            and "NAVIDROME_PASSWORD" in said[0]):
+                    failures.append(f"missingConfig: the log line does not name both: {said!r}")
+        finally:
+            hub.log = original_log
+
         # ----- the probe's own health call is short; the fallback is not -- #
         timeouts.clear()
         answers.extend([404, 200])
@@ -789,6 +927,8 @@ async def run() -> list[str]:
         finally:
             stop(proc)
 
+        failures += await phase_hard_kill(port, lb_url)
+
         mode["health"] = 404
         fresh = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
         with hits_lock:
@@ -825,7 +965,9 @@ def main() -> int:
           "downloads-relayed-on-welcome-frame-and-status/downloads-flip-broadcasts-once/"
           "health-without-downloads-omits-the-key/garbage-downloads-ignored/"
           "progress-kept-in-hint-welcome-and-frame/malformed-progress-dropped-push-accepted/"
-          "push-without-progress-unchanged/progress-survives-restart-from-state")
+          "push-without-progress-unchanged/progress-survives-restart-from-state/"
+          "missing-config-logged-on-change/progress-only-push-invalidates-nothing/"
+          "final-progress-saved-at-once/trailing-save-after-burst")
     return 0
 
 

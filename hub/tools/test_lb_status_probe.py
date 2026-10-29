@@ -240,10 +240,76 @@ async def run_downloads() -> list[str]:
     return failures
 
 
+async def run_status_follows_verdict() -> list[str]:
+    """Review finding 4, `lb_status_follows_a_probe_change`: `/lb/status` and
+    `welcome.lb` are one object. When the hub's own probe (or an inbound push)
+    changes it, a client's next `/lb/status` must not hand back the copy cached
+    before the change for up to PROXY_CACHE_TTL; an unchanged verdict keeps the
+    cache (the probe runs every 60 s)."""
+    failures: list[str] = []
+    probe = ("GET", "/lb/status")
+    spec = hub.LB_ROUTES[probe]
+    original = hub._proxy_upstream_blocking
+    original_upstream = type(hub.LB).upstream
+    type(hub.LB).upstream = property(lambda self: "http://lb.invalid")
+    health = [b'{"ok": true, "downloads": "on"}']
+    status = [200]
+    calls: list[str] = []
+
+    def upstream(method, url, payload, token, timeout, label):
+        calls.append(url)
+        return status[0], health[0], "application/json"
+
+    hub._proxy_upstream_blocking = upstream
+    try:
+        hub.LB._cache.clear()
+        hub.LB.downloads = None
+        await hub.LB.probe()
+        _s, b1, _c = await hub.LB.call(probe, spec, [], None)
+        n = len(calls)
+        _s, b2, _c = await hub.LB.call(probe, spec, [], None)
+        if len(calls) != n or json.loads(b2).get("downloads") != "on":
+            failures.append("setup: /lb/status was not cached with downloads \"on\"")
+        await hub.LB.probe()   # same answer: the cache stays
+        n = len(calls)
+        await hub.LB.call(probe, spec, [], None)
+        if len(calls) != n:
+            failures.append("an unchanged probe answer dropped /lb/status's cache")
+        # lb-bot restarted without its slskd key: the probe sees "off".
+        health[0] = b'{"ok": true, "downloads": "off"}'
+        await hub.LB.probe()
+        if hub.LB.welcome_info().get("downloads") != "off":
+            failures.append("setup: the probe did not move welcome.lb.downloads")
+        _s, b3, _c = await hub.LB.call(probe, spec, [], None)
+        if json.loads(b3).get("downloads") != "off":
+            failures.append(f"/lb/status answered {json.loads(b3).get('downloads')!r} from its "
+                            "cache after the probe broadcast \"off\"")
+        # And the read that went upstream is cached again.
+        n = len(calls)
+        await hub.LB.call(probe, spec, [], None)
+        if len(calls) != n:
+            failures.append("/lb/status was not cached again after the change")
+        # The probe finds lb-bot gone (a 503 health): the cached "reachable"
+        # must not answer the next status read.
+        status[0] = 503
+        await hub.LB.probe()
+        _s, b4, _c = await hub.LB.call(probe, spec, [], None)
+        if json.loads(b4).get("upstreamReachable") is not False:
+            failures.append("/lb/status answered reachable from its cache after the probe "
+                            "broadcast available: false")
+    finally:
+        hub._proxy_upstream_blocking = original
+        type(hub.LB).upstream = original_upstream
+        hub.LB._cache.clear()
+        hub.LB.downloads = None
+    return failures
+
+
 def main() -> int:
     failures = asyncio.run(run())
     failures += asyncio.run(run_failure_propagation())
     failures += asyncio.run(run_downloads())
+    failures += asyncio.run(run_status_follows_verdict())
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -251,7 +317,8 @@ def main() -> int:
     print("PASS - lb status probe: failure-not-cached/success-cached/refused-is-502-down/"
           "timeout-is-504-busy/write-invalidates-its-read/"
           "other-route-down-flips-verdict/other-route-busy-only-drops-status-cache/"
-          "tooLarge-is-not-a-failure/lb-status-carries-downloads")
+          "tooLarge-is-not-a-failure/lb-status-carries-downloads/"
+          "lb-status-follows-a-probe-change")
     return 0
 
 

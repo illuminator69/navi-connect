@@ -15,9 +15,11 @@ route table cannot:
     map and the cached discography, while a refused POST (409) evicts neither;
   - all three are advertised, which is what clients gate the surface on;
   - lb-bot's 400 / 404 / 409 / 502 bodies reach the client with their status;
-  - (Worbus P1) a discography whose scan is running is never served from the
-    cache, and Scan now (`POST /lb/artist/discography`) drops the cached read, so
-    a page polling the scan's counts sees them move;
+  - (Worbus P1) a discography whose scan is running is cached only
+    LB_SCAN_RUNNING_TTL (two reads inside it cost one upstream call, a read after
+    it sees the counts move), and Scan now (`POST /lb/artist/discography`) drops
+    the cached read and caches none for LB_SCAN_FRESH_WINDOW, so an lb-bot that
+    answers "no scan" just after the POST is asked again on the next poll;
   - (Worbus P1, H4) the new fields need no route-table change: a scan by
     `{nd_id}` alone reaches lb-bot as `{nd_id}`, `unresolved` and `scan`'s counts
     and the album meta's `findIt` survive the relay as lb-bot sent them, and a
@@ -33,6 +35,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 os.environ.setdefault("HUB_TOKEN", "test-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -206,22 +209,38 @@ def main() -> int:
             if json.loads(disc).get("rev") != REVISION[0]:
                 failures.append(f"{route}: discography read after the POST was stale")
 
-        # --- Worbus P1: a running scan's discography is read fresh -----------
-        # scan_running_discography_not_cached: while `scan.state` is running,
-        # every read goes upstream and the counts move; once it is done, the
-        # answer is cached as before.
-        proxy._cache.clear()
-        DISCO[0] = {"indexed": False, "unresolved": False,
-                    "scan": {"state": "running", "done": 0, "total": 9}}
-        dones = []
-        for _ in range(3):
-            HITS.clear()
-            _s, _h, disc = get("/lb/artist/discography?nd_id=nd5")
-            dones.append(json.loads(disc).get("scan", {}).get("done"))
-            if not HITS:
-                failures.append("a discography with a running scan was served from the cache")
-        if dones != sorted(set(dones)) or len(dones) != 3:
-            failures.append(f"scan counts read through the hub did not move: {dones}")
+        # --- Worbus P1: a running scan's discography is read nearly fresh ----
+        # scan_running_discography_short_ttl: while `scan.state` is running, an
+        # answer is kept LB_SCAN_RUNNING_TTL (scaled down here): a second read
+        # inside it costs nothing upstream, a read after it goes upstream and
+        # the counts move; once the scan is done, the answer is cached as before.
+        if hub.LB_SCAN_RUNNING_TTL > 3.0:
+            failures.append(f"LB_SCAN_RUNNING_TTL = {hub.LB_SCAN_RUNNING_TTL}; Navic polls "
+                            "every 3 s and must see the counts move")
+        original_running_ttl = hub.LB_SCAN_RUNNING_TTL
+        hub.LB_SCAN_RUNNING_TTL = 0.3
+        try:
+            proxy._cache.clear()
+            DISCO[0] = {"indexed": False, "unresolved": False,
+                        "scan": {"state": "running", "done": 0, "total": 9}}
+            dones = []
+            for _ in range(3):
+                HITS.clear()
+                _s, _h, disc = get("/lb/artist/discography?nd_id=nd5")
+                dones.append(json.loads(disc).get("scan", {}).get("done"))
+                if not HITS:
+                    failures.append("a discography with a running scan was served from a "
+                                    "cache older than LB_SCAN_RUNNING_TTL")
+                HITS.clear()
+                _s, _h, again = get("/lb/artist/discography?nd_id=nd5")
+                if HITS or again != disc:
+                    failures.append("a running scan's discography was not cached for "
+                                    "LB_SCAN_RUNNING_TTL: every polling client reaches lb-bot")
+                time.sleep(0.35)
+            if dones != sorted(set(dones)) or len(dones) != 3:
+                failures.append(f"scan counts read through the hub did not move: {dones}")
+        finally:
+            hub.LB_SCAN_RUNNING_TTL = original_running_ttl
         DISCO[0] = {"indexed": True, "unresolved": False,
                     "scan": {"state": "done", "done": 9, "total": 9}}
         get("/lb/artist/discography?nd_id=nd5")
@@ -248,6 +267,48 @@ def main() -> int:
         if status != 200 or not HITS or json.loads(disc).get("scan", {}).get("state") != "running":
             failures.append(f"after Scan now ({status}) the discography read was "
                             f"{'cached' if not HITS else 'fresh'}: {disc!r}")
+
+        # scan_post_opens_a_fresh_window: lb-bot answers the first GET after the
+        # POST before its scan is registered ("no scan", which alone would be
+        # cached 60 s). Inside the window that answer is not cached, so the next
+        # poll asks lb-bot again and sees `running`; another route's reads are
+        # cached as usual; after the window the discography caches again.
+        DISCO[0] = {"indexed": False, "unresolved": False,
+                    "scan": {"state": "", "done": 0, "total": 0}}
+        status, _h, _b = post("/lb/artist/discography", {"nd_id": "nd8"})
+        HITS.clear()
+        _s, _h, first = get("/lb/artist/discography?nd_id=nd8")
+        DISCO[0] = {"indexed": False, "unresolved": False,
+                    "scan": {"state": "running", "done": 0, "total": 3}}
+        HITS.clear()
+        _s, _h, second = get("/lb/artist/discography?nd_id=nd8")
+        if status != 200 or not HITS or json.loads(second).get("scan", {}).get("state") != "running":
+            failures.append(f"a \"no scan\" answered right after Scan now was cached: the "
+                            f"next poll read {'the cache' if not HITS else 'lb-bot'}: "
+                            f"{json.loads(first).get('scan')} then {second!r}")
+        get("/lb/overrides")
+        HITS.clear()
+        get("/lb/overrides")
+        if HITS:
+            failures.append("Scan now's window stopped another route from caching")
+        spec = hub.LB_ROUTES[("POST", "/lb/artist/discography")]
+        if spec.get("fresh_window") != hub.LB_SCAN_FRESH_WINDOW or not 5 <= spec["fresh_window"] <= 30:
+            failures.append(f"Scan now's fresh_window = {spec.get('fresh_window')!r}")
+        original_window = spec["fresh_window"]
+        spec["fresh_window"] = 0.3
+        proxy._fresh_until.clear()   # the 10 s window the POSTs above opened
+        try:
+            DISCO[0] = {"indexed": True, "unresolved": False,
+                        "scan": {"state": "done", "done": 3, "total": 3}}
+            post("/lb/artist/discography", {"nd_id": "nd9"})
+            time.sleep(0.35)
+            get("/lb/artist/discography?nd_id=nd9")
+            HITS.clear()
+            get("/lb/artist/discography?nd_id=nd9")
+            if HITS:
+                failures.append("the discography was still uncached after Scan now's window")
+        finally:
+            spec["fresh_window"] = original_window
         DISCO[0] = None
 
         # --- Worbus P1 (H4): the new fields ride the existing routes ---------
@@ -394,7 +455,8 @@ def main() -> int:
         return 1
     print("PASS - lb override routes: reachable/body-allowlist/GET-cached/POST-evicts"
           "-map-and-discography/409-evicts-nothing/error-bodies-pass-through/advertised/"
-          "scan-running-discography-not-cached/scan-post-drops-cached-discography/"
+          "scan-running-discography-short-ttl/scan-post-drops-cached-discography/"
+          "scan-post-opens-a-fresh-window/"
           "nd_id-scan-passes/unresolved-and-scan-counts-pass/findIt-survives/"
           "downloads-off-409-relayed")
     return 0

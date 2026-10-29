@@ -16,7 +16,8 @@ Serves a stub lb-bot and drives the real `LbProxy.handle`, proving:
     `album/sources` search, they still answer at once;
   - a non-200 answer reaches the client as `{error, code}` only, `error` cut at 200
     characters; a non-JSON or list body becomes `{"error": "lb-bot answered <status>"}`;
-    the 404 with no `code` is untouched;
+    the 404 with no `code` is untouched; a body with a string `code` and no `error`
+    (lb-bot's 401 `signin_required`, 403 `admin_only`) reaches it as that code;
   - an lb-bot older than the routes (bare 404) reaches the client as that same
     bare 404, no `code` added, and is not cached; a refused upstream is 502 `down`;
   - a terminal fill push and `/lb/notify` drop both cached answers; a progress
@@ -358,6 +359,18 @@ def main() -> int:
                 ("a_long_code_is_cut", 409,
                  json.dumps({"error": "x", "code": "c" * 500}).encode(),
                  {"error": "x", "code": "c" * 64}),
+                # Worbus P1: lb-bot behind its login answers with a code and no
+                # error; a client must read the code, so it reaches it as sent.
+                ("signin_required_401_relayed", 401, b'{"code": "signin_required"}',
+                 {"code": "signin_required"}),
+                ("admin_only_403_relayed", 403, b'{"code":"admin_only"}',
+                 {"code": "admin_only"}),
+                ("a_code_only_body_is_still_narrowed", 401,
+                 json.dumps({"code": "signin_required", "trace": "/config/x",
+                             "error": {"path": "/config/x"}}).encode(),
+                 {"code": "signin_required"}),
+                ("a_non_string_code_alone_is_generic", 401, b'{"code": 7}',
+                 {"error": "lb-bot answered 401"}),
             )
             for name, code, raw, want in cases:
                 ERR_BODY[0] = raw
@@ -504,7 +517,8 @@ def main() -> int:
         return 1
     print("PASS - lb attention/activity: auth/no-params/strip-walk/cached-20s/coalesced"
           "/fast-pool/404-passes-uncached/502-down/settling-push-and-notify-flush"
-          "/searching-push-flushes-progress-does-not/error-bodies-narrowed/fixture-shapes"
+          "/searching-push-flushes-progress-does-not/error-bodies-narrowed"
+          "/signin-required-and-admin-only-codes-relayed/fixture-shapes"
           "/advertised/no-downloads-no-writes")
     return 0
 

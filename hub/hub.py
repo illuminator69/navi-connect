@@ -253,6 +253,13 @@ PROXY_CACHE_TTL_LONG = 6 * 3600.0  # for effectively immutable upstream answers 
 LB_ATTENTION_TTL = 20.0     # /lb/attention and /lb/activity (§15.6): lb-bot builds
                             # its gap view to answer (~1 s), every client asks on
                             # welcome and on fill frames, and a count 20 s old is fine
+# Worbus P1, GET /lb/artist/discography while its `scan.state` is `running`: kept
+# this long, so a page's 3 s poll (Navic) still sees the counts move while many
+# polling clients cost lb-bot one read. And after a 2xx Scan now, for this long
+# none of its answers is cached: lb-bot may answer the next GET before its scan
+# says `running`, and that "no scan" must not stand for a minute.
+LB_SCAN_RUNNING_TTL = 2.0
+LB_SCAN_FRESH_WINDOW = 10.0
 LB_SCREEN_ERROR_KEYS = ("error", "code", "down", "busy")   # what a failed screen read forwards
 # Entries, across every route of one proxy — not bytes. 64 was sized for
 # surfaces that ask one question per page open; a Discover screen asks several,
@@ -291,9 +298,13 @@ LB_PROBE_TIMEOUT = 4.0
 LB_PROBE_STARTUP_WAIT = 3.0
 # `lbIndex` is only a hint — clients pull on every `welcome` regardless — and a
 # bulk build pushes every 2 s, so persisting each one would rewrite state.json
-# (every saved queue in it) at that rate. Leading edge, like the position saves;
-# a new epoch is always written at once, and a graceful stop flushes the rest.
-LB_INDEX_SAVE_THROTTLE = 10.0
+# (every saved queue in it) at that rate. Leading edge, like the position saves,
+# plus one trailing save this long after the last throttled push, so a crash
+# never leaves an older push on disk for good (lb-bot does not resend a head
+# that did not move). Written at once: a new epoch, and the bar appearing,
+# ending or reaching 0 (Worbus P1), the states a restarted hub must not lose.
+# A graceful stop flushes the rest. The variable exists for the tests; leave it.
+LB_INDEX_SAVE_THROTTLE = float(os.environ.get("HUB_LB_INDEX_SAVE_S", "10") or "10")
 
 # --- stations (PROTOCOL §18): radio and autoplay, computed here ---
 # The play history the stations keep (the last STATION_HISTORY_MAX plays from the
@@ -903,7 +914,11 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
 #     invalidates:  routes whose cached answers a 2xx answer of this route drops
 #     invalidates_on_answer: the same, but on ANY answer below 500 (a 404 counts;
 #                a 5xx and the hub's own errors do not) — for polled job routes
-#     coalesce:  False opts a GET out of sharing an identical in-flight call;
+#     fresh_window: seconds after such a 2xx in which the `invalidates` routes'
+#                answers are read but not cached (HttpProxy._fresh_until)
+#     live_while_scanning: (lb-bot) an answer whose `scan.state` is `running` is
+#                kept only LB_SCAN_RUNNING_TTL (LbProxy._cache_ttl)
+#     coalesce: False opts a GET out of sharing an identical in-flight call;
 #                absent means it shares one (see HttpProxy.call)
 #     fallback:  an upstream path retried once when `path` answers 404 — an
 #                upstream older than the route it is asked for
@@ -1052,13 +1067,21 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # (`scan: {state, done, total}`, any scan, the background worker's too)
         # and `unresolved`. A page polls it every few seconds while a scan runs,
         # and a 60 s cached copy froze those counts and, right after Scan now,
-        # still said "no scan". So an answer whose scan is `running` is never
-        # cached (`live_while_scanning`, LbProxy._cacheable), and the POST below
-        # drops the cached read. Upstream it is one SQLite read.
+        # still said "no scan". So an answer whose scan is `running` is kept
+        # only LB_SCAN_RUNNING_TTL (`live_while_scanning`, LbProxy._cache_ttl):
+        # many polling clients share one upstream read, and the counts still
+        # move between two polls. The POST below drops the cached read and opens
+        # a window in which no answer is cached at all. Upstream it is one
+        # SQLite read.
         "method": "GET", "path": "/api/artist/discography",
         "params": ("nd_id", "mbid"), "cache": True, "live_while_scanning": True,
     },
     ("POST", "/lb/artist/discography"): {
+        # Scan now. `fresh_window` (set below, with `invalidates`): lb-bot may
+        # answer the GET right after this 2xx before its scan says `running`,
+        # and a cached "no scan" would then stand for a minute; for
+        # LB_SCAN_FRESH_WINDOW after it, the GETs it invalidates are read but
+        # not cached (HttpProxy._fresh_until).
         "method": "POST", "path": "/api/artist/discography",
         "body": ("mbid", "name", "nd_id", "external"), "cache": False,
     },
@@ -1676,6 +1699,7 @@ LB_ROUTES[("POST", "/lb/artist/release")]["invalidates"] = {("GET", "/lb/artist/
 # the cached "never scanned" it opened with (a scan writes the index only when
 # it ends, so no index push clears that copy meanwhile).
 LB_ROUTES[("POST", "/lb/artist/discography")]["invalidates"] = {("GET", "/lb/artist/discography")}
+LB_ROUTES[("POST", "/lb/artist/discography")]["fresh_window"] = LB_SCAN_FRESH_WINDOW
 # I-019: an override changes which MBID the discography is read under, and the
 # set starts a rescan; both the map and the cached discography are stale at once.
 for _ovr in (("POST", "/lb/artist/override"), ("POST", "/lb/artist/override/remove")):
@@ -1780,6 +1804,10 @@ class HttpProxy:
         # 2 s from ever being cached — `/lb/album/sources` (45-150 s) and the
         # six-hour MusicBrainz routes above all.
         self._cache_gen: dict[tuple[str, str], int] = {}
+        # Per route: until when (monotonic) its answers are read but not cached,
+        # because a write with a `fresh_window` just made lb-bot's next answers
+        # unreliable for a moment (Worbus P1: Scan now). See `_cache_ttl`.
+        self._fresh_until: dict[tuple[str, str], float] = {}
         # Identical GETs in flight at once share one upstream call. Two devices
         # opening the same source sheet used to start two slskd searches; the
         # cache only ever helped the second caller once the first had returned.
@@ -1816,10 +1844,15 @@ class HttpProxy:
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         return status, data, "application/json"
 
-    def _cacheable(self, spec: dict, data: bytes) -> bool:
-        """Hook: may this 200 answer of a cached route be stored? Always, here;
-        `LbProxy` declines a discography whose scan is still running."""
-        return True
+    def _cache_ttl(self, route: tuple[str, str], spec: dict,
+                   data: bytes) -> Optional[float]:
+        """How long this 200 answer of a cached route is kept, or None for not at
+        all: the route's `ttl` (else PROXY_CACHE_TTL), except inside a write's
+        `fresh_window` (`_fresh_until`), when nothing is. `LbProxy` shortens a
+        discography whose scan is still running."""
+        if time.monotonic() < self._fresh_until.get(route, 0.0):
+            return None
+        return spec.get("ttl", PROXY_CACHE_TTL)
 
     def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
         """Hook for a subclass to react to a proxied call's raw outcome, on EVERY
@@ -1834,10 +1867,13 @@ class HttpProxy:
         500 body is `str(e)`, which can carry a path, a trace or a token, and `_strip`
         runs on a 200 only. A non-200 answer keeps just those keys, `error` cut at
         200 characters and `code` at 64, `down`/`busy` only as booleans; anything else
-        (not JSON, a list, no usable `error`) becomes
-        `{"error": "lb-bot answered <status>"}`. A body that already is that shape is
-        returned byte for byte, so a 404 with no `code` stays what the clients' "older
-        lb-bot" rule reads."""
+        (not JSON, a list, neither a string `error` nor a string `code`) becomes
+        `{"error": "lb-bot answered <status>"}`. A body with a string `code` and no
+        `error` is kept as that code (Worbus P1: lb-bot behind its login answers
+        401 `{"code": "signin_required"}` and 403 `{"code": "admin_only"}`, and a
+        client must read the code, not a generic error). A body that already is
+        that shape is returned byte for byte, so a 404 with no `code` stays what
+        the clients' "older lb-bot" rule reads."""
         keys = spec.get("error_keys")
         if not keys or status == 200:
             return data
@@ -1846,7 +1882,9 @@ class HttpProxy:
             payload = json.loads(data)
         except Exception:  # noqa: BLE001 — not JSON
             return plain
-        if not isinstance(payload, dict) or not isinstance(payload.get("error"), str):
+        if not isinstance(payload, dict) or not (
+                isinstance(payload.get("error"), str)
+                or ("code" in keys and isinstance(payload.get("code"), str))):
             return plain
         out = {}
         for k in keys:
@@ -1857,7 +1895,10 @@ class HttpProxy:
                 keep = isinstance(v, (str, int, float, bool))
             if keep:
                 out[k] = v[:64] if k == "code" and isinstance(v, str) else v
-        out["error"] = payload["error"][:200]
+        if isinstance(payload.get("error"), str):
+            out["error"] = payload["error"][:200]
+        else:
+            out.pop("error", None)   # a non-string `error` beside a string `code`
         return data if out == payload else json.dumps(out).encode()
 
     @staticmethod
@@ -1913,7 +1954,8 @@ class HttpProxy:
                 del self._cache[old]
         self._cache[key] = (time.monotonic() + ttl, status, body, ctype)
 
-    def invalidate(self, routes: set[tuple[str, str]]) -> int:
+    def invalidate(self, routes: set[tuple[str, str]],
+                   void_in_flight: bool = True) -> int:
         """Drop every cached answer for these routes, and void the ones in flight.
 
         The generation bump is the half that matters under load: a read that went
@@ -1921,8 +1963,10 @@ class HttpProxy:
         AFTER it, and caching that would re-arm the very staleness this clears.
         Bumped for exactly these routes: a read of any other route in flight
         across this call has nothing stale about it and still caches.
+        `void_in_flight=False` skips the bump, for a route whose answer is built
+        from the state the caller just changed (`LbProxy._set_available`).
         """
-        for r in routes:
+        for r in routes if void_in_flight else ():
             r = tuple(r)
             self._cache_gen[r] = self._cache_gen.get(r, 0) + 1
         wanted = [list(r) for r in routes]
@@ -2087,13 +2131,19 @@ class HttpProxy:
         data = self._strip(spec, status, data)
         data = self._narrow_error(spec, status, data)
         if (spec.get("cache") and gen == self._cache_gen.get(route, 0)
-                and upstream_status == 200 and self._cacheable(spec, data)):
-            self._cache_put(key, status, data, ctype,
-                            spec.get("ttl", PROXY_CACHE_TTL))
+                and upstream_status == 200):
+            ttl = self._cache_ttl(route, spec, data)
+            if ttl is not None:
+                self._cache_put(key, status, data, ctype, ttl)
         # A write that succeeded makes its own read stale: adding to the wishlist
         # answered the list without the row for up to a minute.
         if 200 <= status < 300 and spec.get("invalidates"):
             self.invalidate(set(spec["invalidates"]))
+            if spec.get("fresh_window"):
+                until = time.monotonic() + spec["fresh_window"]
+                for r in spec["invalidates"]:
+                    r = tuple(r)
+                    self._fresh_until[r] = max(self._fresh_until.get(r, 0.0), until)
         # A polled job route: any answer the lb-bot gave (not its 5xx, not the
         # hub's own error) means the job's list may have moved.
         if status < 500 and spec.get("invalidates_on_answer"):
@@ -2228,21 +2278,43 @@ LB_HEALTH_PARSE_MAX = 64 * 1024
 _LB_KEEP = object()   # `_set_available`'s "leave `downloads` as it is"
 
 
-def _lb_downloads_of(data: bytes) -> Optional[str]:
-    """`"on"`/`"off"` from a health body, or None: absent, not a string, any
-    other value, not JSON, not an object, or too large. None means "this lb-bot
-    did not say", which is what an older lb-bot says, and clients read the key's
-    absence as "on"."""
+def _lb_health_body(data: bytes) -> Optional[dict]:
+    """A health body as an object, or None: empty, too large, not JSON, not an
+    object."""
     if not data or len(data) > LB_HEALTH_PARSE_MAX:
         return None
     try:
         payload = json.loads(data)
     except Exception:  # noqa: BLE001
         return None
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get("downloads")
+    return payload if isinstance(payload, dict) else None
+
+
+def _lb_downloads_of(data: bytes) -> Optional[str]:
+    """`"on"`/`"off"` from a health body, or None: absent, not a string, any
+    other value, not JSON, not an object, or too large. None means "this lb-bot
+    did not say", which is what an older lb-bot says, and clients read the key's
+    absence as "on"."""
+    value = (_lb_health_body(data) or {}).get("downloads")
     return value if isinstance(value, str) and value in LB_DOWNLOADS_VALUES else None
+
+
+# lb-bot's `missingConfig`: the names of the settings a stranger's server needs
+# that are empty. Logged by the hub when it changes, never relayed. Names only:
+# an entry that is not an environment variable's name is dropped, so a value
+# can never reach the log through it.
+_LB_CONFIG_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_LB_MISSING_CONFIG_MAX = 16
+
+
+def _lb_missing_config_of(data: bytes) -> Optional[tuple]:
+    """The names from a health body's `missingConfig`, sorted, or None when the
+    body has no such list (an older lb-bot)."""
+    value = (_lb_health_body(data) or {}).get("missingConfig")
+    if not isinstance(value, list):
+        return None
+    return tuple(sorted({v for v in value[:_LB_MISSING_CONFIG_MAX]
+                         if isinstance(v, str) and _LB_CONFIG_NAME_RE.match(v)}))
 
 
 class LbProxy(HttpProxy):
@@ -2265,6 +2337,8 @@ class LbProxy(HttpProxy):
         # inbound push that marks it alive again after a restart must not
         # advertise "on" (absent) to clients until the next probe.
         self.downloads: Optional[str] = None
+        # lb-bot's `missingConfig` as last logged (`_note_missing_config`).
+        self._missing_config: Optional[tuple] = None
         self._refused_logged_at = -math.inf
         self._probed = asyncio.Event()
         self._announcing: set[asyncio.Task] = set()
@@ -2367,6 +2441,13 @@ class LbProxy(HttpProxy):
         after = self.welcome_info()
         if after == before:
             return
+        # `/lb/status` answers the same object: its cached copy (60 s) must not
+        # go on contradicting the frame below (e.g. the probe saw `downloads`
+        # change, or lb-bot come back, before a client's next status read). A
+        # status read in flight is not voided: its `augment` runs this same
+        # verdict through here before it builds the answer it caches, so that
+        # answer always agrees with `welcome_info()` when it is stored.
+        self.invalidate({("GET", "/lb/status")}, void_in_flight=False)
         if value != was:
             log(f"lbbot {'available' if value else 'UNAVAILABLE'} (hub verdict changed)")
         if self.downloads != old_downloads:
@@ -2389,8 +2470,23 @@ class LbProxy(HttpProxy):
         other status is lb-bot unreachable and says nothing about the mode."""
         if status == 200:
             self._set_available(True, _lb_downloads_of(data))
+            self._note_missing_config(_lb_missing_config_of(data))
         else:
             self._set_available(False)
+
+    def _note_missing_config(self, names: Optional[tuple]) -> None:
+        """Log lb-bot's `missingConfig` once each time it changes (Worbus P1): a
+        stranger's lb-bot runs with settings missing and says which, and the hub's
+        log is where the person setting up both reads first. Names only; never on
+        the wire. An answer without the list (an older lb-bot) logs nothing, and
+        an lb-bot reporting nothing missing from the start logs nothing either."""
+        if names is None or names == self._missing_config:
+            return
+        old, self._missing_config = self._missing_config, names
+        if names:
+            log("lbbot reports required settings missing: " + ", ".join(names))
+        elif old:
+            log("lbbot reports its required settings all present")
 
     def mark_alive(self) -> None:
         """An authenticated inbound push from lb-bot: it is up, whatever the last
@@ -2399,18 +2495,25 @@ class LbProxy(HttpProxy):
         if self.enabled:
             self._set_available(True)
 
-    def _cacheable(self, spec: dict, data: bytes) -> bool:
-        """A route marked `live_while_scanning` is not cached while its answer's
-        `scan.state` is `running` (Worbus P1: Scan now's counts). The substring
-        test comes first so an ordinary discography is not parsed twice."""
-        if not spec.get("live_while_scanning") or b'"running"' not in data:
-            return True
+    def _cache_ttl(self, route: tuple[str, str], spec: dict,
+                   data: bytes) -> Optional[float]:
+        """A route marked `live_while_scanning` keeps an answer whose
+        `scan.state` is `running` only LB_SCAN_RUNNING_TTL (Worbus P1: Scan now's
+        counts move, and many polling clients still share one upstream read).
+        The substring test comes first so an ordinary discography is not parsed
+        twice."""
+        ttl = super()._cache_ttl(route, spec, data)
+        if (ttl is None or not spec.get("live_while_scanning")
+                or b'"running"' not in data):
+            return ttl
         try:
             payload = json.loads(data)
         except Exception:  # noqa: BLE001 — not JSON: cache as before
-            return True
+            return ttl
         scan = payload.get("scan") if isinstance(payload, dict) else None
-        return not (isinstance(scan, dict) and scan.get("state") == "running")
+        if isinstance(scan, dict) and scan.get("state") == "running":
+            return min(ttl, LB_SCAN_RUNNING_TTL)
+        return ttl
 
     def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
         """B-005: a proxied call that reached the hub but not lb-bot says
@@ -5630,9 +5733,10 @@ async def _handle_lb_index(protocol: Any, raw_path: str, headers: Any,
     cursor, so a push it missed costs nothing but latency. It does carry the
     build's `progress` when the push did (Worbus P1), and a push that only moved
     `progress`, with the head unchanged, is stored and broadcast like any other:
-    that is how the Home bar moves between head changes. Deliberately does NOT
-    touch `LB_LIBRARY_ROUTES`: the one cache it drops is the discography read,
-    which is the clients' fallback path when they have no mirror.
+    that is how the Home bar moves between head changes; it invalidates nothing.
+    Deliberately does NOT touch `LB_LIBRARY_ROUTES`: the caches a moved head
+    drops are LB_INDEX_INVALIDATES (the discography read, the clients' fallback
+    path when they have no mirror, and the override map).
     """
     path, _, _query = raw_path.partition("?")
     if (path.rstrip("/") or "/") != LB_INDEX_PATH:
@@ -5658,7 +5762,11 @@ async def _handle_lb_index(protocol: Any, raw_path: str, headers: Any,
         return _http_json(400, {"error": "index push needs an integer seq >= 0 and a "
                                          f"non-empty epoch of at most {_LB_INDEX_EPOCH_MAX} chars"})
 
-    LB.invalidate(LB_INDEX_INVALIDATES)
+    # Only a head that moved makes a cached read stale: a progress-only push
+    # (same seq and epoch, every few seconds during a build) drops nothing.
+    held = HUB_INSTANCE.lb_index if HUB_INSTANCE is not None else None
+    if held is None or (held.get("seq"), held.get("epoch")) != (hint["seq"], hint["epoch"]):
+        LB.invalidate(LB_INDEX_INVALIDATES)
     if HUB_INSTANCE is not None:
         HUB_INSTANCE.set_lb_index(hint)
         await HUB_INSTANCE._broadcast({"t": "index", **hint})  # noqa: SLF001 — same module
@@ -5836,6 +5944,7 @@ class Hub:
         # a push missed while the hub was down would leave this stale.
         self.lb_index: Optional[dict] = None
         self._last_lb_index_save_at = 0.0
+        self._lb_index_trailing: Any = None  # the pending trailing save (loop handle)
         self._last_sq_progress_at = 0.0  # throttle the current record's cursor writes
         self._last_position_save_at = 0.0  # throttle position-only state persistence
         self._last_progress_sent = 0.0
@@ -6493,15 +6602,42 @@ class Hub:
             self._backup_task = None
 
     def set_lb_index(self, hint: dict) -> None:
-        """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE).
-        A new epoch is written at once: that is the change a restarted hub must
-        not forget, since it is what tells a client its whole mirror is void."""
-        new_epoch = self.lb_index is None or self.lb_index.get("epoch") != hint["epoch"]
+        """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE),
+        with a trailing save for the last throttled push.
+
+        Written at once: a new epoch, the change a restarted hub must not forget,
+        since it is what tells a client its whole mirror is void; and (Worbus P1)
+        a `progress` that appears, goes, or reaches `unindexed: 0`. A build's
+        final push usually lands inside the window of the one before it, and
+        lb-bot does not send it again, so a hub killed before the trailing save
+        came back showing a bar stuck at its last count."""
+        old = self.lb_index
+        new_epoch = old is None or old.get("epoch") != hint["epoch"]
+        old_progress = (old or {}).get("progress")
+        progress = hint.get("progress")
+        bar_edge = ((old_progress is None) != (progress is None)
+                    or (progress is not None and progress["unindexed"] == 0
+                        and progress != old_progress))
         self.lb_index = dict(hint)
         now = time.monotonic()
-        if new_epoch or now - self._last_lb_index_save_at >= LB_INDEX_SAVE_THROTTLE:
-            self._last_lb_index_save_at = now
-            self._save()
+        if (new_epoch or bar_edge
+                or now - self._last_lb_index_save_at >= LB_INDEX_SAVE_THROTTLE):
+            self._save_lb_index()
+            return
+        if self._lb_index_trailing is None:
+            delay = self._last_lb_index_save_at + LB_INDEX_SAVE_THROTTLE - now
+            try:
+                self._lb_index_trailing = asyncio.get_running_loop().call_later(
+                    max(delay, 0.0), self._save_lb_index)
+            except RuntimeError:  # no loop (a test driving this directly)
+                pass
+
+    def _save_lb_index(self) -> None:
+        if self._lb_index_trailing is not None:
+            self._lb_index_trailing.cancel()
+            self._lb_index_trailing = None
+        self._last_lb_index_save_at = time.monotonic()
+        self._save()
 
     # ----- send helpers ---------------------------------------------------- #
     async def _send(self, dev: Optional[Device], obj: dict) -> None:
