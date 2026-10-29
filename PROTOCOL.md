@@ -1144,8 +1144,9 @@ whitelist stays the only thing a device holding `HUB_TOKEN` can reach, and lb-bo
 cannot tell one device from another through the hub (per-user identity is
 Worbus project 2). The bearer is never put in a URL or a log line. An lb-bot whose
 `LB_BOT_HUB_TOKEN` is not the hub's `HUB_TOKEN` answers `401` on every route while
-its open `/api/health` still reads it as available: the hub relays that `401` as it
-came and names the setting to fix in its own log, at most every 10 minutes.
+its open `/api/health` still reads it as available: the hub relays that `401` (lb-bot's
+`{"code": "signin_required"}`, like its `403 {"code": "admin_only"}`) as it came, on the two
+screen reads of §15.6 too, and names the setting to fix in its own log, at most every 10 minutes.
 
 Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 `/lb/*` answers `503` — except `/lb/status`, which answers `{"configured": false}`.
@@ -1982,21 +1983,27 @@ anyway.
 - Same bearer check as `/lb/fill` (`401` on a bad token), exact-path match (so the
   proxied `/lb/index/changes` and `/keys` fall through), `405` on anything but
   POST, `400` on a malformed body (a `bool` is not a seq).
-- The hub invalidates **only** `GET /lb/artist/discography` — the clients' network
+- When the head moved (`seq` or `epoch` differs from the stored hint), the hub invalidates
+  **only** `GET /lb/artist/discography` — the clients' network
   fallback when an artist is not mirrored — and, since 2026-10-04, `GET /lb/overrides`
-  (its `toCheck` list depends on scan results, §15.4); never `LB_LIBRARY_ROUTES`. `index`
+  (its `toCheck` list depends on scan results, §15.4); never `LB_LIBRARY_ROUTES`. A push
+  that moved only `progress` invalidates nothing. `index`
   is not a library event, any more than `fill` is. Because cache generations are
   per route (§15.1), a push voids only a discography read in flight: a 45–150 s
   `/lb/album/sources` or a six-hour MusicBrainz read that is upstream across a push
   still caches. (With the original proxy-wide generation, a build's push every 2 s
   stopped every read slower than 2 s from ever being cached.)
-- It stores the hint (`lbIndex`, persisted in `state.json`; a new epoch is saved at
-  once, same-epoch pushes at most every `LB_INDEX_SAVE_THROTTLE` = 10 s, and a
+- It stores the hint (`lbIndex`, persisted in `state.json`; saved at once are a new
+  epoch and a `progress` that appears, goes or reaches `unindexed: 0`; other pushes
+  at most every `LB_INDEX_SAVE_THROTTLE` = 10 s, with one trailing save that long
+  after the last throttled push, so a crashed hub loses at most 10 s of hint; a
   graceful stop flushes the rest) and broadcasts
   `{ "t": "index", "seq", "epoch", "progress"? }`, rebuilt from the validated hint.
   The hint is what the **last** push said: a push without `progress` leaves none,
   and a push that moved only `progress` (same seq) is stored and broadcast all the
-  same. A malformed `progress` is dropped and the push still accepted (§15.7).
+  same. A malformed `progress` is dropped and the push still accepted (§15.7). A
+  client may skip its pull on an `index` frame whose `seq` (same `epoch`) is not
+  past its own cursor: only the progress moved.
 - Like the other two inbound routes, the bearer check alone marks lb-bot available
   (below) — before the body is validated.
 
@@ -2011,7 +2018,8 @@ anyway.
   `{configured: false}` answer carries the same `routes: []`, so the two never
   disagree.
 - **`lbIndex: { seq, epoch, progress? }`** appears once the hub has heard a push, and survives
-  a hub restart (`progress` with it, until lb-bot's next push says otherwise). It is **only a hint**: a client pulls on **every** `welcome`
+  a hub restart (`progress` with it, until lb-bot's next push says otherwise). The hub keeps
+  `progress` while lb-bot is unavailable; a client shows the bar only while `lb.available`. It is **only a hint**: a client pulls on **every** `welcome`
   regardless, because an up-to-date pull costs ~100 B and a push missed while the
   hub was down would leave the hint stale. This is the "client closed for days"
   path.
@@ -2460,7 +2468,9 @@ allowlist, the hub strips `folders[].name`, `.path`, `.identifyError`, `.coverUr
 strip above runs on a `200` only, so a non-200 answer from either route is cut to `{error, code}` (plus the
 `down` and `busy` flags the hub's own `502`/`504` carry, kept only as booleans), `error` at 200
 characters and `code` at 64; a body that is not a JSON
-object with a string `error` becomes `{"error": "lb-bot answered <status>"}`. A `404` that already is
+object with a string `error` or a string `code` becomes `{"error": "lb-bot answered <status>"}`, and one with
+a `code` and no `error` (Worbus P1: lb-bot behind its login answers `401 {"code": "signin_required"}` and
+`403 {"code": "admin_only"}`) reaches the client as that `code`. A `404` that already is
 `{error}` with no `code` is passed byte for byte, so "an lb-bot older than the routes" still reads as a 404
 with no `code`. `/api/downloads` (its review rows carry Telegram credentials) and every placement or
 transfer write stay off the wire.
@@ -2478,7 +2488,10 @@ field below is **additive**; its absence is an older lb-bot or hub and means exa
 **The downloads mode.** lb-bot's `GET /api/health` (the hub's probe) and `GET /api/summary` carry
 `"downloads": "on" | "off"`: `"on"` iff lb-bot was started with an slskd API key, fixed for lb-bot's process
 life. The hub relays it as `welcome.lb.downloads`, on the `lb` frame (broadcast when it changes) and on
-`GET /lb/status`, present only when lb-bot's last 200 health answer said `"on"` or `"off"` (§15.3).
+`GET /lb/status`, present only when lb-bot's last 200 health answer said `"on"` or `"off"` (§15.3). Any
+change of that object also drops `/lb/status`'s cached answer, so the two never disagree. The health
+answer's `missingConfig` (names of empty required settings) is **not** relayed: the hub logs it once each
+time it changes, names only.
 **Absent = `"on"`** for every client. While it is `"off"`, lb-bot makes no slskd call at all and every route
 that would start or need a download answers
 
@@ -2495,30 +2508,34 @@ modes.
 lb-bot's first-run build, where `unindexed` counts the library artists its worker will still attempt and
 that have no index row yet (artists covered by another's row and artists in failure backoff are left out,
 so a real library reaches 0), `total` the library's artists and `current` the one being scanned (a name).
-lb-bot sends it at most every 5 s, also when only the progress moved, and none at all with
-`LB_BOT_AUTO_INDEX=0`. The hub keeps it in its hint, so it reaches `welcome.lbIndex`, the `index` frame and
+Every head push (at most one per 2 s, §15.3) carries the current `progress` while the build runs;
+a push that only moved the progress, with the head unchanged, is sent at most every 5 s; and none carries
+it with `LB_BOT_AUTO_INDEX=0`. The hub keeps it in its hint, so it reaches `welcome.lbIndex`, the `index` frame and
 `state.json`: `unindexed` and `total` must be ints from 0 to 2³¹−1, `current` a string (cut at 200
 characters; missing or `null` reads as `""`), and anything else drops `progress` from that push without
 refusing it. **The hint is the last push's**, so lb-bot attaches `progress` to every push while its build
 runs, and a push without it ends the bar. Clients show a bar while `unindexed > 0` and none at 0 or when
-`progress` is absent.
+`progress` is absent, and only while `lb.available` (the hub keeps the last `progress` while lb-bot is away).
 
 **Scan now for any artist.** `POST /lb/artist/discography {"nd_id"}` with no `mbid` is accepted: lb-bot
 resolves the artist's MBID on the task thread (the same name search its worker uses), then scans at
 interactive priority. A second request for an artist already scanning answers the running task; an older
 lb-bot answers `400 mbid is required`. `GET /lb/artist/discography` gains:
 
-- `scan: {"state": "running" | "done" | "failed" | "", "done": int, "total": int, …}` for **any** scan of
-  that artist, the background worker's included (counts may be 0 while unknown). A scan entry expires ten
-  minutes after its last update, so a scan lost to an lb-bot restart does not read as running forever;
+- `scan: {"state": "running" | "done" | "failed", "done": int, "total": int, …}` for **any** scan of
+  that artist, the background worker's included (counts may be 0 while unknown); **absent** when lb-bot holds
+  no scan entry for the artist. A scan entry expires ten minutes after its last update, so a scan lost to an
+  lb-bot restart does not read as running forever;
 - `unresolved: true` when the artist's index row has no MBID (lb-bot found no MusicBrainz match); a resolved
   artist with no releases is `false`. A page offers Retry (the scan route again) and Match manually (the
   §15.4 override). A MusicBrainz outage writes nothing, so it never reads as `unresolved`.
 
 The hub caches this read for 60 s as before, **except** an answer whose `scan.state` is `running`, which is
-never cached (a page polls it for the counts), and a 2xx `POST /lb/artist/discography` drops the cached read,
-so the poll right after Scan now does not get the "never scanned" answer the page opened with. A scan writes
-the index only when it ends, so no `/lb/index` push clears that copy meanwhile.
+kept only `LB_SCAN_RUNNING_TTL` (2 s: a page polls it for the counts every few seconds, and many polling
+clients still cost lb-bot one read). A 2xx `POST /lb/artist/discography` drops the cached read and, for
+`LB_SCAN_FRESH_WINDOW` (10 s) after it, caches none of this route's answers, so the poll right after Scan now
+gets neither the "never scanned" answer the page opened with nor an lb-bot answer given before its scan
+registered. A scan writes the index only when it ends, so no `/lb/index` push clears that copy meanwhile.
 
 **Find it.** `GET /lb/meta/album` gains `findIt: [{"service", "kind": "confirmed" | "search", "url"}]`:
 `confirmed` are MusicBrainz links of the release group's releases (purchase, download, streaming), `search`

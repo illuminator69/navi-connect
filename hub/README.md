@@ -54,6 +54,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `HUB_STATION_HISTORY` | `1` | `0` keeps the stations' play history (PROTOCOL §18.4) in memory only; otherwise it is written to `<HUB_STATE>.history` |
 | `PROXY_QUEUE_TIMEOUT_FAST` | `10` | seconds a proxied request may wait for a free slot before the hub answers 503 `busy` |
 | `HUB_SLEEP_MINUTE_S` | `60` | how many seconds one minute of the sleep timer lasts. Leave it alone: it exists so the tests can watch a timer run out in seconds |
+| `HUB_LB_INDEX_SAVE_S` | `10` | the most often a same-epoch lb-bot index head is written to `state.json`. Leave it alone: it exists so the tests can watch the trailing save in seconds |
 | `HUB_MOOD_RETRY_S` | `60` | how soon a mood list whose build failed is tried again. Also a test knob |
 
 `.env.example` explains each of these at more length.
@@ -147,7 +148,8 @@ The hub also relays lb-bot's **downloads mode** (`welcome.lb.downloads`, the `lb
 frame and `/lb/status`: `"on"` or `"off"`, absent from an older lb-bot) and its
 first-run **index progress** (`lbIndex.progress` and the `index` frame); with
 downloading off, lb-bot's download routes answer `409 downloads_off`, passed on
-unchanged. `../PROTOCOL.md` §15.7.
+unchanged. The settings lb-bot reports missing (`missingConfig`) are not relayed:
+the hub logs their names once each time the list changes. `../PROTOCOL.md` §15.7.
 
 `GET /lb/status` answers even when `LBBOT_URL` is unset, and lists the routes this
 hub can proxy — a client that ships ahead of the hub can then say so instead of
