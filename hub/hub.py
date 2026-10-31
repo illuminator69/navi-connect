@@ -2984,10 +2984,13 @@ def _station_features(raw: Any) -> Optional[tuple[float, ...]]:
 
 
 # An artist credit split into acts, the rule both clients already use for "same
-# artist": `&`, `+`, `,`, `feat.`, `with`, `vs`, `x` — never `/` (AC/DC). The key
-# is the first act, lowercased, punctuation dropped.
+# artist": `&`, `+`, `,`, `feat.`, `with`, `vs`, `x` — never `/` (AC/DC). The hub
+# also splits on `•` ("Phoebe Bridgers • Phoebe Bridgers, Christian Lee Hutson",
+# B-176) and on a SPACED ` - ` ("Lana Del Rey - Nikki Lane", Q-120), never on an
+# unspaced hyphen (Jay-Z, Run-DMC); the clients' rule may still lack those two.
+# The key is the first act, lowercased, punctuation dropped.
 _ARTIST_SEP_RE = re.compile(
-    r"\s*[,&+;]\s*|\s+(?:feat\.?|ft\.?|featuring|with|vs\.?|x)\s+", re.I)
+    r"\s*[,&+;•]\s*|\s+-\s+|\s+(?:feat\.?|ft\.?|featuring|with|vs\.?|x)\s+", re.I)
 
 
 def _station_artist_key(name: Any) -> str:
