@@ -134,7 +134,7 @@ def request(port: int, path: str, method: str = "GET", body=None,
 
 
 def spawn(port: int, state: str, lbbot_url: str, **extra: str):
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_HEALTH_PORT": str(_free_port()), "HUB_HOST": "127.0.0.1",
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state,
            "PROXY_QUEUE_TIMEOUT_FAST": str(QUEUE_TIMEOUT), "LBBOT_URL": lbbot_url,
@@ -969,6 +969,12 @@ def main() -> int:
           "missing-config-logged-on-change/progress-only-push-invalidates-nothing/"
           "final-progress-saved-at-once/trailing-save-after-burst")
     return 0
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

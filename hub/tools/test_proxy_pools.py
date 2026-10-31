@@ -85,7 +85,7 @@ def main() -> int:
 
     port = _free_port()
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_HEALTH_PORT": str(_free_port()), "HUB_HOST": "127.0.0.1",
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state,
            "PROXY_QUEUE_TIMEOUT_FAST": str(QUEUE_TIMEOUT),
@@ -158,6 +158,12 @@ def main() -> int:
     print("PASS - proxy pools: poll-answers-behind-searches/identical-reads-coalesce/"
           "no-slot-is-503-busy")
     return 0
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

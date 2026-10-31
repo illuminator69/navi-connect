@@ -33,7 +33,7 @@ HUB_DIR = os.path.join(os.path.dirname(__file__), "..")
 
 
 def spawn(port, state):
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state,
            "HUB_HOST": "127.0.0.1", "HUB_HEALTH_PORT": str(_free_port())}
     return subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR)
@@ -124,6 +124,12 @@ async def main():
         sys.exit(1)
     print("PASS - progress: paused-report-fanned-out-once-at-its-position/"
           "playing-reports-still-throttled")
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

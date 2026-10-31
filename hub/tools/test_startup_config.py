@@ -80,6 +80,19 @@ def check_pure() -> list[str]:
     expect("short token is not refused", r("t", "0.0.0.0", False, "", ""), want_none=True)
     expect("token containing change-me later", r("my-change-me", "0.0.0.0", False, "", ""),
            want_none=True)
+    # review finding 2: whitespace only is empty, refused the same way
+    expect("whitespace-only token", r("   ", "0.0.0.0", False, "", ""),
+           want_prefix="HUB_TOKEN is not set.")
+    expect("whitespace-only token, insecure on a reachable host",
+           r(" \t\n", "0.0.0.0", True, "", ""), want_prefix="HUB_ALLOW_INSECURE_NO_AUTH is set")
+    # review finding 3: `docker run --env-file` keeps quotes literally
+    expect("double-quoted example token", r(f'"{EXAMPLE_TOKEN}"', "0.0.0.0", False, "", ""),
+           want_line=TOKEN_LINE)
+    expect("single-quoted example token, padded",
+           r(f"  '{EXAMPLE_TOKEN}' ", "0.0.0.0", False, "", ""), want_line=TOKEN_LINE)
+    expect("quoted real token", r(f'"{REAL_32}"', "0.0.0.0", False, "", ""), want_none=True)
+    expect("unmatched quote before change-me", r('"change-me', "0.0.0.0", False, "", ""),
+           want_none=True)
 
     # PREVIEW_SECRET, only when PREVIEW_URL is set
     url = "http://navi-connect-preview:4792"
@@ -93,6 +106,10 @@ def check_pure() -> list[str]:
            r(REAL_32, "0.0.0.0", False, "", EXAMPLE_PREVIEW), want_none=True)
     expect("empty preview secret, PREVIEW_URL unset", r(REAL_32, "0.0.0.0", False, "", ""),
            want_none=True)
+    expect("whitespace-only preview secret", r(REAL_32, "0.0.0.0", False, url, "  "),
+           want_prefix="PREVIEW_SECRET is not set but PREVIEW_URL is")
+    expect("quoted example preview secret",
+           r(REAL_32, "0.0.0.0", False, url, f"'{EXAMPLE_PREVIEW}'"), want_line=PREVIEW_LINE)
     return failures
 
 
@@ -106,8 +123,12 @@ def _env(tmp: str, port: int, **over: str) -> dict:
 
 
 def _refused(tmp: str, label: str, line: str, **over: str) -> list[str]:
+    """Refused before anything writes: non-zero exit, the line, and no state file
+    (HUB_STATE or any side file beside it: .history, .stations, .bak, .tmp)."""
+    env = _env(tmp, _free_port(), **over)
+    state = env["HUB_STATE"]
     try:
-        proc = subprocess.run([sys.executable, "hub.py"], env=_env(tmp, _free_port(), **over),
+        proc = subprocess.run([sys.executable, "hub.py"], env=env,
                               cwd=HUB_DIR, capture_output=True, text=True, timeout=8)
     except subprocess.TimeoutExpired:  # run() has killed it
         return [f"subprocess {label}: still running after 8 s, it started instead of refusing"]
@@ -117,6 +138,9 @@ def _refused(tmp: str, label: str, line: str, **over: str) -> list[str]:
         fails.append(f"subprocess {label}: exit 0, must be non-zero")
     if line not in out:
         fails.append(f"subprocess {label}: the line is missing; output {out!r}")
+    written = [p for p in os.listdir(tmp) if p.startswith(os.path.basename(state))]
+    if written:
+        fails.append(f"subprocess {label}: a refused start wrote {written!r}")
     return fails
 
 
@@ -147,10 +171,13 @@ def _starts(tmp: str, label: str, **over: str) -> list[str]:
 
 def check_subprocess() -> list[str]:
     failures: list[str] = []
+    # A fresh directory per refusal, so "no state file" is about that start alone.
     with tempfile.TemporaryDirectory() as tmp:
         failures += _refused(tmp, "example HUB_TOKEN", TOKEN_LINE, HUB_TOKEN=EXAMPLE_TOKEN)
+    with tempfile.TemporaryDirectory() as tmp:
         failures += _refused(tmp, "example PREVIEW_SECRET", PREVIEW_LINE, HUB_TOKEN=REAL_32,
                              PREVIEW_URL="http://127.0.0.1:9", PREVIEW_SECRET=EXAMPLE_PREVIEW)
+    with tempfile.TemporaryDirectory() as tmp:
         failures += _starts(tmp, "32-character HUB_TOKEN", HUB_TOKEN=REAL_32)
     return failures
 
@@ -167,7 +194,9 @@ def check_env_example() -> list[str]:
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
-    for key in ("PREVIEW_URL", "PREVIEW_PUBLIC_URL", "AUDIOMUSE_URL", "NAVIDROME_URL"):
+    # HUB_ND_USER/PASS: the AudioMuse proxy forwards them whenever set (review finding 6)
+    for key in ("PREVIEW_URL", "PREVIEW_PUBLIC_URL", "AUDIOMUSE_URL", "NAVIDROME_URL",
+                "HUB_ND_USER", "HUB_ND_PASS"):
         if env.get(key):
             failures.append(f".env.example sets {key}={env[key]!r}; it must be commented out")
     if hub.startup_config_refusal(env.get("HUB_TOKEN", ""), "0.0.0.0", False,
@@ -186,8 +215,10 @@ def main() -> int:
     print("PASS - startup config: example-token-refused/empty-token-refused/"
           "insecure-loopback-only/32-char-token-accepted/short-not-refused/"
           "example-or-empty-preview-secret-refused-with-PREVIEW_URL/"
-          "preview-secret-ignored-without-PREVIEW_URL/subprocess-exit-and-line/"
-          "subprocess-32-char-binds/env-example-enables-no-service")
+          "preview-secret-ignored-without-PREVIEW_URL/"
+          "whitespace-only-is-empty/quoted-placeholder-refused/"
+          "subprocess-exit-and-line-no-state-file/"
+          "subprocess-32-char-binds/env-example-enables-no-service-or-nd-creds")
     return 0
 
 

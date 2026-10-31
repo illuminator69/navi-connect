@@ -78,7 +78,7 @@ def main() -> int:
 
     port = _free_port()
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ,
+    env = {**_inherited_env(),
            "HUB_TOKEN": TOKEN,
            "HUB_PORT": str(port),
            "HUB_HEALTH_PORT": str(_free_port()),
@@ -142,6 +142,12 @@ def main() -> int:
     print("PASS - proxy slow route: a request past the handshake deadline still "
           "answers, and answers from upstream")
     return 0
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

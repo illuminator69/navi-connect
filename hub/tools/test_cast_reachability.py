@@ -117,7 +117,7 @@ TRACKS = [{"id": f"t{i}", "title": f"T{i}", "streamUrl": f"http://x/{i}"} for i 
 
 async def main():
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
@@ -244,6 +244,12 @@ async def main():
     print("PASS - cast reachability: presence-vs-reachable/unreachable-refused/"
           "mid-session-drop/load-ack-rollback/ack-timeout/legacy-exempt")
     return 0
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

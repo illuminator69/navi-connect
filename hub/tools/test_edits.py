@@ -129,7 +129,7 @@ def expected_after_remove(order, at):
 
 async def main():
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(PORT),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
@@ -224,7 +224,7 @@ async def test_prune():
                 {"id": "fresh", "name": "Fresh", "lastSeen": now},
             ],
         }, f)
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_DEVICE_TTL_DAYS": "1", "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
@@ -262,7 +262,7 @@ async def test_saved_queues():
     port = _free_port()
     url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
@@ -379,7 +379,7 @@ async def test_audit_fixes():
     port = _free_port()
     url = f"ws://127.0.0.1:{port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
            "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
            "HUB_HEALTH_PORT": str(_free_port())}
     hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
@@ -516,6 +516,12 @@ async def test_audit_fixes():
         sys.exit(1)
     print("PASS - audit fixes: takeover-load/self-transfer-noop/late-released/"
           "name-backfill/eviction-exempt/clear-detach/tombstone/receiver-cap")
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":

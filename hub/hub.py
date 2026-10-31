@@ -8702,7 +8702,12 @@ _EXAMPLE_SECRET_PREFIX = "change-me"
 
 
 def _is_example_secret(value: str) -> bool:
-    return value.strip().lower().startswith(_EXAMPLE_SECRET_PREFIX)
+    v = value.strip()
+    # `docker run --env-file` keeps quotes literally (compose strips them), so a
+    # quoted placeholder must still read as the placeholder.
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    return v.lower().startswith(_EXAMPLE_SECRET_PREFIX)
 
 
 def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
@@ -8712,7 +8717,7 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
     if _is_example_secret(token):
         return ("HUB_TOKEN is still the example value; set your own "
                 "(for example `openssl rand -hex 16`).")
-    if not token:
+    if not token.strip():  # whitespace only is as empty as empty
         if not allow_insecure_no_auth:
             return (
                 "HUB_TOKEN is not set.\n"
@@ -8732,7 +8737,7 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if _is_example_secret(preview_secret):
             return ("PREVIEW_SECRET is still the example value; set your own "
                     "(for example `openssl rand -hex 16`).")
-        if not preview_secret:
+        if not preview_secret.strip():
             return ("PREVIEW_SECRET is not set but PREVIEW_URL is; set your own "
                     "(for example `openssl rand -hex 16`), or unset PREVIEW_URL.")
     return None

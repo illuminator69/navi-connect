@@ -75,7 +75,7 @@ class Hub:
         self.proc = None
 
     async def start(self):
-        env = {**os.environ, "HUB_TOKEN": TOKEN, "HUB_PORT": str(self.port),
+        env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(self.port),
                "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": self.state,
                "HUB_HOST": "127.0.0.1", "HUB_HEALTH_PORT": str(self.health_port),
                "HUB_DEBUG": "1" if self.debug else "", **self.env}
@@ -959,6 +959,12 @@ async def main():
           "but-P1/P5-welcome-at-once/no-do-before-welcome/superseded-socket-dropped/"
           "reset-at-welcome/refused-load-not-believed/empty-queue-never-playing/"
           "takeover/backstop-12s-from-the-oldest")
+
+
+def _inherited_env() -> dict:
+    """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
+    hub refuse to start (B-303), and this suite starts its hubs without previews."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
 
 
 if __name__ == "__main__":
