@@ -210,7 +210,8 @@ class FakeReceiver:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HUB_URL", "ws://localhost:4790"))
-    ap.add_argument("--token", default=os.environ.get("HUB_TOKEN", "change-me-to-a-long-random-secret"))
+    ap.add_argument("--token", default=os.environ.get("HUB_TOKEN", ""),
+                    help="the hub's HUB_TOKEN (default: $HUB_TOKEN)")
     ap.add_argument("--name", default="Fake-Receiver")
     ap.add_argument("--id", default=None, help="stable device id (defaults to one derived from name)")
     ap.add_argument("--echo", action="store_true",

@@ -160,7 +160,8 @@ class Ctl:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HUB_URL", "ws://localhost:4790"))
-    ap.add_argument("--token", default=os.environ.get("HUB_TOKEN", "change-me-to-a-long-random-secret"))
+    ap.add_argument("--token", default=os.environ.get("HUB_TOKEN", ""),
+                    help="the hub's HUB_TOKEN (default: $HUB_TOKEN)")
     args = ap.parse_args()
     asyncio.run(Ctl().run(args.url, args.token))
 

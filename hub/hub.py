@@ -8690,25 +8690,61 @@ async def _serve_health(hub: Hub, reader: asyncio.StreamReader,
             pass
 
 
+# The secrets `.env.example` ships start with this. A copied, unedited file would
+# otherwise run with a publicly known token: HUB_TOKEN is the whole administrative
+# surface, and lb-bot (Worbus P1) accepts it as its trusted service caller too. Only
+# the placeholder is refused, never a "short" value — a real token is whatever its
+# owner chose (B-303).
+_EXAMPLE_SECRET_PREFIX = "change-me"
+
+
+def _is_example_secret(value: str) -> bool:
+    return value.strip().lower().startswith(_EXAMPLE_SECRET_PREFIX)
+
+
+def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
+                           preview_url: str, preview_secret: str) -> Optional[str]:
+    """Why the hub must not start with this configuration, or None. Pure: the
+    values are passed in, so the decision is testable without starting a hub."""
+    if _is_example_secret(token):
+        return ("HUB_TOKEN is still the example value; set your own "
+                "(for example `openssl rand -hex 16`).")
+    if not token:
+        if not allow_insecure_no_auth:
+            return (
+                "HUB_TOKEN is not set.\n"
+                "The WebSocket control plane has administrative reach — claiming device ids, "
+                "rewriting the queue, moving playback — so the hub will not run without a token.\n"
+                "Set HUB_TOKEN, or for a loopback-only experiment set "
+                "HUB_ALLOW_INSECURE_NO_AUTH=true with HUB_HOST=127.0.0.1."
+            )
+        if host not in ("127.0.0.1", "::1", "localhost"):
+            return (
+                f"HUB_ALLOW_INSECURE_NO_AUTH is set but HUB_HOST is {host!r}.\n"
+                "Unauthenticated mode is restricted to loopback — bind 127.0.0.1, or set HUB_TOKEN."
+            )
+    if preview_url:
+        # An empty secret used to be a start-up warning that disabled the preview
+        # proxy; with PREVIEW_URL set it is the same mistake as the placeholder.
+        if _is_example_secret(preview_secret):
+            return ("PREVIEW_SECRET is still the example value; set your own "
+                    "(for example `openssl rand -hex 16`).")
+        if not preview_secret:
+            return ("PREVIEW_SECRET is not set but PREVIEW_URL is; set your own "
+                    "(for example `openssl rand -hex 16`), or unset PREVIEW_URL.")
+    return None
+
+
 def _check_auth_config() -> None:
-    """Refuse to run as an open control plane. See ALLOW_INSECURE_NO_AUTH."""
-    if TOKEN:
-        return
-    if not ALLOW_INSECURE_NO_AUTH:
-        raise SystemExit(
-            "HUB_TOKEN is not set.\n"
-            "The WebSocket control plane has administrative reach — claiming device ids, "
-            "rewriting the queue, moving playback — so the hub will not run without a token.\n"
-            "Set HUB_TOKEN, or for a loopback-only experiment set "
-            "HUB_ALLOW_INSECURE_NO_AUTH=true with HUB_HOST=127.0.0.1."
-        )
-    if HOST not in ("127.0.0.1", "::1", "localhost"):
-        raise SystemExit(
-            f"HUB_ALLOW_INSECURE_NO_AUTH is set but HUB_HOST is {HOST!r}.\n"
-            "Unauthenticated mode is restricted to loopback — bind 127.0.0.1, or set HUB_TOKEN."
-        )
-    log("WARNING: running with NO AUTHENTICATION on loopback only "
-        "(HUB_ALLOW_INSECURE_NO_AUTH). Never do this on a reachable interface.")
+    """Refuse to run as an open control plane, or with the example secrets.
+    See ALLOW_INSECURE_NO_AUTH and startup_config_refusal."""
+    refusal = startup_config_refusal(TOKEN, HOST, ALLOW_INSECURE_NO_AUTH,
+                                     PREVIEW_URL, PREVIEW_SECRET)
+    if refusal:
+        raise SystemExit(refusal)
+    if not TOKEN:
+        log("WARNING: running with NO AUTHENTICATION on loopback only "
+            "(HUB_ALLOW_INSECURE_NO_AUTH). Never do this on a reachable interface.")
 
 
 async def main() -> None:
@@ -8723,12 +8759,7 @@ async def main() -> None:
         log("WARNING: LBBOT_URL is set but HUB_TOKEN is empty — the lb-bot proxy is "
             "DISABLED. lb-bot's API has no auth of its own, so relaying it without "
             "a hub token would publish every route on the whitelist.")
-    if PREVIEW_URL and TOKEN and not PREVIEW_SECRET:
-        log("WARNING: PREVIEW_URL is set but PREVIEW_SECRET is empty — the preview "
-            "proxy is DISABLED. Every stream URL the hub minted would be signed with "
-            "an empty key and refused by the sidecar, i.e. the feature would fail at "
-            "playback rather than at configuration. Set the SAME value on both, and "
-            "not HUB_TOKEN.")
+    # PREVIEW_URL with an empty PREVIEW_SECRET is refused by _check_auth_config.
     if PREVIEW_URL and PREVIEW_SECRET and not PREVIEW_PUBLIC_URL:
         log("NOTE: PREVIEW_PUBLIC_URL is unset — previews play for a client that can "
             "reach PREVIEW_URL itself, but not on a Chromecast. The hub advertises "

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+The hub refuses its example secrets (B-303, bug run H1).
+
+`.env.example` ships `HUB_TOKEN=change-me-…` and `PREVIEW_SECRET=change-me-…`. A
+copied, unedited file used to start a hub whose administrative token is printed in a
+public repository (and lb-bot P1 accepts that token as its trusted service caller).
+Start-up now refuses a token that starts with `change-me`, and, when `PREVIEW_URL` is
+set, a `PREVIEW_SECRET` that is empty or starts with `change-me`. It never refuses a
+value for being short: the owner's token is 32 characters, and whatever its owner chose
+is a real token.
+
+Two halves:
+  - in process: `startup_config_refusal`, the pure decision, over every case;
+  - subprocess: `hub.py` itself, so the decision is proved wired into start-up — the
+    placeholder cases exit non-zero with the one line, the 32-character token binds.
+
+Exits non-zero on failure.
+"""
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+os.environ.setdefault("HUB_TOKEN", "test-token")
+HUB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HUB_DIR)
+
+import hub  # noqa: E402
+
+EXAMPLE_TOKEN = "change-me-to-a-long-random-secret"           # hub/.env.example
+EXAMPLE_PREVIEW = "change-me-to-a-different-long-random-secret"  # hub/.env.example
+REAL_32 = "0123456789abcdef0123456789abcdef"                  # 32 chars, like the owner's
+TOKEN_LINE = ("HUB_TOKEN is still the example value; set your own "
+              "(for example `openssl rand -hex 16`).")
+PREVIEW_LINE = ("PREVIEW_SECRET is still the example value; set your own "
+                "(for example `openssl rand -hex 16`).")
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def check_pure() -> list[str]:
+    failures: list[str] = []
+    r = hub.startup_config_refusal
+
+    def expect(label, got, want_none=False, want_line=None, want_prefix=None):
+        if want_none:
+            if got is not None:
+                failures.append(f"{label}: refused a good config: {got!r}")
+            return
+        if got is None:
+            failures.append(f"{label}: accepted, must be refused")
+            return
+        if want_line is not None and got != want_line:
+            failures.append(f"{label}: wrong line {got!r}")
+        if want_prefix is not None and not got.startswith(want_prefix):
+            failures.append(f"{label}: wrong message {got!r}")
+
+    # HUB_TOKEN
+    expect("example token", r(EXAMPLE_TOKEN, "0.0.0.0", False, "", ""), want_line=TOKEN_LINE)
+    expect("any change-me token", r("change-me", "0.0.0.0", False, "", ""), want_line=TOKEN_LINE)
+    expect("CHANGE-ME, padded", r("  CHANGE-ME-x ", "0.0.0.0", False, "", ""),
+           want_line=TOKEN_LINE)
+    expect("example token with the insecure flag",
+           r(EXAMPLE_TOKEN, "127.0.0.1", True, "", ""), want_line=TOKEN_LINE)
+    expect("empty token", r("", "0.0.0.0", False, "", ""), want_prefix="HUB_TOKEN is not set.")
+    expect("empty token, insecure on a reachable host", r("", "0.0.0.0", True, "", ""),
+           want_prefix="HUB_ALLOW_INSECURE_NO_AUTH is set")
+    expect("empty token, insecure on loopback", r("", "127.0.0.1", True, "", ""),
+           want_none=True)
+    expect("32-character token", r(REAL_32, "0.0.0.0", False, "", ""), want_none=True)
+    expect("short token is not refused", r("t", "0.0.0.0", False, "", ""), want_none=True)
+    expect("token containing change-me later", r("my-change-me", "0.0.0.0", False, "", ""),
+           want_none=True)
+
+    # PREVIEW_SECRET, only when PREVIEW_URL is set
+    url = "http://navi-connect-preview:4792"
+    expect("example preview secret", r(REAL_32, "0.0.0.0", False, url, EXAMPLE_PREVIEW),
+           want_line=PREVIEW_LINE)
+    expect("empty preview secret", r(REAL_32, "0.0.0.0", False, url, ""),
+           want_prefix="PREVIEW_SECRET is not set but PREVIEW_URL is")
+    expect("32-character preview secret", r(REAL_32, "0.0.0.0", False, url, REAL_32[::-1]),
+           want_none=True)
+    expect("example preview secret, PREVIEW_URL unset",
+           r(REAL_32, "0.0.0.0", False, "", EXAMPLE_PREVIEW), want_none=True)
+    expect("empty preview secret, PREVIEW_URL unset", r(REAL_32, "0.0.0.0", False, "", ""),
+           want_none=True)
+    return failures
+
+
+def _env(tmp: str, port: int, **over: str) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("HUB_", "PREVIEW_", "AUDIOMUSE_", "LBBOT_", "NAVIDROME_"))}
+    env.update(HUB_HOST="127.0.0.1", HUB_PORT=str(port), HUB_HEALTH_PORT=str(_free_port()),
+               HUB_STATE=os.path.join(tmp, "state.json"), HUB_MIRROR_PLAYQUEUE="false")
+    env.update(over)
+    return env
+
+
+def _refused(tmp: str, label: str, line: str, **over: str) -> list[str]:
+    try:
+        proc = subprocess.run([sys.executable, "hub.py"], env=_env(tmp, _free_port(), **over),
+                              cwd=HUB_DIR, capture_output=True, text=True, timeout=8)
+    except subprocess.TimeoutExpired:  # run() has killed it
+        return [f"subprocess {label}: still running after 8 s, it started instead of refusing"]
+    out = (proc.stdout + proc.stderr).strip().splitlines()
+    fails = []
+    if proc.returncode == 0:
+        fails.append(f"subprocess {label}: exit 0, must be non-zero")
+    if line not in out:
+        fails.append(f"subprocess {label}: the line is missing; output {out!r}")
+    return fails
+
+
+def _starts(tmp: str, label: str, **over: str) -> list[str]:
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable, "hub.py"], env=_env(tmp, port, **over),
+                            cwd=HUB_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return [f"subprocess {label}: exited {proc.returncode}: "
+                        f"{proc.stdout.read().strip()!r}"]
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return []
+            except OSError:
+                time.sleep(0.2)
+        return [f"subprocess {label}: never bound 127.0.0.1:{port}"]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def check_subprocess() -> list[str]:
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        failures += _refused(tmp, "example HUB_TOKEN", TOKEN_LINE, HUB_TOKEN=EXAMPLE_TOKEN)
+        failures += _refused(tmp, "example PREVIEW_SECRET", PREVIEW_LINE, HUB_TOKEN=REAL_32,
+                             PREVIEW_URL="http://127.0.0.1:9", PREVIEW_SECRET=EXAMPLE_PREVIEW)
+        failures += _starts(tmp, "32-character HUB_TOKEN", HUB_TOKEN=REAL_32)
+    return failures
+
+
+def main() -> int:
+    failures = check_pure() + check_subprocess()
+    for f in failures:
+        print(f"FAIL - {f}")
+    if failures:
+        return 1
+    print("PASS - startup config: example-token-refused/empty-token-refused/"
+          "insecure-loopback-only/32-char-token-accepted/short-not-refused/"
+          "example-or-empty-preview-secret-refused-with-PREVIEW_URL/"
+          "preview-secret-ignored-without-PREVIEW_URL/subprocess-exit-and-line/"
+          "subprocess-32-char-binds")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

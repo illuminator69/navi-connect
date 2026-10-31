@@ -152,7 +152,8 @@ HUB_PORT=4790
 ```
 
 `HUB_TOKEN` is the shared secret every client presents. There is no other auth. Generate something
-real (`openssl rand -hex 32`). **The hub refuses to start without it**, which is deliberate: the
+real (`openssl rand -hex 32`). **The hub refuses to start without it**, or with `.env.example`'s
+`change-me…` value, which is deliberate: the
 WebSocket alone can rewrite your queue and move your playback. (For a throwaway experiment on one
 machine, `HUB_ALLOW_INSECURE_NO_AUTH=true` with `HUB_HOST=127.0.0.1` lets it run tokenless on
 loopback only.)

@@ -32,7 +32,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `HUB_TOKEN` | *(empty)* | shared secret; clients must send it in `hello`. **Required**: the hub refuses to start without it |
+| `HUB_TOKEN` | *(empty)* | shared secret; clients must send it in `hello`. **Required**: the hub refuses to start without it, or with `.env.example`'s `change-me…` value |
 | `HUB_ALLOW_INSECURE_NO_AUTH` | *(unset)* | `true` lets the hub run with no token, and only when `HUB_HOST` is a loopback address. For local experiments |
 | `HUB_HOST` | `0.0.0.0` | listen address |
 | `HUB_PORT` | `4790` | listen port |
@@ -49,7 +49,7 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `LBBOT_WEB_URL` | `LBBOT_URL` | where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links. Set it when `LBBOT_URL` is a Docker-internal name |
 | `PREVIEW_URL` | *(empty)* | the preview sidecar as the hub reaches it; unset disables `/preview/*` (`../preview/README.md`) |
 | `PREVIEW_PUBLIC_URL` | *(empty)* | the sidecar as a client or a Chromecast reaches it; in practice required with `PREVIEW_URL` |
-| `PREVIEW_SECRET` | *(empty)* | signs preview stream URLs; must match the sidecar's and must not be `HUB_TOKEN` |
+| `PREVIEW_SECRET` | *(empty)* | signs preview stream URLs; must match the sidecar's and must not be `HUB_TOKEN`. With `PREVIEW_URL` set, the hub refuses to start when it is empty or `.env.example`'s `change-me…` value |
 | `PREVIEW_TTL` | `21600` | seconds a signed preview stream URL stays valid |
 | `HUB_STATION_HISTORY` | `1` | `0` keeps the stations' play history (PROTOCOL §18.4) in memory only; otherwise it is written to `<HUB_STATE>.history` |
 | `PROXY_QUEUE_TIMEOUT_FAST` | `10` | seconds a proxied request may wait for a free slot before the hub answers 503 `busy` |
