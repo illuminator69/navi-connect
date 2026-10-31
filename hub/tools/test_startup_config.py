@@ -155,8 +155,30 @@ def check_subprocess() -> list[str]:
     return failures
 
 
+def check_env_example() -> list[str]:
+    """H2: the shipped .env.example, read the way docker's env_file reads it (a
+    `#` line is a comment), turns on no optional service, and its HUB_TOKEN is the
+    placeholder start-up refuses."""
+    failures: list[str] = []
+    env: dict[str, str] = {}
+    with open(os.path.join(HUB_DIR, ".env.example"), encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    for key in ("PREVIEW_URL", "PREVIEW_PUBLIC_URL", "AUDIOMUSE_URL", "NAVIDROME_URL"):
+        if env.get(key):
+            failures.append(f".env.example sets {key}={env[key]!r}; it must be commented out")
+    if hub.startup_config_refusal(env.get("HUB_TOKEN", ""), "0.0.0.0", False,
+                                  env.get("PREVIEW_URL", ""),
+                                  env.get("PREVIEW_SECRET", "")) != TOKEN_LINE:
+        failures.append(".env.example's HUB_TOKEN is not refused as the example value")
+    return failures
+
+
 def main() -> int:
-    failures = check_pure() + check_subprocess()
+    failures = check_pure() + check_env_example() + check_subprocess()
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -165,7 +187,7 @@ def main() -> int:
           "insecure-loopback-only/32-char-token-accepted/short-not-refused/"
           "example-or-empty-preview-secret-refused-with-PREVIEW_URL/"
           "preview-secret-ignored-without-PREVIEW_URL/subprocess-exit-and-line/"
-          "subprocess-32-char-binds")
+          "subprocess-32-char-binds/env-example-enables-no-service")
     return 0
 
 

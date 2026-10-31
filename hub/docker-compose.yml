@@ -20,5 +20,8 @@ services:
       - ./data:/data        # persisted session + device registry
 
 networks:
+  # External: this file does not create it. It must already exist (the network
+  # Navidrome, AudioMuse and lb-bot are on), or `docker compose up` refuses to
+  # start. On a fresh host: `docker network create media`.
   media:
     external: true

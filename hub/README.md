@@ -8,7 +8,7 @@ receivers stream from Navidrome themselves. Protocol: [`../PROTOCOL.md`](../PROT
 ## Run
 
 ```bash
-cp .env.example .env        # set HUB_TOKEN + Navidrome creds for the mirror
+cp .env.example .env        # set HUB_TOKEN; uncomment the services you run
 docker compose pull && docker compose up -d
 ```
 
