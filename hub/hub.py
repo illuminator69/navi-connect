@@ -86,6 +86,11 @@ SIGNIN_STR_MAX = 128          # username, salt, deviceId, name, platform
 # What a hello whose credential is unknown or revoked is told, before close 4005.
 SIGNED_OUT_FRAME = {"t": "error", "code": "signed_out",
                     "message": "Signed out of the Worbus Server."}
+# How old a user's flags may get (design §6.1): re-read on that user's connect or
+# lb call when older, and every this often while any socket is open. The env
+# override exists for the suites only.
+USER_REFRESH_SECS = float(os.environ.get("HUB_USER_REFRESH_SECS", "600") or "600")
+USER_REFRESH_TIMEOUT = 8.0    # each native-API call of a refresh
 
 # AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
 # the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
@@ -1018,6 +1023,33 @@ def _nd_check_signin_blocking(username: str, salt: str, token: str) -> tuple[str
     return "ok", {"username": name, "adminRole": user.get("adminRole") is True}
 
 
+def _nd_native_blocking(method: str, path: str, body: Optional[dict] = None,
+                        jwt: Optional[str] = None) -> tuple[str, Any]:
+    """One call to Navidrome's native API (R10). Returns (status, payload):
+    "ok" with the parsed JSON; "unauthorized" (401), "forbidden" (403), "limited"
+    (429); "unreachable" for anything else (refused, timeout, 5xx, not JSON).
+    Nothing is logged here: the login body carries HUB_ND_PASS, the list call
+    a JWT."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{NAVIDROME_URL}{path}", data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if jwt:
+        req.add_header("x-nd-authorization", f"Bearer {jwt}")
+    try:
+        with urllib.request.urlopen(req, timeout=USER_REFRESH_TIMEOUT) as r:
+            raw = r.read(4 * 1024 * 1024)
+    except urllib.error.HTTPError as e:
+        return {401: "unauthorized", 403: "forbidden", 429: "limited"}.get(
+            e.code, "unreachable"), None
+    except Exception:  # noqa: BLE001 — refused, reset, timeout
+        return "unreachable", None
+    try:
+        return "ok", json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return "unreachable", None
+
+
 # --------------------------------------------------------------------------- #
 # Upstream proxies  (designs: ../DESIGN-hub-audiomuse-proxy.md,
 #                             ../DESIGN-lbbot-client-integration.md)
@@ -1939,6 +1971,7 @@ class HttpProxy:
 
     prefix = ""                                  # e.g. "/sonic"
     label = "proxy"
+    refreshes_caller = False                     # LbProxy: see handle()
     routes: dict[tuple[str, str], dict] = {}
 
     def __init__(self) -> None:
@@ -2349,6 +2382,12 @@ class HttpProxy:
         caller = _request_caller(headers)
         if caller is None:
             return _http_json(401, {"error": "unauthorized"})
+        if self.refreshes_caller:
+            # An lb call reads the caller's rights: their flags are re-read in the
+            # background when older than USER_REFRESH_SECS (design §6.1).
+            refresh = getattr(HUB_INSTANCE, "refresh_if_stale", None)
+            if callable(refresh):
+                refresh(_space_key(caller.user))
 
         spec = self.routes.get((method, path))
         if spec is None:
@@ -2480,6 +2519,7 @@ def _lb_missing_config_of(data: bytes) -> Optional[tuple]:
 class LbProxy(HttpProxy):
     """lb-bot library-gap intelligence (design: ../DESIGN-lbbot-client-integration.md)."""
 
+    refreshes_caller = True
     prefix = "/lb"
     label = "lbbot"
     routes = LB_ROUTES
@@ -8615,6 +8655,11 @@ class Hub:
         # (remote address, lower-cased username) -> times of refused sign-ins in
         # the last SIGNIN_REFUSALS_WINDOW (R1). In memory only.
         self._signin_refusals: dict[tuple[str, str], deque] = {}
+        # The service account's native-API JWT (R10): memory only, never logged.
+        # A fresh login only when there is none or Navidrome answered 401.
+        self._nd_jwt: Optional[str] = None
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_refused_logged = False
         # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
         # A HINT only: a client pulls on every welcome whatever it says, because
         # a push missed while the hub was down would leave this stale.
@@ -8814,6 +8859,126 @@ class Hub:
         except Exception:  # noqa: BLE001
             pass
         await UserSpace._close(ws, 4005, "signed out")  # noqa: SLF001
+
+    # ----- user flags stay fresh (design §6.1, R10) ------------------------ #
+    async def _list_users(self) -> tuple[str, Optional[dict]]:
+        """Every Navidrome user's admin flag, read as the service account:
+        ("ok", {key: isAdmin}), or ("refused" | "unavailable", None)."""
+        for attempt in (1, 2):
+            if self._nd_jwt is None:
+                st, body = await asyncio.to_thread(
+                    _nd_native_blocking, "POST", "/auth/login",
+                    {"username": ND_USER, "password": ND_PASS})
+                if st == "ok" and isinstance(body, dict) and isinstance(body.get("token"), str):
+                    self._nd_jwt = body["token"]
+                elif st in ("unauthorized", "forbidden"):
+                    return "refused", None
+                else:
+                    return "unavailable", None   # 429 (rate-limited), down, a bad answer
+            st, body = await asyncio.to_thread(_nd_native_blocking, "GET", "/api/user",
+                                               None, self._nd_jwt)
+            if st == "unauthorized" and attempt == 1:
+                self._nd_jwt = None              # expired or revoked: one fresh login
+                continue
+            if st == "forbidden":
+                return "refused", None           # the service account is not an admin
+            if st != "ok" or not isinstance(body, list):
+                return "unavailable", None
+            users: dict[str, bool] = {}
+            for row in body:
+                if isinstance(row, dict) and isinstance(row.get("userName"), str):
+                    users[_space_key(row["userName"])] = row.get("isAdmin") is True
+            return "ok", users
+        return "unavailable", None
+
+    async def refresh_users(self) -> Optional[dict]:
+        """Re-read every signed-in user's flags in one call. A changed flag sends
+        `{"t": "user", ...}` to that user's sockets; a user Navidrome's list (a
+        200) no longer holds is signed out: their credentials are dropped and
+        their sockets get `signed_out` and 4005; their space's data stays (R16).
+        Unreachable, a timeout, a 5xx or a 429 changes nothing (R10); a service
+        account Navidrome refuses keeps the sign-in flags, logged once.
+        Returns {key: isAdmin} when the list was read, else None."""
+        async with self._refresh_lock:
+            verdict, listed = await self._list_users()
+            if verdict == "refused":
+                if not self._refresh_refused_logged:
+                    self._refresh_refused_logged = True
+                    log("user refresh: Navidrome refuses HUB_ND_USER's user list (it is "
+                        "not an admin); users keep the flags they signed in with")
+                return None
+            if verdict != "ok" or listed is None:
+                dlog("user refresh: Navidrome unavailable; flags kept")
+                return None
+            now = int(time.time() * 1000)
+            known = set(self.user_flags) | {r["user"] for r in self.device_auth.values()}
+            for key in sorted(known):
+                if key == self.primary_user and key not in listed:
+                    continue   # the service account itself just logged in
+                if key not in listed:
+                    await self._sign_out_user(key)
+                    continue
+                old = self.user_flags.get(key)
+                before = self.caller_for(key).wire()
+                self.user_flags[key] = {"name": (old or {}).get("name") or key,
+                                        "admin": listed[key], "checkedAt": now}
+                after = self.caller_for(key).wire()
+                if before != after:
+                    # (For the primary user this is also the first real read
+                    # replacing the legacy token's assumed admin flag, R2.)
+                    log(f"user refresh: {key!r} is {'now' if listed[key] else 'no longer'} "
+                        f"an admin")
+                    sp = self.spaces.get(key)
+                    if sp is not None:
+                        await sp._broadcast({"t": "user", "user": after})  # noqa: SLF001
+            self._save()
+            return listed
+
+    async def _sign_out_user(self, key: str) -> None:
+        """Navidrome no longer has `key`: every device of theirs is signed out."""
+        rows = [h for h, r in self.device_auth.items() if r["user"] == key]
+        for h in rows:
+            del self.device_auth[h]
+        self.user_flags.pop(key, None)
+        sp = self.spaces.get(key)
+        sockets = list(sp.sockets) if sp is not None else []
+        log(f"user refresh: {key!r} is gone from Navidrome; {len(rows)} device "
+            f"credential(s) dropped, {len(sockets)} socket(s) signed out")
+        self._save()
+        await asyncio.gather(*(self._signed_out(ws) for ws in sockets),
+                             return_exceptions=True)
+
+    def refresh_if_stale(self, key: str) -> None:
+        """On a user's connect or lb call: re-read in the background when their
+        flags are older than USER_REFRESH_SECS (or were never read)."""
+        flags = self.user_flags.get(key)
+        age_ms = int(time.time() * 1000) - int((flags or {}).get("checkedAt") or 0)
+        if age_ms >= USER_REFRESH_SECS * 1000 and not self._refresh_lock.locked():
+            try:
+                self._spawn(self.refresh_users())
+            except RuntimeError:
+                pass   # no loop: an in-process caller
+
+    async def refresh_user(self, user: str) -> Optional[dict]:
+        """`user`'s flags after a re-read: {"name", "admin", "checkedAt"}, or None
+        when Navidrome's list no longer holds them (they are signed out). When the
+        list could not be read, the flags as they were."""
+        key = _space_key(user)
+        listed = await self.refresh_users()
+        if listed is not None and key not in listed and key != self.primary_user:
+            return None
+        return self.user_flags.get(key)
+
+    async def _user_refresh_loop(self) -> None:
+        """Every USER_REFRESH_SECS while any socket is open: an idle device hears
+        a demotion or a deletion too (design §6.1)."""
+        while True:
+            await asyncio.sleep(USER_REFRESH_SECS)
+            try:
+                if any(sp.sockets for sp in self.spaces.values()):
+                    await self.refresh_users()
+            except Exception as e:  # noqa: BLE001 — the loop must never die
+                log("user refresh error:", e)
 
     def _prune_device_auth(self) -> int:
         """Credentials go with their device (design §6.2 Expiry): a row whose device
@@ -9375,6 +9540,7 @@ class Hub:
             await space._send(dev, welcome)  # noqa: SLF001
             await space._broadcast_devices()  # noqa: SLF001
             log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}; {arrival}")
+            self.refresh_if_stale(space.key)
 
             async for raw in ws:
                 if dev.ws is not ws:
@@ -9655,6 +9821,7 @@ async def main() -> None:
         serve_kwargs["create_protocol"] = proxy_protocol
 
     sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
+    user_refresh = asyncio.create_task(hub._user_refresh_loop())  # noqa: SLF001
     # The station engine's tier probe (PROTOCOL §18.1: every 10 min, and after a
     # failure), for the characters route's `available` and `engine`.
     # The probe is the hub's (`station_shared`): run through the primary user's
@@ -9680,7 +9847,7 @@ async def main() -> None:
     # to clear the slowest thing the proxy is allowed to wait for.
     handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT,
                             PROXY_SEARCH_TIMEOUT, STATION_BUDGET_S,
-                            SIGNIN_ND_TIMEOUT + 1) + 15
+                            SIGNIN_ND_TIMEOUT + 1, USER_REFRESH_TIMEOUT) + 15
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
                                 open_timeout=handshake_timeout,
@@ -9688,6 +9855,7 @@ async def main() -> None:
         await stop  # run until a stop signal arrives
 
     sweep.cancel()
+    user_refresh.cancel()
     if lb_probe is not None:
         lb_probe.cancel()
     if station_probe is not None:
