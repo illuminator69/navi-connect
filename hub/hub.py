@@ -13,6 +13,7 @@ Stdlib + `websockets` only. Python 3.11+.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import hashlib
 import hmac
@@ -22,6 +23,7 @@ import math
 import os
 import random
 import re
+import secrets
 import signal
 import threading
 import time
@@ -65,6 +67,25 @@ NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").rstrip("/")
 MIRROR_PLAYQUEUE = os.environ.get("HUB_MIRROR_PLAYQUEUE", "true").lower() == "true"
 ND_USER = os.environ.get("HUB_ND_USER", "")
 ND_PASS = os.environ.get("HUB_ND_PASS", "")
+
+# --- device sign-in (Worbus P2, design §6.2; PROTOCOL §3) ---
+# The legacy shared HUB_TOKEN, in a hello or as a client's HTTP bearer, is still
+# accepted as the primary user (HUB_ND_USER) while this is true, so clients that
+# predate sign-in keep working through the upgrade. Packaging turns it off for a
+# stranger's server. lb-bot's inbound callbacks (/lb/notify, /lb/fill, /lb/index)
+# authenticate with HUB_TOKEN whatever this says: it is the service secret (R3).
+ACCEPT_SHARED_TOKEN = os.environ.get("HUB_ACCEPT_SHARED_TOKEN", "true").strip().lower() \
+    not in ("0", "false", "no", "off")
+SIGNIN_PATH = "/hub/signin"
+SIGNOUT_PATH = "/hub/signout"
+SIGNIN_ND_TIMEOUT = 8.0       # the Navidrome getUser check; past it, navidrome_unreachable
+SIGNIN_REFUSALS_MAX = 5       # refused sign-ins per (address, username) ... (R1)
+SIGNIN_REFUSALS_WINDOW = 600.0  # ... in this sliding window; the next one answers 429
+SIGNIN_SALT_MIN = 6
+SIGNIN_STR_MAX = 128          # username, salt, deviceId, name, platform
+# What a hello whose credential is unknown or revoked is told, before close 4005.
+SIGNED_OUT_FRAME = {"t": "error", "code": "signed_out",
+                    "message": "Signed out of the Worbus Server."}
 
 # AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
 # the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
@@ -679,6 +700,23 @@ def _durable_signature_of(data: Any) -> Optional[str]:
     first boot on this build does not rewrite a good backup."""
     if not isinstance(data, dict):
         return None
+    sig = _durable_signature_users(data)
+    auth = data.get("deviceAuth")
+    if sig is None or not auth:
+        return sig
+    # The device credentials (hashes only) too: a secret cannot be re-derived, so a
+    # restore from a backup older than a sign-in would sign that device out (H1
+    # review, Minor 1). Empty, the signature is P1's.
+    try:
+        rows = sorted((str(h), str(r.get("user")), str(r.get("deviceId")))
+                      for h, r in auth.items() if isinstance(r, dict))
+        return json.dumps([sig, rows])
+    except Exception:  # noqa: BLE001 — a hand-edited backup with the wrong shapes
+        return None
+
+
+def _durable_signature_users(data: dict) -> Optional[str]:
+    """`_durable_signature_of` without the device credentials."""
     base = _durable_signature(data.get("mixes"), data.get("deletedSavedQueues"))
     users = data.get("users")
     if not users:
@@ -914,6 +952,70 @@ def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], positio
             r.read()
     except Exception as e:  # noqa: BLE001 — mirror is best-effort
         log("savePlayQueue mirror failed:", e)
+
+
+# --------------------------------------------------------------------------- #
+# Device sign-in (Worbus P2, design §6.2)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Caller:
+    """Who an HTTP request or a socket acts for. `legacy`: the shared HUB_TOKEN,
+    which is the primary user (design §6.2)."""
+    user: str
+    admin: bool
+    primary: bool
+    legacy: bool = False
+
+    def wire(self) -> dict:
+        """`welcome.user` and the `user` frame."""
+        return {"name": self.user, "admin": self.admin, "primary": self.primary}
+
+
+# The caller of the HTTP request being answered, for a proxy whose `call` needs it
+# (the stations pick the caller's space; lb-bot learns who is calling, H5). Set by
+# HttpProxy.handle around `call`; each request is its own task, so it never leaks
+# into another request.
+_CALLER: contextvars.ContextVar[Optional[Caller]] = contextvars.ContextVar(
+    "hub_caller", default=None)
+
+
+def _secret_hash(secret: str) -> str:
+    """What the hub keeps of a device secret: sha256, hex. Never the secret."""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _nd_check_signin_blocking(username: str, salt: str, token: str) -> tuple[str, Optional[dict]]:
+    """Ask the hub's own Navidrome whether `token`/`salt` is `username`'s pair: the
+    user's own `getUser`, authenticated as that user (design §6.2; R10: a user may
+    read themselves, admin or not). Returns ("ok", {username, adminRole}),
+    ("refused", None) when Navidrome answered and said no (code 40, 50, any
+    `failed`, or a record for somebody else), or ("unreachable", None) when it did
+    not answer as Navidrome: refused connection, timeout, a 5xx, a body that is not
+    a Subsonic response.
+
+    Nothing about the request is logged: the URL carries the pair."""
+    query = urllib.parse.urlencode({"username": username, "u": username, "t": token,
+                                    "s": salt, "v": "1.16.1", "c": "worbus-hub", "f": "json"})
+    url = f"{NAVIDROME_URL}/rest/getUser.view?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=SIGNIN_ND_TIMEOUT) as r:
+            raw = r.read(256 * 1024)
+    except Exception:  # noqa: BLE001 — refused, reset, timeout, DNS, an HTTP error
+        # status (Navidrome answers its refusals 200 with `failed`): not an answer
+        return "unreachable", None
+    try:
+        sub = json.loads(raw.decode("utf-8"))["subsonic-response"]
+    except Exception:  # noqa: BLE001 — not Navidrome (a proxy's page, a wrong URL)
+        return "unreachable", None
+    if not isinstance(sub, dict):
+        return "unreachable", None
+    if sub.get("status") != "ok":
+        return "refused", None
+    user = sub.get("user")
+    name = user.get("username") if isinstance(user, dict) else None
+    if not isinstance(name, str) or _space_key(name) != _space_key(username):
+        return "refused", None
+    return "ok", {"username": name, "adminRole": user.get("adminRole") is True}
 
 
 # --------------------------------------------------------------------------- #
@@ -1809,6 +1911,24 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
                 "application/json")
 
 
+def _bearer(headers: Any) -> str:
+    auth = (headers.get("Authorization") or "") if headers is not None else ""
+    return auth[7:] if auth.startswith("Bearer ") else ""
+
+
+def _request_caller(headers: Any) -> Optional[Caller]:
+    """The caller an HTTP request's bearer names, or None (401). Through the hub
+    when one is running (`Hub.caller`); with none (a suite driving a proxy on its
+    own) only today's shared token is known, as the primary user."""
+    hub = HUB_INSTANCE
+    fn = getattr(hub, "caller", None)
+    if callable(fn):
+        return fn(headers)
+    if ACCEPT_SHARED_TOKEN and hmac.compare_digest(_bearer(headers).encode(), TOKEN.encode()):
+        return Caller(user=_space_key(ND_USER), admin=True, primary=True, legacy=True)
+    return None
+
+
 class HttpProxy:
     """Route table + auth + concurrency cap + shared result cache.
 
@@ -2224,9 +2344,10 @@ class HttpProxy:
             return _http_json(503, {"error": f"{self.label} proxy disabled: "
                                              f"{self.disabled_reason}"})
 
-        auth = (headers.get("Authorization") or "") if headers is not None else ""
-        supplied = auth[7:] if auth.startswith("Bearer ") else ""
-        if not hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+        # Every client route's one auth check (Worbus P2): a device secret is its
+        # user; the legacy HUB_TOKEN is the primary user while the switch is on.
+        caller = _request_caller(headers)
+        if caller is None:
             return _http_json(401, {"error": "unauthorized"})
 
         spec = self.routes.get((method, path))
@@ -2243,11 +2364,14 @@ class HttpProxy:
                 return _http_json(400, {"error": "malformed JSON body"})
 
         params = self._filtered_params(spec, query)
+        token = _CALLER.set(caller)
         try:
             status, data, ctype = await self.call((method, path), spec, params, body)
         except Exception as e:  # noqa: BLE001 — a proxy fault must not kill the socket
             log(f"{self.label} proxy failed:", e)
             return _http_json(502, {"error": "proxy failure"})
+        finally:
+            _CALLER.reset(token)
         dlog(f"{self.label.upper()} {method} {path} -> {status} ({len(data)}B)")
         return _http_response(status, data, ctype)
 
@@ -5229,8 +5353,13 @@ class StationProxy(HttpProxy):
         if hub is None:
             return 503, json.dumps({"fallback": True, "error": "hub starting"}).encode(), \
                 "application/json"
-        # The primary user's stations until sign-in (H2) gives the bearer a user.
-        status, payload = await hub.primary_space.stations.route(route[1], body or {})
+        # The caller's own stations: a device secret's user, the legacy token's
+        # primary user (design §6.3). `space_for` only ever sees a name Navidrome
+        # confirmed at sign-in, or the primary user (R16).
+        caller = _CALLER.get()
+        space = (hub.primary_space if caller is None or caller.primary
+                 else hub.space_for(caller.user))
+        status, payload = await space.stations.route(route[1], body or {})
         return status, json.dumps(payload).encode(), "application/json"
 
 
@@ -5907,6 +6036,31 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
         await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
     dlog("LB fill ->", frame)
     return _http_json(200, {"ok": True})
+
+
+async def _handle_hub_auth(protocol: Any, raw_path: str, headers: Any,
+                           method: str) -> Optional[tuple]:
+    """POST /hub/signin and POST /hub/signout (PROTOCOL §3, design §6.2)."""
+    path = (raw_path.partition("?")[0].rstrip("/") or "/")
+    if path not in (SIGNIN_PATH, SIGNOUT_PATH):
+        return None
+    if method != "POST":
+        return _http_json(405, {"error": "method not allowed"})
+    hub = HUB_INSTANCE
+    if hub is None:
+        return _http_json(503, {"code": "navidrome_unreachable", "error": "hub starting"})
+    if path == SIGNOUT_PATH:
+        status, payload = await hub.signout(headers)
+        return _http_json(status, payload)
+    raw = await _read_body(protocol, headers)
+    try:
+        body = json.loads(raw) if raw else None
+    except Exception:  # noqa: BLE001 — not JSON
+        body = None
+    peer = getattr(protocol, "remote_address", None)
+    remote = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else "?"
+    status, payload = await hub.signin(remote, body)
+    return _http_json(status, payload)
 
 
 async def _handle_lb_notify(protocol: Any, raw_path: str, headers: Any,
@@ -8442,6 +8596,13 @@ class Hub:
         # sha256(device secret) hex -> {"user", "deviceId", "createdAt"}. Never the
         # secret itself (Global Constraints). Filled in by sign-in (H2).
         self.device_auth: dict[str, dict] = {}
+        # What Navidrome last said about each signed-in user: key -> {"name" (its
+        # canonical username), "admin" (adminRole), "checkedAt" (ms)}. Read at
+        # sign-in, refreshed by H4; persisted as `userFlags` so a restart keeps it.
+        self.user_flags: dict[str, dict] = {}
+        # (remote address, lower-cased username) -> times of refused sign-ins in
+        # the last SIGNIN_REFUSALS_WINDOW (R1). In memory only.
+        self._signin_refusals: dict[tuple[str, str], deque] = {}
         # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
         # A HINT only: a client pulls on every welcome whatever it says, because
         # a push missed while the hub was down would leave this stale.
@@ -8499,6 +8660,169 @@ class Hub:
                 raise ValueError("a space needs a user name")
             sp = self.spaces[key] = UserSpace(self, key, primary=key == self.primary_user)
         return sp
+
+    # ----- who is calling (design §6.2) ------------------------------------ #
+    def auth_secret(self, secret: Any) -> Optional[tuple[str, str]]:
+        """(user, deviceId) a device secret is bound to, looked up by its hash."""
+        if not isinstance(secret, str) or not secret:
+            return None
+        row = self.device_auth.get(_secret_hash(secret))
+        return (row["user"], row["deviceId"]) if row else None
+
+    def caller_for(self, user: str, legacy: bool = False) -> Caller:
+        """A Caller for a user the hub knows (a bound secret, or the primary user).
+        The legacy token's admin flag is True until Navidrome has been read for
+        the primary user (R2); from then on, what it said."""
+        key = _space_key(user)
+        flags = self.user_flags.get(key)
+        primary = key == self.primary_user
+        if flags is None:
+            admin = primary          # the legacy caller, before any read (R2)
+        else:
+            admin = bool(flags.get("admin"))
+        name = flags.get("name") if flags and flags.get("name") else key
+        return Caller(user=name, admin=admin, primary=primary, legacy=legacy)
+
+    def caller(self, headers: Any) -> Optional[Caller]:
+        """The caller an HTTP request's bearer names, or None: a device secret is
+        its user; the legacy HUB_TOKEN is the primary user while
+        HUB_ACCEPT_SHARED_TOKEN is on (R3: off, it is a 401 like any bad bearer)."""
+        supplied = _bearer(headers)
+        if hmac.compare_digest(supplied.encode(), TOKEN.encode()):
+            return self.caller_for(self.primary_user, legacy=True) if ACCEPT_SHARED_TOKEN \
+                else None
+        bound = self.auth_secret(supplied)
+        return self.caller_for(bound[0]) if bound else None
+
+    # ----- sign-in and sign-out (PROTOCOL §3) ------------------------------- #
+    def _refusals(self, key: tuple[str, str]) -> deque:
+        q = self._signin_refusals.setdefault(key, deque())
+        cutoff = time.monotonic() - SIGNIN_REFUSALS_WINDOW
+        while q and q[0] < cutoff:
+            q.popleft()
+        return q
+
+    def _mint_device_id(self) -> str:
+        taken = {did for sp in self.spaces.values() for did in sp.devices}
+        taken |= {r["deviceId"] for r in self.device_auth.values()}
+        while True:
+            did = os.urandom(8).hex()
+            if did not in taken:
+                return did
+
+    def _device_id_for(self, key: str, asked: Any) -> str:
+        """R4: an id this user already has (a device row in their space, or one of
+        their credentials) is kept; an unknown id, or one in another user's space
+        or credentials, gets a freshly minted one."""
+        if isinstance(asked, str) and asked and len(asked) <= SIGNIN_STR_MAX:
+            sp = self.spaces.get(key)
+            own = (sp is not None and asked in sp.devices) or any(
+                r["user"] == key and r["deviceId"] == asked for r in self.device_auth.values())
+            if own:
+                return asked
+        return self._mint_device_id()
+
+    async def signin(self, remote: str, body: Any) -> tuple[int, dict]:
+        """POST /hub/signin: check the pair with Navidrome, bind a fresh secret to
+        (user, deviceId). The pair is never stored or logged; of the secret only
+        its sha256 is kept, and the log names lengths only."""
+        if not isinstance(body, dict):
+            return 400, {"code": "bad_request"}
+        username, salt, token = body.get("username"), body.get("salt"), body.get("token")
+        name, platform = body.get("name"), body.get("platform")
+        ok = (isinstance(username, str) and username.strip()
+              and len(username) <= SIGNIN_STR_MAX
+              and isinstance(salt, str) and SIGNIN_SALT_MIN <= len(salt) <= SIGNIN_STR_MAX
+              and isinstance(token, str) and len(token) == 32
+              and all(c in "0123456789abcdef" for c in token)
+              and isinstance(name, str) and len(name) <= SIGNIN_STR_MAX
+              and isinstance(platform, str) and len(platform) <= SIGNIN_STR_MAX
+              and (body.get("deviceId") is None or isinstance(body.get("deviceId"), str)))
+        if not ok:
+            return 400, {"code": "bad_request"}
+        rate_key = (remote, _space_key(username))
+        if len(self._refusals(rate_key)) >= SIGNIN_REFUSALS_MAX:
+            log(f"sign-in for {username[:64]!r} from {remote}: too many refused attempts")
+            return 429, {"code": "too_many_attempts"}
+        try:
+            verdict, user = await asyncio.wait_for(
+                asyncio.to_thread(_nd_check_signin_blocking, username, salt, token),
+                SIGNIN_ND_TIMEOUT + 1)
+        except asyncio.TimeoutError:
+            verdict, user = "unreachable", None
+        if verdict == "unreachable":
+            log(f"sign-in for {username[:64]!r}: Navidrome did not answer")
+            return 503, {"code": "navidrome_unreachable"}
+        if verdict != "ok" or user is None:
+            self._refusals(rate_key).append(time.monotonic())
+            log(f"sign-in for {username[:64]!r} from {remote}: Navidrome refused "
+                f"(salt length {len(salt)}, token length {len(token)})")
+            return 401, {"code": "navidrome_refused"}
+        canonical = user["username"]
+        key = _space_key(canonical)
+        did = self._device_id_for(key, body.get("deviceId"))
+        # A re-sign-in of the same device replaces its old secret (design §7 RACES).
+        for h in [h for h, r in self.device_auth.items()
+                  if r["user"] == key and r["deviceId"] == did]:
+            del self.device_auth[h]
+        secret = secrets.token_urlsafe(32)
+        self.device_auth[_secret_hash(secret)] = {
+            "user": key, "deviceId": did, "createdAt": int(time.time() * 1000)}
+        self.user_flags[key] = {"name": canonical, "admin": user["adminRole"],
+                                "checkedAt": int(time.time() * 1000)}
+        self.space_for(key)   # R16: a name Navidrome just confirmed
+        self._save()
+        caller = self.caller_for(key)
+        log(f"sign-in: {canonical!r} on device {did[:8]} ({name[:64]!r}, {platform[:32]}); "
+            f"admin={caller.admin} primary={caller.primary}; secret length {len(secret)}")
+        return 200, {"deviceId": did, "deviceSecret": secret, "user": caller.wire()}
+
+    async def signout(self, headers: Any) -> tuple[int, dict]:
+        """POST /hub/signout with the device's secret: forget that credential. The
+        device row stays, so a later sign-in by the same user keeps its id. A
+        socket still bound to it is closed with 4005."""
+        supplied = _bearer(headers)
+        bound = self.auth_secret(supplied)
+        if bound is None:
+            return 401, {"code": "signed_out"}
+        del self.device_auth[_secret_hash(supplied)]
+        user, did = bound
+        self._save()
+        log(f"sign-out: {user!r} device {did[:8]}")
+        sp = self.spaces.get(user)
+        dev = sp.devices.get(did) if sp is not None else None
+        if dev is not None and dev.ws is not None:
+            self._spawn(self._signed_out(dev.ws))
+        return 200, {}
+
+    @staticmethod
+    async def _signed_out(ws: Any) -> None:
+        try:
+            await ws.send(json.dumps(SIGNED_OUT_FRAME))
+        except Exception:  # noqa: BLE001
+            pass
+        await UserSpace._close(ws, 4005, "signed out")  # noqa: SLF001
+
+    def _prune_device_auth(self) -> int:
+        """Credentials go with their device (design §6.2 Expiry): a row whose device
+        row is gone, and that is older than DEVICE_TTL_DAYS, is dropped. A row
+        whose device never said hello (R5) therefore lasts DEVICE_TTL_DAYS from its
+        sign-in; one whose device row the sweep removed goes with it."""
+        if DEVICE_TTL_DAYS <= 0:
+            return 0
+        cutoff = int(time.time() * 1000) - int(DEVICE_TTL_DAYS * 86_400_000)
+        stale = []
+        for h, r in self.device_auth.items():
+            sp = self.spaces.get(r["user"])
+            if sp is not None and r["deviceId"] in sp.devices:
+                continue
+            if r.get("createdAt", 0) < cutoff:
+                stale.append(h)
+        for h in stale:
+            del self.device_auth[h]
+        if stale:
+            log(f"pruned {len(stale)} device credential(s) with no device left")
+        return len(stale)
 
     def _spawn(self, coro: Any) -> None:
         """Run `coro` in the background, holding a reference until it is done."""
@@ -8641,12 +8965,28 @@ class Hub:
                     continue
                 self.space_for(key).apply_state(section, where=f"state users.{key[:64]}")
 
+        def user_flags() -> None:
+            raw = data.get("userFlags")
+            for k, row in (raw if isinstance(raw, dict) else {}).items():
+                key = _space_key(k)
+                if not key or not isinstance(row, dict):
+                    continue
+                name = row.get("name")
+                self.user_flags[key] = {
+                    "name": name if isinstance(name, str) and name else key,
+                    "admin": row.get("admin") is True,
+                    "checkedAt": _as_int(row.get("checkedAt"), 0, 0)}
+
         for name, section in (("lbIndex", lb_index), ("deviceAuth", device_auth),
-                              ("users", users)):
+                              ("userFlags", user_flags), ("users", users)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
                 log(f"state: skipped unreadable {name}:", e)
+        try:
+            self._prune_device_auth()
+        except Exception as e:  # noqa: BLE001
+            log("state: device credential pruning failed:", e)
 
     def _move_primary(self, old: str, data: dict) -> None:
         """HUB_ND_USER is no longer the user the file's top level belongs to (R15).
@@ -8705,14 +9045,24 @@ class Hub:
         """Expire stale picker rows while the hub runs, not just at startup."""
         while True:
             await asyncio.sleep(DEVICE_SWEEP_INTERVAL)
-            for sp in list(self.spaces.values()):
-                try:  # per space: one user's failure must not skip the others
-                    if sp._prune_devices():  # noqa: SLF001 — same module
-                        self._save()
-                        await sp._broadcast_devices()  # noqa: SLF001
-                    sp.stations._sweep()  # noqa: SLF001
-                except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
-                    log("device sweep error:", e)
+            await self._sweep_once()
+
+    async def _sweep_once(self) -> None:
+        """One pass of the sweep: every space's stale devices and idle stations,
+        then the credentials whose device is gone (design §6.2 Expiry, R5)."""
+        for sp in list(self.spaces.values()):
+            try:  # per space: one user's failure must not skip the others
+                if sp._prune_devices():  # noqa: SLF001 — same module
+                    self._save()
+                    await sp._broadcast_devices()  # noqa: SLF001
+                sp.stations._sweep()  # noqa: SLF001
+            except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
+                log("device sweep error:", e)
+        try:
+            if self._prune_device_auth():
+                self._save()
+        except Exception as e:  # noqa: BLE001
+            log("device credential sweep error:", e)
 
     def health(self) -> dict:
         """Liveness snapshot for the HTTP health endpoint.
@@ -8750,6 +9100,7 @@ class Hub:
         data["users"] = {key: sp.state_dict() for key, sp in self.spaces.items()
                          if key != self.primary_user}
         data["deviceAuth"] = self.device_auth
+        data["userFlags"] = self.user_flags
         # Whose space the top level is (R15); a P1 hub ignores it.
         data["primaryUser"] = self.primary_user
         return json.dumps(data), _durable_signature_of(data)
@@ -8867,6 +9218,23 @@ class Hub:
         self._last_lb_index_save_at = time.monotonic()
         self._save()
 
+    @staticmethod
+    def _bind_device_id(desc: dict, bound_id: str, dname: str) -> dict:
+        """The id a secret-bound hello registers (design §6.2): the secret's own,
+        whatever the hello claims, except a `cast-` id whose `bridgedBy` is the
+        secret's id, which is that user's bridged speaker."""
+        claimed = desc.get("id")
+        if isinstance(claimed, str) and claimed.startswith("cast-") \
+                and desc.get("bridgedBy") == bound_id:
+            return desc
+        if claimed not in (None, bound_id):
+            log(f"hello from {dname!r} claimed id {str(claimed)[:16]!r}; "
+                f"its secret is bound to {bound_id[:8]}, which it registers as")
+        desc = dict(desc)
+        desc["id"] = bound_id
+        desc.pop("bridgedBy", None)
+        return desc
+
     async def handler(self, ws: Any) -> None:
         dev: Optional[Device] = None
         space: Optional[UserSpace] = None
@@ -8887,20 +9255,59 @@ class Hub:
             if not isinstance(msg, dict):
                 await close(ws, 4002, "protocol")
                 return
-            token_ok = not TOKEN or hmac.compare_digest(str(msg.get("token") or ""), TOKEN)
-            if msg.get("t") != "hello" or not token_ok:
-                got = str(msg.get("token") or "")
-                name = (msg.get("device") or {}).get("name", "?")
+            desc = msg.get("device")
+            desc = dict(desc) if isinstance(desc, dict) else {}
+            dname = str(desc.get("name", "?"))[:64]
+            auth = msg.get("auth")
+            secret = auth.get("deviceSecret") if isinstance(auth, dict) else None
+            got = msg.get("token") if isinstance(msg.get("token"), str) else ""
+
+            async def refuse_token() -> None:
                 # Length only, never a prefix of what was supplied. The prefix was there to
                 # catch a quoted value from docker --env-file, and the length difference it
                 # produces says the same thing without putting four characters of somebody's
                 # secret in a log file that gets pasted into bug reports.
-                log(f"AUTH REJECTED for {name!r}: supplied token has length {len(got)}, "
+                log(f"AUTH REJECTED for {dname!r}: supplied token has length {len(got)}, "
                     f"expected {len(TOKEN)} — check HUB_TOKEN "
                     f"(note: docker --env-file does NOT strip quotes, which shows up here "
-                    f"as a length two greater than expected)")
+                    f"as a length two greater than expected)"
+                    + ("" if ACCEPT_SHARED_TOKEN else
+                       "; HUB_ACCEPT_SHARED_TOKEN is off, so the shared token is refused"))
                 await ws.send(json.dumps({"t": "error", "code": "auth", "message": "bad token"}))
                 await close(ws, 4001, "auth")
+
+            async def refuse_signed_out(why: str) -> None:
+                log(f"SIGNED OUT: {dname!r} {why}")
+                await ws.send(json.dumps(SIGNED_OUT_FRAME))
+                await close(ws, 4005, "signed out")
+
+            # Which user's space this connection is bound to, for its whole life
+            # (design §6.2-6.3): a device secret's user, or for the legacy shared
+            # token the primary user.
+            if msg.get("t") != "hello":
+                await refuse_token()
+                return
+            if isinstance(secret, str) and secret:
+                bound = self.auth_secret(secret)
+                if bound is None:
+                    await refuse_signed_out(f"offered a device secret this hub does not hold "
+                                            f"(length {len(secret)})")
+                    return
+                user, bound_id = bound
+                desc = self._bind_device_id(desc, bound_id, dname)
+                space, caller = self.space_for(user), self.caller_for(user)
+            elif got:
+                if not (ACCEPT_SHARED_TOKEN and TOKEN and hmac.compare_digest(got, TOKEN)):
+                    await refuse_token()
+                    return
+                space, caller = self.primary_space, self.caller_for(self.primary_user,
+                                                                     legacy=True)
+            elif not TOKEN:
+                # Loopback with HUB_ALLOW_INSECURE_NO_AUTH: no credential, as before.
+                space, caller = self.primary_space, self.caller_for(self.primary_user,
+                                                                     legacy=True)
+            else:
+                await refuse_signed_out("sent no credential")
                 return
 
             # Before registering, so a device is never half-announced while its
@@ -8912,16 +9319,13 @@ class Hub:
             # where both sides zero the command echo (PROTOCOL §5.2), and a `do`
             # ahead of it would be numbered for a connection that has not begun.
             # `ws.send` writes its frame before it first suspends.
-            #
-            # Which user's space this connection is bound to, for its whole life.
-            # Until sign-in (H2) every accepted hello is the legacy shared token,
-            # which is the primary user (design §6.2).
-            space = self.primary_space
-            dev, arrival = space._register(msg.get("device", {}), ws)  # noqa: SLF001
+            dev, arrival = space._register(desc, ws)  # noqa: SLF001
             welcome = {
                 "t": "welcome",
                 "deviceId": dev.id,
                 "features": list(HUB_FEATURES),
+                # Who this socket acts for (R2): an older client ignores it.
+                "user": caller.wire(),
                 "session": space._session_snapshot(),  # noqa: SLF001
                 "savedQueues": space._saved_queues_list(),  # noqa: SLF001
                 "mixes": space._mixes_list(),  # noqa: SLF001
@@ -9015,8 +9419,11 @@ def _build_proxy_protocol() -> Optional[type]:
             # sit under the lb prefix but are inbound, so LbProxy would 404 them
             # against its route table. (/lb/index matches only exactly, so the
             # proxied /lb/index/changes and /lb/index/keys fall through.)
-            result = await _handle_lb_notify(self, path, request_headers,
-                                             self.http_method)
+            result = await _handle_hub_auth(self, path, request_headers,
+                                            self.http_method)
+            if result is None:
+                result = await _handle_lb_notify(self, path, request_headers,
+                                                 self.http_method)
             if result is None:
                 result = await _handle_lb_fill(self, path, request_headers,
                                                self.http_method)
@@ -9242,7 +9649,8 @@ async def main() -> None:
     # and the MusicBrainz-backed routes were on the same cliff. The deadline has
     # to clear the slowest thing the proxy is allowed to wait for.
     handshake_timeout = max(PROXY_TIMEOUT, PROXY_SLOW_TIMEOUT,
-                            PROXY_SEARCH_TIMEOUT, STATION_BUDGET_S) + 15
+                            PROXY_SEARCH_TIMEOUT, STATION_BUDGET_S,
+                            SIGNIN_ND_TIMEOUT + 1) + 15
     async with websockets.serve(hub.handler, HOST, PORT,
                                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
                                 open_timeout=handshake_timeout,
