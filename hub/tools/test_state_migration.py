@@ -112,9 +112,9 @@ def write_fixture(state: str) -> dict:
     return data
 
 
-def new_hub(state: str) -> "hubmod.Hub":
+def new_hub(state: str, nd_user: str = "Owner") -> "hubmod.Hub":
     hubmod.STATE_PATH = state
-    hubmod.ND_USER = "Owner"
+    hubmod.ND_USER = nd_user
     return hubmod.Hub()
 
 
@@ -462,11 +462,188 @@ def test_station_side_files_per_user(tmp: str) -> list[str]:
     return failures
 
 
+# --------------------------------------------------------------------------- #
+# 5 (R14): a long name's side files
+# --------------------------------------------------------------------------- #
+def test_side_file_stem_long_names(tmp: str) -> list[str]:
+    failures: list[str] = []
+    state = os.path.join(tmp, "state.json")
+    h = new_hub(state)
+    users_dir = state + ".users"
+    short, edge, long_ = "Ж" * 19, "ж" * 20, "Жанна" * 10   # 114 / 120 / 300 bytes quoted
+    stems = {k: os.path.basename(h.space_for(k).stations._history_file.path)  # noqa: SLF001
+             for k in (short, edge, long_)}
+    import hashlib
+    import urllib.parse
+    want = {short: urllib.parse.quote(short.lower(), safe="") + ".history",
+            edge: urllib.parse.quote(edge, safe="") + ".history",
+            long_: "sha256-" + hashlib.sha256(long_.lower().encode()).hexdigest() + ".history"}
+    for k, w in want.items():
+        if stems[k] != w:
+            failures.append(f"a {len(k)}-letter name's history file is {stems[k]!r}, not {w!r}")
+        if len((stems[k] + ".tmp").encode()) > 255:
+            failures.append(f"a {len(k)}-letter name's file name is past 255 bytes")
+    sp = h.space_for(long_)
+    sp.stations._history_add("long-tr", "a1a1")  # noqa: SLF001
+    sp.stations.stations["st_long"] = hubmod.Station.from_state(_station("st_long"))
+    sp.stations._stations_touch()  # noqa: SLF001
+    h._save()  # noqa: SLF001
+    for s in h.spaces.values():
+        s.stations.close()
+    h2 = new_hub(state)
+    s2 = h2.spaces.get(long_.lower())
+    if s2 is None or [p[0] for p in s2.stations.history] != ["long-tr"] \
+            or set(s2.stations.stations) != {"st_long"}:
+        failures.append("a long Cyrillic name's stations/history did not round-trip")
+    if any(os.path.basename(p).startswith("%") and len(p) > 200 for p in os.listdir(users_dir)):
+        failures.append(f"a long encoded stem reached the disk: {os.listdir(users_dir)}")
+    return failures
+
+
+# --------------------------------------------------------------------------- #
+# 6 (R15): HUB_ND_USER changed between two starts
+# --------------------------------------------------------------------------- #
+def _bob_into(h: "hubmod.Hub") -> None:
+    bob = h.space_for("bob")
+    bob.session.queue = [_song(7), _song(8)]
+    bob.session.saved_queue_id = "q_b"
+    bob.saved_queues["q_b"] = bob._sanitize_saved_queue(  # noqa: SLF001
+        {"id": "q_b", "songs": [_song(7)], "createdAt": NOW, "updatedAt": NOW})
+    bob.mixes["mx_b"] = hubmod.Hub._sanitize_mix({"id": "mx_b", "name": "Bob mix",
+                                                  "kind": "genre", "seedId": "g2"})
+    bob.devices["bob-phone"] = hubmod.Device(id="bob-phone", name="Bob phone", last_seen=NOW)
+    bob.deleted_saved_queues["q_bx"] = NOW
+    bob.stations.stations["st_bob"] = hubmod.Station.from_state(_station("st_bob"))
+    bob.stations._stations_touch()  # noqa: SLF001
+    bob.stations._history_add("bob-tr", "cafe")  # noqa: SLF001
+    bob.session.station_id = "st_bob"
+
+
+def _check_bob(label: str, sp: object, failures: list) -> None:
+    if [t.get("id") for t in sp.session.queue] != ["tr7", "tr8"]:
+        failures.append(f"{label}: bob's queue {[t.get('id') for t in sp.session.queue]}")
+    if set(sp.saved_queues) != {"q_b"} or set(sp.mixes) != {"mx_b"} \
+            or set(sp.devices) != {"bob-phone"} or set(sp.deleted_saved_queues) != {"q_bx"}:
+        failures.append(f"{label}: bob's rows {sorted(sp.saved_queues)} {sorted(sp.mixes)} "
+                        f"{sorted(sp.devices)} {sorted(sp.deleted_saved_queues)}")
+    if set(sp.stations.stations) != {"st_bob"} or [p[0] for p in sp.stations.history] != ["bob-tr"]:
+        failures.append(f"{label}: bob's stations/history {sorted(sp.stations.stations)} "
+                        f"{sp.stations.history}")
+    if sp.session.station_id != "st_bob":
+        failures.append(f"{label}: bob's station binding {sp.session.station_id!r}")
+
+
+def test_primary_user_change_moves_spaces(tmp: str) -> list[str]:
+    global ROLLBACK_PARSER
+    import contextlib
+    import io
+    failures: list[str] = []
+    state = os.path.join(tmp, "state.json")
+    fx = write_fixture(state)
+    h = new_hub(state)
+    _bob_into(h)
+    h._save()  # noqa: SLF001
+    for sp in h.spaces.values():
+        sp.stations.close()
+    with open(state, encoding="utf-8") as f:
+        if json.load(f).get("primaryUser") != "owner":
+            failures.append("state.json does not name its primary user")
+
+    # owner -> bob
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        h2 = new_hub(state, "Bob")
+    moved = [ln for ln in out.getvalue().splitlines() if "primary user changed" in ln]
+    if len(moved) != 1 or "'owner'" not in moved[0] or "'bob'" not in moved[0]:
+        failures.append(f"the move was not logged once by name: {moved}")
+    if h2.primary_user != "bob" or set(h2.spaces) != {"bob", "owner"}:
+        failures.append(f"after the move: primary {h2.primary_user!r}, spaces {sorted(h2.spaces)}")
+        return failures
+    _check_bob("bob, now primary", h2.primary_space, failures)
+    check_primary_holds_fixture("owner, now under users", h2.spaces["owner"], fx, failures)
+    with open(state, encoding="utf-8") as f:
+        raw = json.load(f)
+    if raw.get("primaryUser") != "bob" or [t["id"] for t in raw["session"]["queue"]] != ["tr7", "tr8"]:
+        failures.append("the move was not saved: bob is not the top level")
+    if [t["id"] for t in raw.get("users", {}).get("owner", {}).get("session", {}).get("queue", [])] \
+            != ["tr1", "tr2", "tr3"]:
+        failures.append("the move was not saved: the owner is not under users")
+    with open(state + ".history", encoding="utf-8") as f:
+        if [p[0] for p in json.load(f)["plays"]] != ["bob-tr"]:
+            failures.append("today's history file is not bob's after the move")
+    with open(os.path.join(state + ".users", "owner.history"), encoding="utf-8") as f:
+        if [p[0] for p in json.load(f)["plays"]] != ["tr1", "tr2"]:
+            failures.append("the owner's history did not move under .users/")
+    if os.path.exists(os.path.join(state + ".users", "bob.history")):
+        failures.append("bob's old .users/ copy was left behind")
+
+    # bob -> owner: and back, nothing lost either way
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        h3 = new_hub(state, "owner")
+    if sum("primary user changed" in ln for ln in out.getvalue().splitlines()) != 1:
+        failures.append("the move back was not logged once")
+    check_primary_holds_fixture("owner, primary again", h3.primary_space, fx, failures)
+    if "bob" not in h3.spaces:
+        failures.append("bob's space was lost on the move back")
+    else:
+        _check_bob("bob, under users again", h3.spaces["bob"], failures)
+    # A third start with the same user moves nothing.
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        new_hub(state, "owner")
+    if "primary user changed" in out.getvalue():
+        failures.append("a start with an unchanged HUB_ND_USER moved the spaces")
+
+    # The rollback still finds the owner at the top level.
+    p1 = _load_p1_module(tmp)
+    if p1 is not None:
+        p1.STATE_PATH = state
+        old = p1.Hub()
+    else:
+        old = _P1KeysOnly(state)
+    check_primary_holds_fixture("rollback after two moves", old, fx, failures)
+    if any(t.get("id") == "tr7" for t in old.session.queue) or "st_bob" in old.stations.stations:
+        failures.append("the rollback after two moves sees bob's data as the owner's")
+    return failures
+
+
+def test_move_to_a_user_without_a_space(tmp: str) -> list[str]:
+    """HUB_ND_USER changed to someone the file never had: an empty primary space,
+    the old one kept whole under users. And a file without `primaryUser` (P1's)
+    belongs to whoever HUB_ND_USER is now."""
+    failures: list[str] = []
+    state = os.path.join(tmp, "state.json")
+    fx = write_fixture(state)
+    h = new_hub(state)            # writes nothing yet: the fixture has no primaryUser
+    h._save()  # noqa: SLF001
+    h2 = new_hub(state, "carol")
+    if h2.primary_space.session.queue or h2.primary_space.mixes or h2.primary_space.stations.stations:
+        failures.append("carol's new primary space is not empty")
+    if "owner" not in h2.spaces:
+        failures.append("the owner's space was lost moving to a user with none")
+    else:
+        check_primary_holds_fixture("owner under users", h2.spaces["owner"], fx, failures)
+    # P1's file, no primaryUser: HUB_ND_USER's, whoever that is.
+    state2 = os.path.join(tmp, "p1", "state.json")
+    os.makedirs(os.path.dirname(state2))
+    write_fixture(state2)
+    h3 = new_hub(state2, "dave")
+    if set(h3.spaces) != {"dave"}:
+        failures.append(f"a P1 file with HUB_ND_USER=dave made spaces {sorted(h3.spaces)}")
+    else:
+        check_primary_holds_fixture("P1 file as dave's", h3.primary_space, fx, failures)
+    return failures
+
+
 def main() -> int:
     tests = [test_state_without_users_loads_as_primary,
              test_primary_space_stays_in_top_level_keys,
              test_other_users_round_trip_under_users,
-             test_station_side_files_per_user]
+             test_station_side_files_per_user,
+             test_side_file_stem_long_names,
+             test_primary_user_change_moves_spaces,
+             test_move_to_a_user_without_a_space]
     failures: list[str] = []
     saved_path, saved_user = hubmod.STATE_PATH, hubmod.ND_USER
     for t in tests:
@@ -485,7 +662,8 @@ def main() -> int:
         return 1
     print("PASS - state migration: p1-file-loads-as-primary/rollback-keeps-owner-top-level"
           f"({ROLLBACK_PARSER})/other-users-round-trip-under-users/"
-          "station-side-files-per-user")
+          "station-side-files-per-user/long-name-stem-hashed/"
+          "primary-user-change-moves-spaces-both-ways+rollback/move-to-a-new-user")
     return 0
 
 

@@ -3615,6 +3615,12 @@ class StationEngine:
     def _stations_touch(self) -> None:
         self._stations_file.touch()
 
+    def persist_now(self) -> None:
+        """Write both side files now, changed or not (a primary-user move, R15)."""
+        for f in (self._history_file, self._stations_file):
+            f._dirty = True  # noqa: SLF001 — same module
+            f.flush()
+
     def close(self) -> None:
         """Graceful stop: the history and the stations are written now, not up to
         30 s from now, each after any write of its own still in flight."""
@@ -6010,12 +6016,27 @@ def _space_key(user: Any) -> str:
     return user.strip().lower() if isinstance(user, str) else ""
 
 
+# The longest percent-encoded key used as a side-file stem (ruling R14). Past it the
+# stem is `sha256-<hex>`: `quote` makes a non-ASCII character 6 bytes, so a 50-letter
+# Cyrillic name would pass the 255-byte file-name limit with `.history.tmp`.
+SIDE_STEM_MAX = 120
+
+
+def _space_side_stem(key: str) -> str:
+    """The file-name stem of a user's station side files: the percent-encoded key
+    (a name with `/` or one that is `..` stays a plain file name; letters, digits
+    and `_.-` are unchanged) when it is at most SIDE_STEM_MAX bytes, else
+    `sha256-<hex of the key>`. Both are deterministic, so a restart finds them."""
+    stem = urllib.parse.quote(key, safe="")
+    if len(stem.encode("ascii")) <= SIDE_STEM_MAX:
+        return stem
+    return "sha256-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def _space_side_base(key: str) -> str:
-    """Where a non-primary user's station side files live: `<HUB_STATE>.users/<key>`
-    plus today's suffixes (`.history`, `.stations`). The key is percent-encoded, so
-    a name with `/` or one that is `..` stays a file name inside `.users/`; a plain
-    name (letters, digits, `_.-`) is unchanged."""
-    return os.path.join(STATE_PATH + USERS_DIR_SUFFIX, urllib.parse.quote(key, safe=""))
+    """Where a non-primary user's station side files live: `<HUB_STATE>.users/<stem>`
+    plus today's suffixes (`.history`, `.stations`); see `_space_side_stem`."""
+    return os.path.join(STATE_PATH + USERS_DIR_SUFFIX, _space_side_stem(key))
 
 
 class UserSpace:
@@ -8454,7 +8475,12 @@ class Hub:
         # The primary user's space is built before _load, which hands it today's
         # top-level state (its StationEngine reads today's side files as it is built).
         self.space_for(self.primary_user)
+        # Set by _apply_state when the file's primary user is not HUB_ND_USER
+        # (ruling R15): the engine holding the new primary user's old side-file
+        # copies, for the steps that finish the move once the load is done.
+        self._primary_move: Optional[StationEngine] = None
         self._load()
+        self._finish_primary_move()
         # A timer the state file brought back counts down from here.
         for sp in self.spaces.values():
             sp._sleep_arm()  # noqa: SLF001 — same module
@@ -8560,8 +8586,19 @@ class Hub:
         the same keys; `lbIndex` and `deviceAuth` are the hub's. Each part is
         guarded on its own, as each section inside a space is: one unreadable user
         costs that user, never the owner or the others.
+
+        `primaryUser` names whose space the top level is. A file without it (P1's)
+        is HUB_ND_USER's. When it names someone else, HUB_ND_USER was changed:
+        that user's space moves under `users` and HUB_ND_USER's comes up to the
+        top level (`_move_primary`, ruling R15).
         """
-        self.primary_space.apply_state(data)
+        named = data.get("primaryUser")
+        old = _space_key(named) if isinstance(named, str) else ""
+        moved_from = old if old and old != self.primary_user else None
+        if moved_from is None:
+            self.primary_space.apply_state(data)
+        else:
+            self._move_primary(moved_from, data)
 
         def lb_index() -> None:
             # Additive like `mixes`: a state.json from before the index mirror
@@ -8592,6 +8629,8 @@ class Hub:
                 raise TypeError(f"users is {type(raw).__name__}, not an object")
             for name, section in raw.items():
                 key = _space_key(name)
+                if moved_from is not None and key == self.primary_user:
+                    continue  # brought up to the top level by _move_primary
                 if not key or key == self.primary_user or key in self.spaces:
                     # The primary user is the top level; a second spelling of a key
                     # already read would overwrite it.
@@ -8608,6 +8647,59 @@ class Hub:
                 section()
             except Exception as e:  # noqa: BLE001
                 log(f"state: skipped unreadable {name}:", e)
+
+    def _move_primary(self, old: str, data: dict) -> None:
+        """HUB_ND_USER is no longer the user the file's top level belongs to (R15).
+
+        The top level (with today's station side files) becomes `old`'s space,
+        filed under `users`; `users[<HUB_ND_USER>]`, if there is one, becomes the
+        primary space (with its `.users/` side files), else the primary space
+        starts empty. Nothing is dropped. The old primary user's stations and
+        history are written to their new place here, before anything can save
+        state.json; `_finish_primary_move` does the rest once the load is done.
+        """
+        new = self.primary_user
+        log(f"primary user changed from {old!r} to {new!r} (HUB_ND_USER): {old!r}'s "
+            f"state moves under users, {new!r}'s comes to the top level")
+        prim = self.primary_space
+        old_sp = self.space_for(old)
+        # Today's side files (loaded into the primary engine as it was built) are
+        # the old primary user's; the new one's are their `.users/` copies.
+        theirs = StationEngine(prim, self.station_shared, side_base=_space_side_base(new))
+        old_sp.stations.stations, old_sp.stations.history = (prim.stations.stations,
+                                                             prim.stations.history)
+        prim.stations.stations, prim.stations.history = theirs.stations, theirs.history
+        old_sp.stations.persist_now()
+        self._primary_move = theirs
+        users = data.get("users")
+        section = None
+        for name, raw in (users.items() if isinstance(users, dict) else ()):
+            if _space_key(name) == new and isinstance(raw, dict):
+                section = raw
+                break
+        if section is not None:
+            prim.apply_state(section, where=f"state users.{new[:64]} (now primary)")
+        old_sp.apply_state(data, where=f"state (previous primary {old[:64]})")
+
+    def _finish_primary_move(self) -> None:
+        """The rest of a primary-user move, in an order a crash cannot lose data
+        in: state.json names the new primary user first, then today's side files
+        become theirs, then their `.users/` copies go. (A crash between the first
+        two steps leaves today's side files read as the new user's at the next
+        start: misfiled, not lost; the old user's copy is already in `.users/`.)"""
+        theirs = self._primary_move
+        if theirs is None:
+            return
+        self._primary_move = None
+        self._save(blocking_backup=True)
+        self.primary_space.stations.persist_now()
+        for f in (theirs._history_file, theirs._stations_file):  # noqa: SLF001
+            try:
+                os.unlink(f.path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log(f"could not remove {os.path.basename(f.path)}:", e)
 
     async def _device_sweep_loop(self) -> None:
         """Expire stale picker rows while the hub runs, not just at startup."""
@@ -8658,6 +8750,8 @@ class Hub:
         data["users"] = {key: sp.state_dict() for key, sp in self.spaces.items()
                          if key != self.primary_user}
         data["deviceAuth"] = self.device_auth
+        # Whose space the top level is (R15); a P1 hub ignores it.
+        data["primaryUser"] = self.primary_user
         return json.dumps(data), _durable_signature_of(data)
 
     def _save(self, blocking_backup: bool = False) -> None:
