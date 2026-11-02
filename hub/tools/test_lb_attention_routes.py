@@ -163,6 +163,10 @@ class FakeHub:
     async def _broadcast(self, obj: dict) -> None:
         self.frames.append(obj)
 
+    # Worbus P2 (H3): the fill relay sends to admins only; recorded the same way.
+    async def _broadcast_admins(self, obj: dict) -> None:
+        self.frames.append(obj)
+
 
 def walk_keys(node, out: set[str]) -> set[str]:
     if isinstance(node, dict):

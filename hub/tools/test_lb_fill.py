@@ -52,6 +52,11 @@ class FakeHub:
     async def _broadcast(self, obj: dict) -> None:
         self.frames.append(obj)
 
+    # Worbus P2 (H3): the fill relay sends to admins only; this fake records it
+    # the same way, so every frame assertion below is unchanged.
+    async def _broadcast_admins(self, obj: dict) -> None:
+        self.frames.append(obj)
+
 
 async def push(payload: dict, token: str | None = None) -> tuple:
     body = json.dumps(payload).encode()

@@ -2353,6 +2353,11 @@ class HttpProxy:
         spec = self.routes.get((method, path))
         if spec is None:
             return _http_json(404, {"error": "unknown route"})
+        if spec.get("nd") and not caller.primary:
+            # A route that sends HUB_ND_USER's credentials upstream reads the
+            # primary user's listening (the Sonic Fingerprint): theirs alone.
+            return _http_json(403, {"code": "primary_only",
+                                    "error": "This is the primary user's listening."})
 
         body: Optional[dict] = None
         if spec["method"] == "POST":
@@ -4698,6 +4703,9 @@ class StationEngine:
         seed = self._parse_seed(body.get("seed"))
         if seed is None:
             return 400, {"code": "bad_seed", "error": "seed must be track, tracks or yourMix"}
+        if seed["kind"] == "yourMix" and not getattr(self.space, "primary", True):
+            # Your mix is the Sonic Fingerprint of HUB_ND_USER (design §6.3).
+            return 403, {"code": "primary_only", "error": "Your mix is the primary user's."}
         character = body.get("character")
         if character is None:
             character = STATION_DEFAULT_CHARACTER
@@ -6033,7 +6041,9 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
             or frame.get("status") in _LB_FILL_SETTLED):
         LB.invalidate(LB_ATTENTION_ROUTES)
     if HUB_INSTANCE is not None:
-        await HUB_INSTANCE._broadcast(frame)  # noqa: SLF001 — same module
+        # Fills are admin actions, and a fill row names peers (design §6.3, R8):
+        # admins' sockets only. Everyone hears an album land from `library`.
+        await HUB_INSTANCE._broadcast_admins(frame)  # noqa: SLF001 — same module
     dlog("LB fill ->", frame)
     return _http_json(200, {"ok": True})
 
@@ -6814,7 +6824,9 @@ class UserSpace:
                                            for d in self.devices.values()]})
 
     def _mirror_play_queue(self) -> None:
-        if not MIRROR_PLAYQUEUE:
+        # The mirror writes HUB_ND_USER's Navidrome play queue with the service
+        # account, so only the primary user's session is mirrored (design §6.3).
+        if not MIRROR_PLAYQUEUE or not self.primary:
             return
         ids = [t.get("id") for t in self.session.queue if t.get("id")]
         current = None
@@ -8835,11 +8847,29 @@ class Hub:
         for sp in self.spaces.values():
             sp.stations.close()
 
-    async def _broadcast(self, obj: dict) -> None:
-        """A frame for every connected device of every user: library facts (`lb`,
-        `index`, `library`) and, until H3 narrows it, `fill`."""
+    # ----- who hears a frame (design §6.3) ---------------------------------- #
+    # Per-user frames (session, devices, progress, savedQueues, mixes, station,
+    # transfer errors) are sent by their own space (UserSpace._broadcast, ._send):
+    # nothing else reaches a space's sockets.
+    async def _broadcast_space(self, space: UserSpace, obj: dict) -> None:
+        await space._broadcast(obj)  # noqa: SLF001 — same module
+
+    async def _broadcast_all(self, obj: dict) -> None:
+        """A library fact (`lb`, `index`, `library`): every connected device of
+        every user."""
         await asyncio.gather(*(sp._broadcast(obj) for sp in list(self.spaces.values())),  # noqa: SLF001
                              return_exceptions=True)
+
+    async def _broadcast_admins(self, obj: dict) -> None:
+        """`fill`: the sockets of admin users only (R8; a legacy-token socket is
+        the primary user's, with that user's admin flag, R2)."""
+        await asyncio.gather(*(sp._broadcast(obj) for key, sp in list(self.spaces.items())  # noqa: SLF001
+                               if self.caller_for(key).admin),
+                             return_exceptions=True)
+
+    async def _broadcast(self, obj: dict) -> None:
+        """The lb-bot relays' name for `_broadcast_all` (library facts)."""
+        await self._broadcast_all(obj)
 
     # ----- persistence ----------------------------------------------------- #
     def _load(self) -> None:
