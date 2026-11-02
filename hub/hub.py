@@ -1904,6 +1904,12 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
         req.add_header("Authorization", f"Bearer {token}")
     if body is not None:
         req.add_header("Content-Type", "application/json")
+    # The caller's identity for lb-bot (X-Worbus-*), set by the proxy for this
+    # call (`_UPSTREAM_HEADERS`; `asyncio.to_thread` carries it into this thread).
+    # Values are bytes, put on the wire as they are: http.client would latin-1
+    # encode a str and refuse a non-Latin name (R11).
+    for name, value in _UPSTREAM_HEADERS.get().items():
+        req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             # One byte past the cap, so "exactly at the limit" and "over it" are
@@ -1943,6 +1949,26 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
                 "application/json")
 
 
+# Extra headers for the upstream call being made (LbProxy: the caller's identity).
+_UPSTREAM_HEADERS: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "hub_upstream_headers", default={})
+
+LBBOT_TOO_OLD = {"code": "lbbot_too_old",
+                 "error": "This Worbus Server's lb-bot is too old for signed-in users."}
+
+
+def _identity_headers(caller: Optional[Caller]) -> dict:
+    """The three X-Worbus-* headers for `caller`, always together (design §6.4):
+    the canonical name as UTF-8 bytes (R11), the admin and primary flags as 1|0.
+    Empty with no caller (the hub's own probe), which lb-bot reads as today's
+    service caller."""
+    if caller is None:
+        return {}
+    return {"X-Worbus-User": caller.user.encode("utf-8"),
+            "X-Worbus-Admin": b"1" if caller.admin else b"0",
+            "X-Worbus-Primary": b"1" if caller.primary else b"0"}
+
+
 def _bearer(headers: Any) -> str:
     auth = (headers.get("Authorization") or "") if headers is not None else ""
     return auth[7:] if auth.startswith("Bearer ") else ""
@@ -1971,7 +1997,9 @@ class HttpProxy:
 
     prefix = ""                                  # e.g. "/sonic"
     label = "proxy"
-    refreshes_caller = False                     # LbProxy: see handle()
+    # LbProxy: the caller's flags are refreshed on its calls, sent to the upstream
+    # as X-Worbus-* headers, and its role class keys the cache and in-flight calls.
+    caller_aware = False
     routes: dict[tuple[str, str], dict] = {}
 
     def __init__(self) -> None:
@@ -2237,8 +2265,19 @@ class HttpProxy:
         # pressing refresh actually means.
         cache_params = sorted((k, v) for k, v in params
                               if k not in PROXY_NO_CACHE_PARAMS)
-        key = json.dumps([route, upstream_path, cache_params, body],
-                         sort_keys=True, default=str)
+        key_parts: list = [route, upstream_path, cache_params, body]
+        if self.caller_aware:
+            # The caller's class (admin, primary), never its name: no lb answer
+            # varies by name, and four variants at most per entry (design §6.4).
+            # Every route, so an answer lb-bot shapes by role (fills, Fresh's
+            # artistPlays, the wishlist's addedBy, Scan now's limits) never
+            # crosses roles from the cache or a coalesced call.
+            # A call with no caller (the hub's own, or a suite driving the proxy)
+            # keeps the classless key it always had.
+            caller = _CALLER.get()
+            if caller is not None:
+                key_parts.append([caller.admin, caller.primary])
+        key = json.dumps(key_parts, sort_keys=True, default=str)
         refresh = any(k in PROXY_NO_CACHE_PARAMS and v not in ("", "0", "false")
                       for k, v in params)
         if spec.get("cache") and not refresh:
@@ -2344,6 +2383,17 @@ class HttpProxy:
         route's for the first call only; the fallback keeps the route's own."""
         query = ("?" + urllib.parse.urlencode(params)) if params else ""
         timeout_route = spec.get("timeout", PROXY_TIMEOUT)
+        ident = _identity_headers(_CALLER.get()) if self.caller_aware else {}
+        token = _UPSTREAM_HEADERS.set(ident)
+        try:
+            return await self._fetch_with(spec, upstream_path, query, payload,
+                                          timeout, timeout_route)
+        finally:
+            _UPSTREAM_HEADERS.reset(token)
+
+    async def _fetch_with(self, spec: dict, upstream_path: str, query: str,
+                          payload: Optional[bytes], timeout: Optional[float],
+                          timeout_route: float) -> tuple[int, bytes, str]:
         result = await asyncio.to_thread(
             _proxy_upstream_blocking, spec["method"], self.upstream + upstream_path + query,
             payload, self.upstream_token,
@@ -2358,6 +2408,10 @@ class HttpProxy:
                 self.upstream + spec["fallback"] + query,
                 payload, self.upstream_token, timeout_route, self.label)
         return result
+
+    def refuse_caller(self, caller: Caller) -> Optional[tuple]:
+        """A refusal for this caller before any route is called, or None."""
+        return None
 
     async def handle(self, protocol: Any, raw_path: str,
                      headers: Any, method: str) -> Optional[tuple]:
@@ -2382,7 +2436,7 @@ class HttpProxy:
         caller = _request_caller(headers)
         if caller is None:
             return _http_json(401, {"error": "unauthorized"})
-        if self.refreshes_caller:
+        if self.caller_aware:
             # An lb call reads the caller's rights: their flags are re-read in the
             # background when older than USER_REFRESH_SECS (design §6.1).
             refresh = getattr(HUB_INSTANCE, "refresh_if_stale", None)
@@ -2392,6 +2446,9 @@ class HttpProxy:
         spec = self.routes.get((method, path))
         if spec is None:
             return _http_json(404, {"error": "unknown route"})
+        refused = self.refuse_caller(caller)
+        if refused is not None:
+            return refused
         if spec.get("nd") and not caller.primary:
             # A route that sends HUB_ND_USER's credentials upstream reads the
             # primary user's listening (the Sonic Fingerprint): theirs alone.
@@ -2489,6 +2546,14 @@ def _lb_health_body(data: bytes) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
+def _lb_identity_of(data: bytes) -> bool:
+    """Whether a health body says lb-bot reads the hub's X-Worbus-* headers
+    (`identity: 1`, Worbus P2). Absent or anything else: an older lb-bot."""
+    value = (_lb_health_body(data) or {}).get("identity")
+    return value is True or (isinstance(value, int) and not isinstance(value, bool)
+                             and value == 1)
+
+
 def _lb_downloads_of(data: bytes) -> Optional[str]:
     """`"on"`/`"off"` from a health body, or None: absent, not a string, any
     other value, not JSON, not an object, or too large. None means "this lb-bot
@@ -2519,7 +2584,7 @@ def _lb_missing_config_of(data: bytes) -> Optional[tuple]:
 class LbProxy(HttpProxy):
     """lb-bot library-gap intelligence (design: ../DESIGN-lbbot-client-integration.md)."""
 
-    refreshes_caller = True
+    caller_aware = True
     prefix = "/lb"
     label = "lbbot"
     routes = LB_ROUTES
@@ -2537,6 +2602,11 @@ class LbProxy(HttpProxy):
         # inbound push that marks it alive again after a restart must not
         # advertise "on" (absent) to clients until the next probe.
         self.downloads: Optional[str] = None
+        # lb-bot reads the X-Worbus-* headers (its /api/health says `identity: 1`).
+        # False until a health answer says so: an older lb-bot would treat every
+        # caller as the hub's admin, so until then only the primary user passes
+        # (design §6.4, "An older lb-bot").
+        self.identity = False
         # lb-bot's `missingConfig` as last logged (`_note_missing_config`).
         self._missing_config: Optional[tuple] = None
         self._refused_logged_at = -math.inf
@@ -2592,12 +2662,24 @@ class LbProxy(HttpProxy):
                                     "webUrl": self.web_url()})
         return None
 
+    def refuse_caller(self, caller: Caller) -> Optional[tuple]:
+        """While lb-bot has no `identity`, everyone but the primary user (and the
+        legacy token, which is the primary user) gets 503 lbbot_too_old, admins
+        included: an older lb-bot would serve them listening and Fresh's
+        artistPlays, and treat them all as admins."""
+        if caller.primary or self.identity:
+            return None
+        return _http_json(503, dict(LBBOT_TOO_OLD))
+
     def welcome_info(self) -> dict:
         """`welcome.lb` and the `lb` frame: the probe's answer, without a client
         having to ask for it."""
         info = {"available": bool(self.enabled and self.available),
                 "routes": self.advertised_routes(),
                 "webUrl": self.web_url()}
+        # Worbus P2: present only when lb-bot's health reported it.
+        if self.enabled and self.identity:
+            info["identity"] = True
         # Worbus P1: present only when lb-bot's health reported it. Absent is an
         # older lb-bot or hub, and every client reads that as "on".
         if self.enabled and self.downloads is not None:
@@ -2615,7 +2697,8 @@ class LbProxy(HttpProxy):
         url = LBBOT_WEB_URL or self.upstream
         return url if url.startswith(("http://", "https://")) else ""
 
-    def _set_available(self, value: bool, downloads: Any = _LB_KEEP) -> None:
+    def _set_available(self, value: bool, downloads: Any = _LB_KEEP,
+                       identity: Any = _LB_KEEP) -> None:
         """The one way the verdict moves, and the one broadcaster of `t: "lb"`.
         A CHANGE of `welcome_info()` is broadcast (ruling R18): `welcome.lb` is a
         connect-time snapshot, and a client that trusts it and stops probing
@@ -2638,6 +2721,8 @@ class LbProxy(HttpProxy):
         self.available = value
         if downloads is not _LB_KEEP:
             self.downloads = downloads
+        if identity is not _LB_KEEP:
+            self.identity = bool(identity)
         after = self.welcome_info()
         if after == before:
             return
@@ -2669,7 +2754,7 @@ class LbProxy(HttpProxy):
         went upstream): a 200 is lb-bot up and states its downloads mode; any
         other status is lb-bot unreachable and says nothing about the mode."""
         if status == 200:
-            self._set_available(True, _lb_downloads_of(data))
+            self._set_available(True, _lb_downloads_of(data), _lb_identity_of(data))
             self._note_missing_config(_lb_missing_config_of(data))
         else:
             self._set_available(False)
