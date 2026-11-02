@@ -216,6 +216,17 @@ def _load_p1_module(tmp: str):
     return None
 
 
+def _base_commit_present() -> bool:
+    """Whether BASE_COMMIT exists in the repository holding this hub (the VM's
+    navi-connect: it must). False where git or the commit is absent."""
+    try:
+        return subprocess.run(["git", "-C", HUB_DIR, "cat-file", "-e",
+                               f"{BASE_COMMIT}^{{commit}}"], capture_output=True,
+                              timeout=20).returncode == 0
+    except Exception:  # noqa: BLE001 — no git
+        return False
+
+
 class _P1KeysOnly:
     """Fallback rollback parser: reads exactly the keys P1 reads, nothing else."""
 
@@ -278,6 +289,12 @@ def test_primary_space_stays_in_top_level_keys(tmp: str) -> list[str]:
         old = p1.Hub()
     else:
         ROLLBACK_PARSER = "P1-keys fallback parser"
+        if _base_commit_present():
+            # H1 review Minor 4: in this repo the real base hub is there, so the
+            # fallback would hide a broken loader behind a weaker check.
+            failures.append(f"the base commit {BASE_COMMIT} is in this repository but its "
+                            "hub.py could not be read: the rollback ran on the fallback "
+                            "parser only")
         old = _P1KeysOnly(state)
     check_primary_holds_fixture(f"rollback ({ROLLBACK_PARSER})", old, fx, failures)
     leaked = []

@@ -60,7 +60,10 @@ STATE_PATH = os.environ.get("HUB_STATE", "/data/state.json")
 # Runs on load AND on a periodic sweep (DEVICE_SWEEP_INTERVAL): without the sweep a
 # long-lived hub accretes a picker row per device that ever connected — including a
 # `cast-<id>` for every speaker ever seen on any network the bridging client visited.
-DEVICE_TTL_DAYS = float(os.environ.get("HUB_DEVICE_TTL_DAYS", "7") or "0")
+# Since Worbus P2 a device's sign-in goes with it (`_prune_device_auth`), so 0 also
+# keeps every credential forever. Unset or blank is the default, 7 (R19): a blank
+# line in a copied .env used to read as 0.
+DEVICE_TTL_DAYS = float((os.environ.get("HUB_DEVICE_TTL_DAYS") or "").strip() or "7")
 DEVICE_SWEEP_INTERVAL = 3600.0  # seconds between stale-device sweeps
 
 NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").rstrip("/")
@@ -87,8 +90,11 @@ SIGNIN_STR_MAX = 128          # username, salt, deviceId, name, platform
 SIGNED_OUT_FRAME = {"t": "error", "code": "signed_out",
                     "message": "Signed out of the Worbus Server."}
 # How old a user's flags may get (design §6.1): re-read on that user's connect or
-# lb call when older, and every this often while any socket is open. The env
-# override exists for the suites only.
+# lb call when older, and every this often while any socket is open. It is also
+# the back-off: at most one read is ATTEMPTED per this interval, whatever its
+# outcome, so a Navidrome that is down or rate-limiting the service account's
+# login (R10) hears from the hub once per interval, not once per hello or lb call.
+# The env override exists for the suites only.
 USER_REFRESH_SECS = float(os.environ.get("HUB_USER_REFRESH_SECS", "600") or "600")
 USER_REFRESH_TIMEOUT = 8.0    # each native-API call of a refresh
 
@@ -313,6 +319,14 @@ PROXY_MAX_RESPONSE = 4 * 1024 * 1024
 # The hub's own view of whether lb-bot is up, carried in `welcome` so a client
 # can gate its lb-bot surfaces without first awaiting a `/lb/status` round trip.
 LB_PROBE_INTERVAL = 60.0
+# Worbus P2 R20: a non-primary caller's write (any lb route but a GET) is
+# forwarded only when lb-bot proved it reads the X-Worbus-* headers within this
+# many seconds (an answer carrying `X-Worbus-Identity: 1`, or a health read
+# saying `identity: 1`); otherwise one health read runs first. The per-answer
+# proof of R17 comes AFTER the call, too late for a write that an older lb-bot,
+# swapped in a moment ago, has already run as an admin. The env override exists
+# for the suites only.
+LB_IDENTITY_PROOF_MAX_S = float(os.environ.get("HUB_LB_IDENTITY_PROOF_MAX_S", "10") or "10")
 # The hub's own probe asks `/api/health`, which answers in milliseconds, so it
 # gets a short deadline of its own rather than PROXY_TIMEOUT: an lb-bot that
 # HANGS must read as down within seconds, not after 20. Only the health call is
@@ -1024,30 +1038,35 @@ def _nd_check_signin_blocking(username: str, salt: str, token: str) -> tuple[str
 
 
 def _nd_native_blocking(method: str, path: str, body: Optional[dict] = None,
-                        jwt: Optional[str] = None) -> tuple[str, Any]:
-    """One call to Navidrome's native API (R10). Returns (status, payload):
+                        jwt: Optional[str] = None) -> tuple[str, Any, Optional[int]]:
+    """One call to Navidrome's native API (R10). Returns (status, payload, total):
     "ok" with the parsed JSON; "unauthorized" (401), "forbidden" (403), "limited"
     (429); "unreachable" for anything else (refused, timeout, 5xx, not JSON).
-    Nothing is logged here: the login body carries HUB_ND_PASS, the list call
-    a JWT."""
+    `total` is a 200's `X-Total-Count` as an integer, else None: Navidrome's REST
+    API states how many rows exist, and a list shorter than that is one page of
+    it (R21). Nothing is logged here: the login body carries HUB_ND_PASS, the
+    list call a JWT."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"{NAVIDROME_URL}{path}", data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if jwt:
         req.add_header("x-nd-authorization", f"Bearer {jwt}")
+    total: Optional[int] = None
     try:
         with urllib.request.urlopen(req, timeout=USER_REFRESH_TIMEOUT) as r:
             raw = r.read(4 * 1024 * 1024)
+            count = (r.headers.get("X-Total-Count") or "").strip()
+            total = int(count) if count.isdigit() else None
     except urllib.error.HTTPError as e:
         return {401: "unauthorized", 403: "forbidden", 429: "limited"}.get(
-            e.code, "unreachable"), None
+            e.code, "unreachable"), None, None
     except Exception:  # noqa: BLE001 — refused, reset, timeout
-        return "unreachable", None
+        return "unreachable", None, None
     try:
-        return "ok", json.loads(raw.decode("utf-8"))
+        return "ok", json.loads(raw.decode("utf-8")), total
     except Exception:  # noqa: BLE001
-        return "unreachable", None
+        return "unreachable", None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1910,8 +1929,14 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
     # encode a str and refuse a non-Latin name (R11).
     for name, value in _UPSTREAM_HEADERS.get().items():
         req.add_header(name, value)
+    # Worbus P2 R17: whether the upstream itself answered, and with
+    # `X-Worbus-Identity: 1`, for the proxy that asked (`_UPSTREAM_PROOF`, a dict
+    # per call; None when nobody asked).
+    proof = _UPSTREAM_PROOF.get()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            if proof is not None:
+                _note_proof(proof, r.headers)
             # One byte past the cap, so "exactly at the limit" and "over it" are
             # distinguishable. `read(PROXY_MAX_RESPONSE)` alone TRUNCATES SILENTLY:
             # the status stays 200 and the body is a half-finished JSON document,
@@ -1929,6 +1954,8 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
             return (r.status, raw,
                     r.headers.get("Content-Type") or "application/json")
     except urllib.error.HTTPError as e:
+        if proof is not None:
+            _note_proof(proof, e.headers)
         try:
             payload = e.read(PROXY_MAX_RESPONSE)
         except Exception:  # noqa: BLE001
@@ -1952,6 +1979,21 @@ def _proxy_upstream_blocking(method: str, url: str, body: Optional[bytes],
 # Extra headers for the upstream call being made (LbProxy: the caller's identity).
 _UPSTREAM_HEADERS: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "hub_upstream_headers", default={})
+# Worbus P2 R17: a fresh dict per proxied call, which `_proxy_upstream_blocking`
+# fills from the response it got (`_note_proof`): "answered" (the upstream itself
+# answered, a success or an HTTP error, as opposed to the hub's own 502 `down` or
+# 504 `busy`) and "identity" (the answer carried `X-Worbus-Identity: 1`, which
+# lb-bot puts on every /api answer since this round). A contextvar so the
+# six-argument helper the suites patch keeps its signature; `asyncio.to_thread`
+# hands the same dict to the worker thread.
+_UPSTREAM_PROOF: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "hub_upstream_proof", default=None)
+
+
+def _note_proof(proof: dict, headers: Any) -> None:
+    proof["answered"] = True
+    value = headers.get("X-Worbus-Identity") if headers is not None else None
+    proof["identity"] = (value or "").strip() == "1"
 
 LBBOT_TOO_OLD = {"code": "lbbot_too_old",
                  "error": "This Worbus Server's lb-bot is too old for signed-in users."}
@@ -2065,6 +2107,17 @@ class HttpProxy:
         if time.monotonic() < self._fresh_until.get(route, 0.0):
             return None
         return spec.get("ttl", PROXY_CACHE_TTL)
+
+    def _answer_refusal(self, upstream_status: int,
+                        proof: dict) -> Optional[tuple[int, bytes, str]]:
+        """Hook: an upstream answer the caller must not be served, replaced by
+        this refusal (not cached, not augmented), or None. `LbProxy`: R17."""
+        return None
+
+    def _may_cache(self, proof: dict) -> bool:
+        """Hook: whether this upstream answer may be cached at all (on top of the
+        route's own rules). `LbProxy`: a non-primary class needs R17's proof."""
+        return True
 
     def _note_upstream_result(self, upstream_status: int, data: bytes) -> None:
         """Hook for a subclass to react to a proxied call's raw outcome, on EVERY
@@ -2274,6 +2327,12 @@ class HttpProxy:
             # crosses roles from the cache or a coalesced call.
             # A call with no caller (the hub's own, or a suite driving the proxy)
             # keeps the classless key it always had.
+            # Every CLIENT request reaches here through `handle`, which sets
+            # `_CALLER` first; the probe calls `_fetch` directly. Keep it so: a
+            # caller-less lb call sends no X-Worbus-* headers, which lb-bot reads
+            # as its admin service caller, and its answer is cached under the
+            # classless key. Never route a client's request here without a caller
+            # (review Minor 7).
             caller = _CALLER.get()
             if caller is not None:
                 key_parts.append([caller.admin, caller.primary])
@@ -2338,9 +2397,12 @@ class HttpProxy:
                 f"{_url_for_log(url)}")
             return (503, json.dumps({"error": f"{self.label} proxy busy",
                                      "busy": True}).encode(), "application/json")
+        proof: dict = {}
+        proof_token = _UPSTREAM_PROOF.set(proof)
         try:
             status, data, ctype = await self._fetch(spec, upstream_path, params, payload)
         finally:
+            _UPSTREAM_PROOF.reset(proof_token)
             sem.release()
 
         # Captured BEFORE augment: the probe route rewrites any upstream status
@@ -2349,12 +2411,17 @@ class HttpProxy:
         # went away). Only an upstream success is worth remembering.
         upstream_status = status
         self._note_upstream_result(upstream_status, data)
+        # Before augment, the cache and the write's invalidation: an answer this
+        # caller may not have is never stored, relayed or acted on (R17).
+        refused = self._answer_refusal(upstream_status, proof)
+        if refused is not None:
+            return refused
         if spec.get("probe"):
             status, data, ctype = self.augment(spec, status, data)
         data = self._strip(spec, status, data)
         data = self._narrow_error(spec, status, data)
         if (spec.get("cache") and gen == self._cache_gen.get(route, 0)
-                and upstream_status == 200):
+                and upstream_status == 200 and self._may_cache(proof)):
             ttl = self._cache_ttl(route, spec, data)
             if ttl is not None:
                 self._cache_put(key, status, data, ctype, ttl)
@@ -2607,6 +2674,13 @@ class LbProxy(HttpProxy):
         # caller as the hub's admin, so until then only the primary user passes
         # (design §6.4, "An older lb-bot").
         self.identity = False
+        # When (monotonic) lb-bot last proved it reads the X-Worbus-* headers: a
+        # 200 health saying `identity: 1`, or any answer carrying
+        # `X-Worbus-Identity: 1` (R17). A non-primary write needs one younger than
+        # LB_IDENTITY_PROOF_MAX_S (R20). -inf while unproved.
+        self._proof_at = -math.inf
+        # The one health read scheduled outside the 60 s loop (`_probe_soon`).
+        self._probe_task: Optional[asyncio.Task] = None
         # lb-bot's `missingConfig` as last logged (`_note_missing_config`).
         self._missing_config: Optional[tuple] = None
         self._refused_logged_at = -math.inf
@@ -2671,6 +2745,88 @@ class LbProxy(HttpProxy):
             return None
         return _http_json(503, dict(LBBOT_TOO_OLD))
 
+    @staticmethod
+    def _too_old() -> tuple[int, bytes, str]:
+        return 503, json.dumps(LBBOT_TOO_OLD).encode(), "application/json"
+
+    def _answer_refusal(self, upstream_status: int,
+                        proof: dict) -> Optional[tuple[int, bytes, str]]:
+        """R17: identity is proved per answer. lb-bot puts `X-Worbus-Identity: 1`
+        on every /api answer; an answer without it comes from an older lb-bot,
+        whatever the last health read said (one swapped in since, F-W2). Then:
+          - a non-primary caller gets 503 lbbot_too_old instead of the answer
+            (an older lb-bot answered it as an admin and the primary user);
+          - `identity` goes false (an `lb` frame says so), every lb cache entry
+            is dropped and a health read runs at once (`_identity_lost`).
+        The primary user's answer is served either way, as with any older
+        lb-bot. The hub's own 502/504 (`answered` unset: lb-bot never answered)
+        proves nothing and is relayed as before; it is never a 200."""
+        if proof.get("identity"):
+            # A proof refreshes R20's clock only while `identity` holds: once it
+            # was dropped, only a health read sets it again (R17).
+            if self.identity:
+                self._proof_at = time.monotonic()
+            return None
+        caller = _CALLER.get()
+        guarded = caller is not None and not caller.primary
+        if not proof.get("answered"):
+            if guarded and upstream_status < 500:
+                # Not the hub's own error, yet no proof (a stand-in upstream in a
+                # suite): fail closed.
+                return self._too_old()
+            return None
+        if guarded or self.identity:
+            self._identity_lost()
+        return self._too_old() if guarded else None
+
+    def _may_cache(self, proof: dict) -> bool:
+        """An answer cached under a non-primary class must carry R17's proof, so
+        one from an older lb-bot is never stored for other users of that class,
+        even if `_answer_refusal` is reordered one day."""
+        caller = _CALLER.get()
+        return caller is None or caller.primary or bool(proof.get("identity"))
+
+    def _identity_lost(self) -> None:
+        """lb-bot answered without `X-Worbus-Identity`: treat it as an older
+        lb-bot until a health read says otherwise (R17). `_set_available` drops
+        `identity` (and broadcasts the `lb` frame) and every cached lb answer."""
+        if self.identity:
+            log("lbbot answered without X-Worbus-Identity: an older lb-bot; signed-in "
+                "users other than the primary user are refused until a health read "
+                "says identity: 1")
+        self._set_available(self.available, identity=False)
+        self._proof_at = -math.inf
+        self._probe_soon()
+
+    async def _write_gate(self) -> Optional[tuple[int, bytes, str]]:
+        """R20: before a non-primary caller's write, a proof younger than
+        LB_IDENTITY_PROOF_MAX_S, else one health read (single-flight) first.
+        None lets the write go; else the answer instead of forwarding it: 503
+        lbbot_too_old, or the hub's 502 `down` when the read found lb-bot gone
+        (a network problem must not read as an old lb-bot)."""
+        if self.identity and time.monotonic() - self._proof_at < LB_IDENTITY_PROOF_MAX_S:
+            return None
+        task = self._probe_soon()
+        if task is not None:
+            await asyncio.shield(task)
+        if self.identity and time.monotonic() - self._proof_at < LB_IDENTITY_PROOF_MAX_S:
+            return None
+        if not self.available:
+            return (502, json.dumps({"error": f"{self.label} unreachable",
+                                     "down": True}).encode(), "application/json")
+        return self._too_old()
+
+    async def _call_upstream(self, route: tuple[str, str], spec: dict,
+                             upstream_path: str, params: list[tuple[str, str]],
+                             body: Optional[dict], key: str) -> tuple[int, bytes, str]:
+        caller = _CALLER.get()
+        if caller is not None and not caller.primary and spec["method"] != "GET":
+            refused = await self._write_gate()
+            if refused is not None:
+                return refused
+        return await super()._call_upstream(route, spec, upstream_path, params,
+                                            body, key)
+
     def welcome_info(self) -> dict:
         """`welcome.lb` and the `lb` frame: the probe's answer, without a client
         having to ask for it."""
@@ -2717,12 +2873,29 @@ class LbProxy(HttpProxy):
         """
         value = bool(value)
         before = self.welcome_info()
-        was, old_downloads = self.available, self.downloads
+        was, old_downloads, old_identity = self.available, self.downloads, self.identity
         self.available = value
         if downloads is not _LB_KEEP:
             self.downloads = downloads
         if identity is not _LB_KEEP:
             self.identity = bool(identity)
+        if not value:
+            # Worbus P2 (F-W2): whatever lb-bot comes back must prove itself again;
+            # an older one swapped in while it was away would otherwise inherit the
+            # last one's `identity` until the next probe.
+            self.identity = False
+        if not self.identity:
+            self._proof_at = -math.inf
+        if value and self.identity != old_identity:
+            # lb-bot answers and its identity changed (an older lb-bot was swapped
+            # in, or a new one replaced it): nothing cached on either side of the
+            # change is served across it, and a read in flight is not cached.
+            self.invalidate(set(self.routes))
+        if value and not was and identity is _LB_KEEP:
+            # Became available without reading a health body (lb-bot's push,
+            # `mark_alive`): read it now rather than at the next 60 s tick, so a
+            # new lb-bot's `identity` is known in one read (F-W1, R17).
+            self._probe_soon()
         after = self.welcome_info()
         if after == before:
             return
@@ -2754,7 +2927,10 @@ class LbProxy(HttpProxy):
         went upstream): a 200 is lb-bot up and states its downloads mode; any
         other status is lb-bot unreachable and says nothing about the mode."""
         if status == 200:
-            self._set_available(True, _lb_downloads_of(data), _lb_identity_of(data))
+            identity = _lb_identity_of(data)
+            self._set_available(True, _lb_downloads_of(data), identity)
+            if identity:
+                self._proof_at = time.monotonic()
             self._note_missing_config(_lb_missing_config_of(data))
         else:
             self._set_available(False)
@@ -2886,6 +3062,21 @@ class LbProxy(HttpProxy):
         finally:
             self._probed.set()
         return self.available
+
+    def _probe_soon(self) -> Optional[asyncio.Task]:
+        """One health read now, single-flight: the running one if there is one.
+        In an empty context, so it carries no caller's X-Worbus-* headers (the
+        probe is the hub's own service call). None with no running loop."""
+        task = self._probe_task
+        if task is not None and not task.done():
+            return task
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(self.probe(), context=contextvars.Context())
+        self._probe_task = task
+        return task
 
     async def probe_loop(self) -> None:
         while True:
@@ -8744,6 +8935,11 @@ class Hub:
         # A fresh login only when there is none or Navidrome answered 401.
         self._nd_jwt: Optional[str] = None
         self._refresh_lock = asyncio.Lock()
+        # When (monotonic) the last flag read was started, by `refresh_if_stale`
+        # or the idle loop, whatever came of it: the R10 back-off. Set before the
+        # read is spawned, so two calls in one loop tick cannot both start one.
+        self._refresh_attempted_at = -math.inf
+        self._refresh_partial_logged = False
         self._refresh_refused_logged = False
         # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
         # A HINT only: a client pulls on every welcome whatever it says, because
@@ -8837,12 +9033,22 @@ class Hub:
         return self.caller_for(bound[0]) if bound else None
 
     # ----- sign-in and sign-out (PROTOCOL §3) ------------------------------- #
-    def _refusals(self, key: tuple[str, str]) -> deque:
-        q = self._signin_refusals.setdefault(key, deque())
+    def _refusal_count(self, key: tuple[str, str]) -> int:
+        """Refused sign-ins for `key` in the window (R1). Prunes the whole table
+        first: an entry is created only by a refusal, and goes once its last
+        refusal leaves the window, so a client cycling usernames cannot grow it
+        past the refusals of the last SIGNIN_REFUSALS_WINDOW (review Minor 3)."""
         cutoff = time.monotonic() - SIGNIN_REFUSALS_WINDOW
-        while q and q[0] < cutoff:
-            q.popleft()
-        return q
+        for k in list(self._signin_refusals):
+            q = self._signin_refusals[k]
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                del self._signin_refusals[k]
+        return len(self._signin_refusals.get(key, ()))
+
+    def _add_refusal(self, key: tuple[str, str]) -> None:
+        self._signin_refusals.setdefault(key, deque()).append(time.monotonic())
 
     def _mint_device_id(self) -> str:
         taken = {did for sp in self.spaces.values() for did in sp.devices}
@@ -8883,7 +9089,7 @@ class Hub:
         if not ok:
             return 400, {"code": "bad_request"}
         rate_key = (remote, _space_key(username))
-        if len(self._refusals(rate_key)) >= SIGNIN_REFUSALS_MAX:
+        if self._refusal_count(rate_key) >= SIGNIN_REFUSALS_MAX:
             log(f"sign-in for {username[:64]!r} from {remote}: too many refused attempts")
             return 429, {"code": "too_many_attempts"}
         try:
@@ -8896,7 +9102,7 @@ class Hub:
             log(f"sign-in for {username[:64]!r}: Navidrome did not answer")
             return 503, {"code": "navidrome_unreachable"}
         if verdict != "ok" or user is None:
-            self._refusals(rate_key).append(time.monotonic())
+            self._add_refusal(rate_key)
             log(f"sign-in for {username[:64]!r} from {remote}: Navidrome refused "
                 f"(salt length {len(salt)}, token length {len(token)})")
             return 401, {"code": "navidrome_refused"}
@@ -8948,10 +9154,13 @@ class Hub:
     # ----- user flags stay fresh (design §6.1, R10) ------------------------ #
     async def _list_users(self) -> tuple[str, Optional[dict]]:
         """Every Navidrome user's admin flag, read as the service account:
-        ("ok", {key: isAdmin}), or ("refused" | "unavailable", None)."""
+        ("ok", {key: isAdmin}); ("partial", {key: isAdmin}) when the answer's
+        `X-Total-Count` says more users exist than it listed (R21: one page of a
+        paginated list, which must not sign the rest out); or ("refused" |
+        "unavailable", None)."""
         for attempt in (1, 2):
             if self._nd_jwt is None:
-                st, body = await asyncio.to_thread(
+                st, body, _total = await asyncio.to_thread(
                     _nd_native_blocking, "POST", "/auth/login",
                     {"username": ND_USER, "password": ND_PASS})
                 if st == "ok" and isinstance(body, dict) and isinstance(body.get("token"), str):
@@ -8960,8 +9169,8 @@ class Hub:
                     return "refused", None
                 else:
                     return "unavailable", None   # 429 (rate-limited), down, a bad answer
-            st, body = await asyncio.to_thread(_nd_native_blocking, "GET", "/api/user",
-                                               None, self._nd_jwt)
+            st, body, total = await asyncio.to_thread(_nd_native_blocking, "GET",
+                                                      "/api/user", None, self._nd_jwt)
             if st == "unauthorized" and attempt == 1:
                 self._nd_jwt = None              # expired or revoked: one fresh login
                 continue
@@ -8973,6 +9182,8 @@ class Hub:
             for row in body:
                 if isinstance(row, dict) and isinstance(row.get("userName"), str):
                     users[_space_key(row["userName"])] = row.get("isAdmin") is True
+            if total is not None and total > len(body):
+                return "partial", users
             return "ok", users
         return "unavailable", None
 
@@ -8982,8 +9193,9 @@ class Hub:
         200) no longer holds is signed out: their credentials are dropped and
         their sockets get `signed_out` and 4005; their space's data stays (R16).
         Unreachable, a timeout, a 5xx or a 429 changes nothing (R10); a service
-        account Navidrome refuses keeps the sign-in flags, logged once.
-        Returns {key: isAdmin} when the list was read, else None."""
+        account Navidrome refuses keeps the sign-in flags, logged once. A partial
+        list (R21) updates the users it holds and signs nobody out.
+        Returns {key: isAdmin} when the whole list was read, else None."""
         async with self._refresh_lock:
             verdict, listed = await self._list_users()
             if verdict == "refused":
@@ -8992,16 +9204,22 @@ class Hub:
                     log("user refresh: Navidrome refuses HUB_ND_USER's user list (it is "
                         "not an admin); users keep the flags they signed in with")
                 return None
-            if verdict != "ok" or listed is None:
+            if verdict not in ("ok", "partial") or listed is None:
                 dlog("user refresh: Navidrome unavailable; flags kept")
                 return None
+            complete = verdict == "ok"
+            if not complete and not self._refresh_partial_logged:
+                self._refresh_partial_logged = True
+                log(f"user refresh: Navidrome's user list holds {len(listed)} user(s) and "
+                    "says there are more; nobody missing from it is signed out")
             now = int(time.time() * 1000)
             known = set(self.user_flags) | {r["user"] for r in self.device_auth.values()}
             for key in sorted(known):
                 if key == self.primary_user and key not in listed:
                     continue   # the service account itself just logged in
                 if key not in listed:
-                    await self._sign_out_user(key)
+                    if complete:
+                        await self._sign_out_user(key)
                     continue
                 old = self.user_flags.get(key)
                 before = self.caller_for(key).wire()
@@ -9017,7 +9235,7 @@ class Hub:
                     if sp is not None:
                         await sp._broadcast({"t": "user", "user": after})  # noqa: SLF001
             self._save()
-            return listed
+            return listed if complete else None
 
     async def _sign_out_user(self, key: str) -> None:
         """Navidrome no longer has `key`: every device of theirs is signed out."""
@@ -9033,16 +9251,26 @@ class Hub:
         await asyncio.gather(*(self._signed_out(ws) for ws in sockets),
                              return_exceptions=True)
 
+    def _refresh_due(self) -> bool:
+        """The R10 back-off: no read was attempted within USER_REFRESH_SECS."""
+        return time.monotonic() - self._refresh_attempted_at >= USER_REFRESH_SECS
+
     def refresh_if_stale(self, key: str) -> None:
         """On a user's connect or lb call: re-read in the background when their
-        flags are older than USER_REFRESH_SECS (or were never read)."""
+        flags are older than USER_REFRESH_SECS (or were never read), and no read
+        was attempted within USER_REFRESH_SECS. A failed read (Navidrome down, a
+        429 on the login, a refused service account) therefore waits for the next
+        interval; it is not retried on every hello and lb call (review I1)."""
         flags = self.user_flags.get(key)
         age_ms = int(time.time() * 1000) - int((flags or {}).get("checkedAt") or 0)
-        if age_ms >= USER_REFRESH_SECS * 1000 and not self._refresh_lock.locked():
-            try:
-                self._spawn(self.refresh_users())
-            except RuntimeError:
-                pass   # no loop: an in-process caller
+        if age_ms < USER_REFRESH_SECS * 1000 or not self._refresh_due():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return   # no loop: an in-process caller
+        self._refresh_attempted_at = time.monotonic()
+        self._spawn(self.refresh_users())
 
     async def refresh_user(self, user: str) -> Optional[dict]:
         """`user`'s flags after a re-read: {"name", "admin", "checkedAt"}, or None
@@ -9056,11 +9284,17 @@ class Hub:
 
     async def _user_refresh_loop(self) -> None:
         """Every USER_REFRESH_SECS while any socket is open: an idle device hears
-        a demotion or a deletion too (design §6.1)."""
+        a demotion or a deletion too (design §6.1). It keeps the same schedule as
+        `refresh_if_stale` (one attempt per interval between them), so a read
+        started by a connect is not followed by the loop's own a moment later."""
         while True:
-            await asyncio.sleep(USER_REFRESH_SECS)
+            wait = self._refresh_attempted_at + USER_REFRESH_SECS - time.monotonic()
+            await asyncio.sleep(wait if wait > 0 else USER_REFRESH_SECS)
+            if not self._refresh_due():
+                continue
             try:
                 if any(sp.sockets for sp in self.spaces.values()):
+                    self._refresh_attempted_at = time.monotonic()
                     await self.refresh_users()
             except Exception as e:  # noqa: BLE001 — the loop must never die
                 log("user refresh error:", e)
@@ -9576,14 +9810,16 @@ class Hub:
                 user, bound_id = bound
                 desc = self._bind_device_id(desc, bound_id, dname)
                 space, caller = self.space_for(user), self.caller_for(user)
-            elif got:
-                if not (ACCEPT_SHARED_TOKEN and TOKEN and hmac.compare_digest(got, TOKEN)):
-                    await refuse_token()
-                    return
+            elif not TOKEN:
+                # Loopback with HUB_ALLOW_INSECURE_NO_AUTH: any token or none is the
+                # primary user, as the base hub did (R22). Only a device secret is
+                # checked (above): it names a user.
                 space, caller = self.primary_space, self.caller_for(self.primary_user,
                                                                      legacy=True)
-            elif not TOKEN:
-                # Loopback with HUB_ALLOW_INSECURE_NO_AUTH: no credential, as before.
+            elif got:
+                if not (ACCEPT_SHARED_TOKEN and hmac.compare_digest(got, TOKEN)):
+                    await refuse_token()
+                    return
                 space, caller = self.primary_space, self.caller_for(self.primary_user,
                                                                      legacy=True)
             else:

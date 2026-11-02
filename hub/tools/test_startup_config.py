@@ -228,11 +228,35 @@ def check_env_example() -> list[str]:
                                 f"by name: {got!r}")
     if hub.startup_config_refusal(REAL_32, "0.0.0.0", False, "", "", **good) is not None:
         failures.append("a filled-in service account is refused")
+    # R19 (B-323): the example ships the code's default, 7; 0 would keep every
+    # device, and with it every device sign-in, forever.
+    if env.get("HUB_DEVICE_TTL_DAYS") != "7":
+        failures.append(f".env.example sets HUB_DEVICE_TTL_DAYS={env.get('HUB_DEVICE_TTL_DAYS')!r}, "
+                        "not the default 7")
+    return failures
+
+
+def check_device_ttl() -> list[str]:
+    """R19: HUB_DEVICE_TTL_DAYS unset or blank is the default, 7 (a blank line in a
+    copied .env read as 0, keeping devices and their sign-ins forever); an
+    explicit 0 still means keep."""
+    failures: list[str] = []
+    for label, value, want in (("unset", None, 7.0), ("blank", "", 7.0),
+                               ("spaces", "  ", 7.0), ("0", "0", 0.0), ("3", "3", 3.0)):
+        env = {k: v for k, v in os.environ.items() if k != "HUB_DEVICE_TTL_DAYS"}
+        if value is not None:
+            env["HUB_DEVICE_TTL_DAYS"] = value
+        got = subprocess.run([sys.executable, "-c", "import hub; print(hub.DEVICE_TTL_DAYS)"],
+                             cwd=HUB_DIR, env=env, capture_output=True, text=True, timeout=30)
+        out = (got.stdout.strip().splitlines() or [""])[-1]
+        if got.returncode != 0 or out != str(want):
+            failures.append(f"HUB_DEVICE_TTL_DAYS {label}: DEVICE_TTL_DAYS is {out!r} "
+                            f"(rc {got.returncode}), not {want}")
     return failures
 
 
 def main() -> int:
-    failures = check_pure() + check_env_example() + check_subprocess()
+    failures = check_pure() + check_env_example() + check_device_ttl() + check_subprocess()
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -244,7 +268,8 @@ def main() -> int:
           "whitespace-only-is-empty/quoted-placeholder-refused/"
           "subprocess-exit-and-line-no-state-file/"
           "subprocess-32-char-binds/env-example-enables-no-service-or-nd-creds/"
-          "env-example-service-account-placeholders-refused")
+          "env-example-service-account-placeholders-refused/"
+          "device-ttl-example-7-blank-is-default")
     return 0
 
 

@@ -254,6 +254,14 @@ on; off, it is `401` on client routes (lb-bot's inbound pushes, §15.1, keep usi
   (§3.1); a user the list no longer holds is signed out (`4005`). A failed read
   changes nothing. A service account Navidrome refuses (not an admin) leaves the
   flags as they were at sign-in.
+- **At most one read is attempted per 10 minutes, whatever its outcome.** A read
+  that failed (Navidrome down, its login answering `429`, the service account
+  refused) is retried at the next interval, not on the next connect or lb call;
+  the login itself happens only when the hub holds no token or Navidrome answered
+  `401`.
+- **A partial list signs nobody out.** When `GET /api/user` answers with an
+  `X-Total-Count` larger than the rows it holds (one page of a paginated list),
+  the users it holds are updated and nobody missing from it is signed out.
 
 ---
 
@@ -1284,6 +1292,30 @@ unavailable. The hub's cache and in-flight coalescing are keyed by the caller's
 class `(admin, primary)` on every lb route, never by name, so an answer lb-bot
 shapes by role (fills, Fresh's `artistPlays`, the wishlist's `addedBy`, Scan
 now's limits) never crosses roles.
+
+**Identity is proved per answer, not per probe.** lb-bot (this round on) puts
+`X-Worbus-Identity: 1` on **every** `/api` answer, refusals and errors included.
+lb-bot can be swapped for an older one between two health reads, so the hub
+does not trust the last read alone:
+- **Reads.** A non-primary caller is served an lb-bot answer only when it carries
+  the header. One without it (an older lb-bot answered, as an admin) is replaced
+  by the `503 lbbot_too_old` above and is never cached. The hub then drops
+  `identity` (an `lb` frame without it goes out), drops every cached lb answer,
+  and reads `/api/health` at once. A primary user's answer without the header is
+  served, as from any older lb-bot, and has the same effect on `identity`.
+- **Writes.** A non-primary caller's call on any lb route that is not a `GET` is
+  forwarded only when lb-bot proved `identity` (an answer with the header, or a
+  health read saying `identity: 1`) within the last **10 s**. Otherwise the hub
+  reads `/api/health` first, and forwards only if it says `identity: 1`: else
+  `503 lbbot_too_old` (or the hub's own `502 {"down": true}` when lb-bot did not
+  answer), and the write never reaches lb-bot. (The per-answer proof alone would
+  arrive after an older lb-bot had already run the write as an admin.)
+- **Availability.** lb-bot seen going away (a failed health read, or the hub's
+  own `502 {"down": true}`) drops `identity` too, so whatever comes back proves
+  itself again; and whenever lb-bot becomes available without a health read (its
+  push to `/lb/notify`, `/lb/fill` or `/lb/index`), the hub reads `/api/health`
+  at once rather than at the next 60 s probe. Every change of `identity` while
+  lb-bot answers drops every cached lb answer.
 
 Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 `/lb/*` answers `503` — except `/lb/status`, which answers `{"configured": false}`.

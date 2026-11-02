@@ -23,6 +23,8 @@ carol (not admins).
   test_resignin_replaces_secret
   test_sweep_removes_device_auth                 (in process; R5)
   test_no_secret_in_state_log_or_frames
+  test_insecure_mode_accepts_any_token           (R22: as the base hub did)
+  test_rate_limit_table_holds_refusals_only      (in process; review Minor 3)
 
 Exits non-zero on failure.
 """
@@ -558,6 +560,81 @@ def t_no_secrets(h: HubProc) -> list[str]:
     return f
 
 
+async def t_insecure(nd: FakeNavidrome) -> list[str]:
+    """R22: with no HUB_TOKEN (HUB_ALLOW_INSECURE_NO_AUTH, loopback), a hello with
+    any token, or none, is the primary user, as the base hub accepted it. A device
+    secret is still checked: it names a user."""
+    f = []
+    h = HubProc(nd.url, HUB_TOKEN="", HUB_ALLOW_INSECURE_NO_AUTH="true")
+    try:
+        await h.up()
+        for i, (label, token) in enumerate((("a token", "any-token-at-all"),
+                                            ("no token", None))):
+            s = await Sock().hello(h.ws_url, {"id": f"insecure-{i}", "name": "I"},
+                                   token=token)
+            w = s.first("welcome")
+            if w is None:
+                f.append(f"insecure mode refused a hello with {label}: close "
+                         f"{await s.wait_closed(1)}, frames {s.frames[-1:]}")
+            elif (w.get("user") or {}).get("name") != "owner" or \
+                    (w.get("user") or {}).get("primary") is not True:
+                f.append(f"a hello with {label} is {w.get('user')}, not the primary user")
+            await s.close()
+        s = await Sock().hello(h.ws_url, {"id": "insecure-x", "name": "X"},
+                               secret="a-secret-this-hub-never-issued")
+        if await s.wait_closed() != 4005:
+            f.append(f"insecure mode let an unknown device secret in ({s.close_code})")
+    finally:
+        h.stop()
+    return f
+
+
+def t_refusal_table() -> list[str]:
+    """Review Minor 3: the R1 table holds refusals only, and an entry goes once its
+    refusals leave the window. Asking about a key, an unreachable Navidrome and a
+    success add nothing."""
+    f = []
+    import hub as hubmod
+    nd = FakeNavidrome(USERS).start()
+    saved_url = hubmod.NAVIDROME_URL
+    tmp = tempfile.mkdtemp(prefix="signin-refusals-")
+    hubmod.STATE_PATH = os.path.join(tmp, "state.json")
+    hubmod.ND_USER = "owner"
+    try:
+        h = hubmod.Hub()
+
+        def body(user: str, password: str) -> dict:
+            salt, token = subsonic_pair(password)
+            return {"username": user, "salt": salt, "token": token, "name": "t",
+                    "platform": "test"}
+
+        hubmod.NAVIDROME_URL = "http://127.0.0.1:9"     # nobody answers there
+        st, _p = asyncio.run(h.signin("10.0.0.1", body("bob", "whatever")))
+        if st != 503:
+            f.append(f"an unreachable Navidrome answered {st}")
+        if h._signin_refusals:  # noqa: SLF001
+            f.append(f"an attempt Navidrome never answered left {len(h._signin_refusals)} "  # noqa: SLF001
+                     "rate-limit entr(y/ies)")
+        hubmod.NAVIDROME_URL = nd.url
+        for i in range(3):
+            asyncio.run(h.signin("10.0.0.1", body(f"nobody{i}", "wrong")))
+        if len(h._signin_refusals) != 3:  # noqa: SLF001
+            f.append(f"three refused usernames made {len(h._signin_refusals)} entries")  # noqa: SLF001
+        for q in h._signin_refusals.values():  # noqa: SLF001
+            for j in range(len(q)):
+                q[j] -= hubmod.SIGNIN_REFUSALS_WINDOW + 5
+        st, _p = asyncio.run(h.signin("10.0.0.2", body("bob", PASSWORDS["bob"])))
+        if st != 200:
+            f.append(f"bob's sign-in answered {st}")
+        if h._signin_refusals:  # noqa: SLF001
+            f.append(f"{len(h._signin_refusals)} entries whose refusals left the window "  # noqa: SLF001
+                     "are kept")
+    finally:
+        hubmod.NAVIDROME_URL = saved_url
+        nd.stop()
+    return f
+
+
 async def main_async() -> list[str]:
     nd = FakeNavidrome(USERS).start()
     failures: list[str] = []
@@ -587,6 +664,11 @@ async def main_async() -> list[str]:
         except Exception:  # noqa: BLE001
             got = [f"raised:\n{traceback.format_exc()}"]
         failures += [f"test_legacy_token_refused_when_switch_off: {x}" for x in got]
+        try:
+            got = await t_insecure(nd)
+        except Exception:  # noqa: BLE001
+            got = [f"raised:\n{traceback.format_exc()}"]
+        failures += [f"test_insecure_mode_accepts_any_token: {x}" for x in got]
     finally:
         h.stop()
         nd.stop()
@@ -600,6 +682,12 @@ def main() -> int:
         failures += [f"test_sweep_removes_device_auth: {x}" for x in t_sweep()]
     except Exception:  # noqa: BLE001
         failures.append(f"test_sweep_removes_device_auth: raised:\n{traceback.format_exc()}")
+    try:
+        failures += [f"test_rate_limit_table_holds_refusals_only: {x}"
+                     for x in t_refusal_table()]
+    except Exception:  # noqa: BLE001
+        failures.append(f"test_rate_limit_table_holds_refusals_only: raised:\n"
+                        f"{traceback.format_exc()}")
     for x in failures:
         print(f"FAIL - {x}")
     if failures:
@@ -609,7 +697,8 @@ def main() -> int:
           "unknown-secret-4005+none-4005+bad-token-4001/secret-decides-id/"
           "cast-id-needs-own-bridgedBy/legacy-token-primary/switch-off-refuses-legacy/"
           "signout-keeps-device/resignin-replaces/sweep-removes-device-auth/"
-          "no-secret-in-state-log-frames")
+          "no-secret-in-state-log-frames/insecure-mode-accepts-any-token/"
+          "rate-limit-table-holds-refusals-only")
     return 0
 
 

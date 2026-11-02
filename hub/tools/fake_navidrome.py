@@ -16,9 +16,13 @@ ruling R10, measured on Navidrome 0.64.2 by lane W, 2026-11-02):
   Native API:
     - `POST /auth/login {"username", "password"}` -> 200 {"token": <jwt>, ...},
       401 for a wrong pair; `login_limit` logins in a row answer 429 after it;
+      `login_calls` counts every login that arrived, whatever the mode;
     - `GET /api/user` with `x-nd-authorization: Bearer <jwt>`: 401 for a token it
       did not issue (or one revoked by `revoke_tokens()`), 403 for a non-admin's,
-      else 200 and a list of {id, userName, name, isAdmin}.
+      else 200 and a list of {id, userName, name, isAdmin} with `X-Total-Count`
+      (the number of users, as Navidrome's REST API sends it). `list_limit` cuts
+      the list to its first N rows and leaves `X-Total-Count` the whole number:
+      a paginated answer (R21).
 
 Modes (`fake.mode`) for the Subsonic and native routes alike: "ok", "hang"
 (answers after `hang_s`, past the hub's 8 s budget), "500".
@@ -58,6 +62,7 @@ class FakeNavidrome:
         self.login_calls = 0
         self.user_list_calls = 0
         self.login_limit: int | None = None   # logins answered before 429s start
+        self.list_limit: int | None = None    # /api/user rows returned (R21), None = all
         self.play_queues: list[dict] = []     # every savePlayQueue: {"u", "ids", ...}
         self._tokens: dict[str, str] = {}     # jwt -> user
         self.server: socketserver.TCPServer | None = None
@@ -75,10 +80,13 @@ class FakeNavidrome:
             def log_message(self, *_a):  # noqa: D102
                 pass
 
-            def _send(self, status: int, body: bytes, ctype: str = "application/json"):
+            def _send(self, status: int, body: bytes, ctype: str = "application/json",
+                      extra: dict | None = None):
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 try:
                     self.wfile.write(body)
@@ -108,8 +116,10 @@ class FakeNavidrome:
                 if path == "/api/user":
                     if not self._mode_gate():
                         return
-                    status, body = fake._api_user(self.headers.get("x-nd-authorization") or "")
-                    self._send(status, body)
+                    status, body, total = fake._api_user(
+                        self.headers.get("x-nd-authorization") or "")
+                    self._send(status, body, extra=None if total is None
+                               else {"X-Total-Count": str(total)})
                     return
                 self._send(404, b'{"error":"not found"}')
 
@@ -117,9 +127,12 @@ class FakeNavidrome:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""
                 if self.path == "/auth/login":
+                    with fake.lock:   # counted on arrival, whatever the mode
+                        fake.login_calls += 1
+                        calls = fake.login_calls
                     if not self._mode_gate():
                         return
-                    status, body = fake._login(raw)
+                    status, body = fake._login(raw, calls)
                     self._send(status, body)
                     return
                 self._send(404, b'{"error":"not found"}')
@@ -174,10 +187,7 @@ class FakeNavidrome:
         return _subsonic({"status": "ok"})
 
     # ----- native API ---------------------------------------------------------- #
-    def _login(self, raw: bytes) -> tuple[int, bytes]:
-        with self.lock:
-            self.login_calls += 1
-            calls = self.login_calls
+    def _login(self, raw: bytes, calls: int) -> tuple[int, bytes]:
         if self.login_limit is not None and calls > self.login_limit:
             return 429, b'{"error":"too many requests"}'
         try:
@@ -194,19 +204,23 @@ class FakeNavidrome:
         return 200, json.dumps({"id": user, "username": user, "name": user,
                                 "isAdmin": rec["admin"], "token": token}).encode()
 
-    def _api_user(self, header: str) -> tuple[int, bytes]:
+    def _api_user(self, header: str) -> tuple[int, bytes, int | None]:
         with self.lock:
             self.user_list_calls += 1
         token = header[7:] if header.startswith("Bearer ") else ""
         with self.lock:
             user = self._tokens.get(token)
         if user is None:
-            return 401, b'{"error":"Unauthorized"}'
+            return 401, b'{"error":"Unauthorized"}', None
         rec = self.users.get(user)
         if rec is None or not rec["admin"]:
-            return 403, b'{"error":"Forbidden"}'
-        return 200, json.dumps([{"id": n, "userName": n, "name": n, "isAdmin": r["admin"]}
-                                for n, r in self.users.items()]).encode()
+            return 403, b'{"error":"Forbidden"}', None
+        rows = [{"id": n, "userName": n, "name": n, "isAdmin": r["admin"]}
+                for n, r in self.users.items()]
+        total = len(rows)
+        if self.list_limit is not None:
+            rows = rows[:self.list_limit]
+        return 200, json.dumps(rows).encode(), total
 
 
 def subsonic_pair(password: str, salt: str | None = None) -> tuple[str, str]:

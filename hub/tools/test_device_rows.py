@@ -92,14 +92,17 @@ async def group_kind(failures):
 
         # ----- the shape: 1 to 16 lowercase letters, known value or not ------ #
         good = {"a": "a", "fridge": "fridge", "x" * 16: "x" * 16}
+        # Each waits for its `welcome` (up to 3 s) rather than a fixed 0.15 s
+        # settle, which a loaded run could outlast (lane H review: the flake).
         for i, kind in enumerate(good):
             p = Peer(f"Good{i}", f"good{i}", ["controller"], kind=kind)
-            await p.connect(hub.url, settle=0.15)
+            await p.connect(hub.url, settle=0.0)
+            await until(lambda: p.welcome is not None, 3)
             await p.close()
         for i, kind in enumerate(BAD_KINDS):
             p = Peer(f"Bad{i}", f"bad{i}", ["controller"], kind=kind)
-            await p.connect(hub.url, settle=0.15)
-            if p.welcome is None:
+            await p.connect(hub.url, settle=0.0)
+            if not await until(lambda: p.welcome is not None, 3):
                 failures.append(f"kind: a hello with kind {kind!r} got no `welcome`")
             await p.close()
         await asyncio.sleep(0.3)

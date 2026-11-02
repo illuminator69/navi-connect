@@ -29,6 +29,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -291,7 +292,16 @@ async def _legacy_connection_lands_in_primary(tmp: str) -> list[str]:
     proc = subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        await asyncio.sleep(1.2)
+        # Poll the port rather than a fixed 1.2 s (H1 review Minor 5).
+        end = time.monotonic() + 10
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    break
+            except OSError:
+                if time.monotonic() > end:
+                    raise RuntimeError(f"the hub on {port} did not come up in 10 s")
+                await asyncio.sleep(0.1)
         a = Client("Phone", device_id="legacy-phone")
         await a.connect(f"ws://127.0.0.1:{port}")
         await a.act(action="setQueue", tracks=[{"id": "L1", "title": "One"},

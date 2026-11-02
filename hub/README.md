@@ -34,17 +34,18 @@ Clients then connect to `ws://<unraid-host>:4790`.
 |-----|---------|---------|
 | `HUB_TOKEN` | *(empty)* | the hub ↔ lb-bot service secret, and the legacy shared client credential (the primary user) while `HUB_ACCEPT_SHARED_TOKEN` is on. **Required**: the hub refuses to start without it, or with `.env.example`'s `change-me…` value |
 | `HUB_ACCEPT_SHARED_TOKEN` | `true` | accept `HUB_TOKEN` from clients (in `hello` and as a bearer) as the primary user, so clients from before sign-in keep working. `false` refuses it (`4001` / `401`); lb-bot's pushes into the hub still use `HUB_TOKEN`. Packaging for other people's servers sets it `false` |
-| `HUB_ALLOW_INSECURE_NO_AUTH` | *(unset)* | `true` lets the hub run with no token, and only when `HUB_HOST` is a loopback address. For local experiments |
+| `HUB_ALLOW_INSECURE_NO_AUTH` | *(unset)* | `true` lets the hub run with no token, and only when `HUB_HOST` is a loopback address. Then any `hello` token, or none, is the primary user (a device secret is still checked). For local experiments |
 | `HUB_HOST` | `0.0.0.0` | listen address |
 | `HUB_PORT` | `4790` | listen port |
 | `HUB_HEALTH_PORT` | `HUB_PORT`+1 | plain-HTTP health endpoint, for Docker healthchecks |
 | `HUB_STATE` | `/data/state.json` | persisted session + device registry |
-| `HUB_DEVICE_TTL_DAYS` | `0` | drop devices unseen for this many days; `0` keeps them forever |
+| `HUB_DEVICE_TTL_DAYS` | `7` | drop devices unseen for this many days (at start and hourly), and with each its sign-in; a sign-in whose device never said hello lasts this long too. `0` keeps devices **and their sign-ins** forever; unset or blank is `7` |
 | `HUB_DEBUG` | `false` | per-frame logging at ~1 Hz; very noisy |
 | `NAVIDROME_URL` | *(empty)* | your Navidrome base URL. **Required**: devices sign in against it |
 | `HUB_ND_USER` / `HUB_ND_PASS` | *(empty)* | the Navidrome **service account**. **Required**. `HUB_ND_USER` is the **primary user**: today's state is theirs, the play-queue mirror and the Sonic Fingerprint (Your mix) are theirs only, and it should be the same account as lb-bot's `NAVIDROME_USER`. It re-reads users' admin flags, which needs a Navidrome admin; a non-admin service account keeps the flags users signed in with. The AudioMuse proxy passes it on for the fingerprint route |
 | `HUB_MIRROR_PLAYQUEUE` | `true` | mirror the primary user's queue to Navidrome so unmodified Subsonic clients can resume |
-| `HUB_USER_REFRESH_SECS` | `600` | how often users' flags are re-read. Leave it alone: it exists so the tests can watch a demotion arrive in seconds |
+| `HUB_USER_REFRESH_SECS` | `600` | how often users' flags are re-read, and the back-off: at most one read is attempted per interval, so a failing one waits for the next. Leave it alone: it exists so the tests can watch a demotion arrive in seconds |
+| `HUB_LB_IDENTITY_PROOF_MAX_S` | `10` | how old lb-bot's last identity proof may be before a non-primary write waits for a health read. Leave it alone: it exists so the tests can swap lb-bots in seconds |
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
 | `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client. The hub calls it with `Authorization: Bearer <HUB_TOKEN>`, so lb-bot's `LB_BOT_HUB_TOKEN` must be this `HUB_TOKEN` (and its `LB_BOT_HUB_URL` this hub's http:// address; both required on lb-bot since Worbus P1) |
@@ -75,7 +76,10 @@ naming the missing setting (never a value), and with `.env.example`'s placeholde
   fill progress goes to admins only.
 - **lb-bot learns who is calling** (`X-Worbus-User/-Admin/-Primary`) and applies its
   own rights. An lb-bot too old to read them is closed to everyone but the primary
-  user (`503 lbbot_too_old`).
+  user (`503 lbbot_too_old`). lb-bot proves it on every answer
+  (`X-Worbus-Identity: 1`), so an older lb-bot swapped in later is caught on its
+  first answer, and a non-primary write is held for a health read when the last
+  proof is older than 10 s (PROTOCOL §15).
 - **Storage, and what a rollback keeps.** `state.json` keeps the primary user's space
   in the same top-level keys as before, and their station files stay
   `state.json.history` / `.stations`. Other users are under `users`, with station files
@@ -173,8 +177,14 @@ reads it as available; the hub's log then says `lbbot refused the hub's call (40
 Since Worbus project 2 every call also carries the caller's Navidrome name and flags
 (`X-Worbus-User`, `X-Worbus-Admin`, `X-Worbus-Primary`), and lb-bot applies its own
 rights to them; until lb-bot's `/api/health` says `identity: 1`, only the primary
-user's calls go through (`503 lbbot_too_old` for everyone else). The whitelist stays
-the boundary. Disabled (503) when `HUB_TOKEN` is empty, for the same reason as the
+user's calls go through (`503 lbbot_too_old` for everyone else). lb-bot also puts
+`X-Worbus-Identity: 1` on every `/api` answer: an answer without it (an older lb-bot
+put back in its place) is never served to anyone but the primary user nor cached, and
+drops `identity` until the next health read, which the hub then makes at once; a
+non-primary write is forwarded only on a proof younger than 10 s, else after a fresh
+health read. A push from lb-bot that makes it available is followed by a health read
+at once too, so a hub started before lb-bot knows its `identity` within a second. The
+whitelist stays the boundary. Disabled (503) when `HUB_TOKEN` is empty, for the same reason as the
 AudioMuse proxy.
 
 The hub also relays lb-bot's **downloads mode** (`welcome.lb.downloads`, the `lb`

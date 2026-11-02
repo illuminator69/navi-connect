@@ -20,6 +20,15 @@ and 401 to one it did not issue.
                                          HUB_ND_USER=carol (not an admin): /api/user
                                          answers 403; alice keeps the admin flag she
                                          signed in with; logged once
+  test_failed_reads_back_off             (R10, review Important 1) while /auth/login
+                                         answers 429, and again while Navidrome
+                                         answers 500: a burst of hellos and lb calls
+                                         inside one interval makes at most one login,
+                                         and the next interval tries again
+  test_partial_user_list_signs_nobody_out
+                                         (R21) /api/user answering fewer rows than its
+                                         X-Total-Count: bob, missing from it, stays
+                                         signed in; alice, listed, is still demoted
 
 Exits non-zero on failure.
 """
@@ -34,6 +43,8 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 from fake_navidrome import FakeNavidrome  # noqa: E402
 from test_signin import PASSWORDS, TOKEN, USERS, HubProc, Sock  # noqa: E402
@@ -177,11 +188,108 @@ async def t_service_not_admin(nd: FakeNavidrome) -> list[str]:
     return f
 
 
+async def _burst(h: HubProc, bearers: list[str], seconds: float) -> int:
+    """Hellos with the legacy token and lb calls with each bearer, for `seconds`:
+    every one of them asks the hub to refresh flags that are stale. Returns how
+    many were made."""
+    made = 0
+    end = time.monotonic() + seconds
+    with ThreadPoolExecutor(4) as ex:
+        while time.monotonic() < end:
+            socks = await asyncio.gather(*(Sock().hello(
+                h.ws_url, {"id": f"burst-{made}-{i}", "name": "Burst"}, token=TOKEN)
+                for i in range(3)))
+            futs = [ex.submit(h.http, "GET", "/lb/wishlist", None, b, None, 5)
+                    for b in bearers for _ in range(3)]
+            for fu in futs:
+                fu.result()
+            for s in socks:
+                await s.close()
+            made += len(socks) + len(futs)
+    return made
+
+
+async def t_backoff(nd: FakeNavidrome) -> list[str]:
+    f = []
+    # An lb-bot nobody answers at: every lb call still reads the caller's flags first.
+    env = {"HUB_USER_REFRESH_SECS": "4", "LBBOT_URL": "http://127.0.0.1:9"}
+    for case in ("login answering 429", "Navidrome answering 500"):
+        h = HubProc(nd.url, **env)
+        try:
+            await h.up()
+            st, alice = await h.signin("alice")
+            if st != 200:
+                return [f"alice's sign-in answered {st} {alice}"]
+            nd.login_calls = 0
+            if case == "login answering 429":
+                nd.login_limit = 0
+            else:
+                nd.mode = "500"
+            t0 = time.monotonic()
+            made = await _burst(h, [TOKEN, alice["deviceSecret"]], 2.5)
+            within = nd.login_calls
+            if within > 1:
+                f.append(f"{case}: {made} hellos and lb calls inside one interval made "
+                         f"{within} logins, not at most 1")
+            if within < 1:
+                f.append(f"{case}: no login was tried at all (the burst never asked)")
+            # The next interval tries again: not stuck after a failure.
+            await asyncio.sleep(max(0.0, 4.3 - (time.monotonic() - t0)))
+            await asyncio.to_thread(h.http, "GET", "/lb/wishlist", None, TOKEN, None, 5)
+            if not await _until(lambda: nd.login_calls > within, 3):
+                f.append(f"{case}: no login was tried in the next interval")
+            if nd.login_calls > within + 1:
+                f.append(f"{case}: the next interval made {nd.login_calls - within} logins")
+        finally:
+            nd.login_limit = None
+            nd.mode = "ok"
+            h.stop()
+    return f
+
+
+async def t_partial_list(nd: FakeNavidrome) -> list[str]:
+    f = []
+    h = HubProc(nd.url, **FAST)
+    try:
+        await h.up()
+        bob, _ = await _connect(h, "bob")
+        alice, _ = await _connect(h, "alice")
+        if not await _until(lambda: nd.user_list_calls >= 1, 6):
+            f.append("no refresh read the user list within 6 s")
+        # owner, alice, bob, carol: two rows of four, bob cut off.
+        nd.list_limit = 2
+        nd.users["alice"]["admin"] = False
+        calls = nd.user_list_calls
+        await _until(lambda: nd.user_list_calls >= calls + 2, 8)
+        await asyncio.sleep(0.5)
+        if nd.user_list_calls < calls + 2:
+            f.append("the partial list was not read twice within 8 s")
+        if bob.close_code is not None or any(fr.get("code") == "signed_out"
+                                             for fr in bob.frames):
+            f.append(f"a partial /api/user list signed bob out ({bob.close_code})")
+        with open(h.state, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not any(r.get("user") == "bob" for r in raw.get("deviceAuth", {}).values()):
+            f.append("a partial /api/user list dropped bob's credentials")
+        frame = next((fr for fr in alice.frames if fr.get("t") == "user"), None)
+        if frame != {"t": "user", "user": {"name": "alice", "admin": False, "primary": False}}:
+            f.append(f"alice, listed in the partial answer, heard {frame} (flags not updated)")
+        await bob.close()
+        await alice.close()
+    finally:
+        nd.list_limit = None
+        nd.users["alice"]["admin"] = True
+        h.stop()
+    return f
+
+
 async def main_async() -> list[str]:
     failures: list[str] = []
     for name, fn in (("test_idle_socket_hears_demotion", t_demotion),
                      ("test_deleted_user_gets_4005", t_deleted),
-                     ("test_non_admin_service_account_keeps_signin_flags", t_service_not_admin)):
+                     ("test_non_admin_service_account_keeps_signin_flags", t_service_not_admin),
+                     ("test_failed_reads_back_off", t_backoff),
+                     ("test_partial_user_list_signs_nobody_out", t_partial_list)):
         nd = FakeNavidrome({k: (v[0], v[1]) for k, v in USERS.items()}).start()
         try:
             got = await fn(nd)
@@ -201,7 +309,9 @@ def main() -> int:
         return 1
     print("PASS - user refresh: idle-socket-hears-demotion+no-fill-after/one-login-jwt-cached/"
           "relogin-once-on-401/deleted-user-4005-after-500s-change-nothing/"
-          "deleted-user-space-kept/non-admin-service-account-keeps-flags-logged-once")
+          "deleted-user-space-kept/non-admin-service-account-keeps-flags-logged-once/"
+          "failed-reads-back-off(429,500)-one-login-per-interval/"
+          "partial-user-list-signs-nobody-out")
     return 0
 
 

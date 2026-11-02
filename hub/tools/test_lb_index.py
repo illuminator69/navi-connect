@@ -488,8 +488,9 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
     return failures
 
 
-async def phase_restart(port: int) -> list[str]:
-    """lbIndex survives a restart; lb-bot down, then an inbound push revives it."""
+async def phase_restart(port: int, lb_port: int) -> list[str]:
+    """lbIndex survives a restart; lb-bot down, then it comes up on its port and
+    its inbound push revives it (and, Worbus P2 R17, a health read follows)."""
     failures: list[str] = []
     first = await welcome_of(port, "r1")
     # progress_survives_restart_from_state: the last push before the restart had it.
@@ -505,6 +506,13 @@ async def phase_restart(port: int) -> list[str]:
                         f"{(first.get('lb') or {}).get('downloads')!r}")
     ws, _w = await connect(port, "r-watch")
     await drain(ws, 0.3)
+    # lb-bot comes up where the hub was told it is, then pushes. (Before Worbus
+    # P2 the push alone was believed; since R17 a health read follows it, which
+    # a port nobody listens on would answer "down".)
+    revived = http.server.ThreadingHTTPServer(("127.0.0.1", lb_port), Upstream)
+    threading.Thread(target=revived.serve_forever, daemon=True).start()
+    with hits_lock:
+        health_before = hits.get("/api/health", 0)
     s, _b, _e = await asyncio.to_thread(request, port, "/lb/index", "POST",
                                         {"seq": 43, "epoch": "1-deadbeef"})
     if s != 200:
@@ -522,6 +530,11 @@ async def phase_restart(port: int) -> list[str]:
     second = await welcome_of(port, "r2")
     if (second.get("lb") or {}).get("available") is not True:
         failures.append("an authenticated inbound push did not mark lb-bot available")
+    with hits_lock:
+        if hits.get("/api/health", 0) <= health_before:
+            failures.append("no health read followed the push that revived lb-bot (R17)")
+    revived.shutdown()
+    revived.server_close()
     # Pushes without `progress` (an older lb-bot, or a build that ended) leave
     # the hint without one: the bar goes rather than sticking at its last count.
     if second.get("lbIndex") != {"seq": 44, "epoch": "1-deadbeef"}:
@@ -691,6 +704,17 @@ async def unit_checks() -> list[str]:
                 await lb.probe()
             else:
                 lb.mark_alive()
+                # Worbus P2 R17 (F-W1): a push that makes lb-bot available is
+                # followed by one health read at once; here it answers as before,
+                # so it moves nothing. A push to an lb-bot already up reads nothing.
+                task = lb._probe_task  # noqa: SLF001
+                probed = task is not None and not task.done()
+                if probed:
+                    answers.append(200)
+                    await task
+                if probed != (expect is True):
+                    failures.append(f"step {i} (alive): a health read "
+                                    f"{'ran' if probed else 'did not run'} after the push")
             await settle()
             frames = [f for f in fake.frames if f.get("t") == "lb"]
             want = ([] if expect is None else
@@ -728,6 +752,10 @@ async def unit_checks() -> list[str]:
             fake.frames.clear()
             if step == "alive":
                 lb.mark_alive()
+                task = lb._probe_task  # noqa: SLF001
+                if task is not None and not task.done():   # R17's read after a push
+                    answers.append((200, body({"ok": True, "downloads": "off"})))
+                    await task
             else:
                 answers.append(step)
                 await lb.probe()
@@ -907,7 +935,8 @@ async def run() -> list[str]:
     lb_url = f"http://127.0.0.1:{upstream.server_address[1]}"
     with socket.socket() as dead:
         dead.bind(("127.0.0.1", 0))
-        dead_url = f"http://127.0.0.1:{dead.getsockname()[1]}"
+        dead_port = dead.getsockname()[1]
+        dead_url = f"http://127.0.0.1:{dead_port}"
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     port = _free_port()
     try:
@@ -923,7 +952,7 @@ async def run() -> list[str]:
         proc = spawn(port, state, dead_url)
         try:
             await asyncio.sleep(1.5)
-            failures += await phase_restart(port)
+            failures += await phase_restart(port, dead_port)
         finally:
             stop(proc)
 
