@@ -64,7 +64,7 @@ def is_hiphop(tag: str) -> bool:
 async def capabilities(hub, known_id: str) -> dict:
     """Which tiers and routes answer, and what shape the rows have. Statuses and
     key names only, never a value."""
-    eng = hub.HUB_INSTANCE.stations
+    eng = hub.HUB_INSTANCE.primary_space.stations
     await eng.probe()
     caps: dict = {"tier2": eng.tier2_ok, "tier1": eng.tier1_ok,
                   "navidromeSonicSimilarity": eng.sonic}
@@ -103,7 +103,7 @@ async def resolve(hub, title: str, artist: str) -> str:
 
 
 async def seed_row(hub, seed: str) -> dict:
-    eng = hub.HUB_INSTANCE.stations
+    eng = hub.HUB_INSTANCE.primary_space.stations
     if hub.AUDIOMUSE_URL:
         status, data = await eng._am("score", {"id": seed}, None, None)  # noqa: SLF001
         row = hub._station_row(data) if status == 200 else None  # noqa: SLF001
@@ -115,7 +115,7 @@ async def seed_row(hub, seed: str) -> dict:
 
 async def run_character(hub, seed, your_mix, character, refills, count, skips, seed_tag,
                         plays=()):
-    eng = hub.HUB_INSTANCE.stations
+    eng = hub.HUB_INSTANCE.primary_space.stations
     body = {"seed": {"kind": "yourMix"} if your_mix else {"kind": "track", "ids": [seed]},
             "character": character, "count": count, "deviceId": "probe"}
     status, ans = await eng.start(body, debug=True)

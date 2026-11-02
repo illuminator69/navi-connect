@@ -140,7 +140,7 @@ async def part_a(hub, out: dict, lib: dict | None, coverage: list | None) -> Non
 
 
 async def part_b(hub, out: dict, ids: list[str]) -> None:
-    eng = hub.HUB_INSTANCE.stations
+    eng = hub.HUB_INSTANCE.primary_space.stations
     await eng.probe()
     res = []
     for ch in hub.STATION_CHARACTERS:

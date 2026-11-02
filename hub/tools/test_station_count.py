@@ -357,7 +357,9 @@ async def whitelist_checks(failures):
     try:
         hubmod.TOKEN = "t"
         hubmod.AUDIOMUSE_URL = "http://audiomuse.invalid"
-        hubmod.HUB_INSTANCE = types.SimpleNamespace(stations=_Stations())
+        # Worbus P2: StationProxy reaches the engine through the (primary) space.
+        hubmod.HUB_INSTANCE = types.SimpleNamespace(
+            primary_space=types.SimpleNamespace(stations=_Stations()))
         cases = {"/sonic/station/count": ({"seed": {"kind": "tracks", "ids": ["a"]},
                                            "character": "close"},
                                           ["variety", "count", "bindSession", "stationId"]),

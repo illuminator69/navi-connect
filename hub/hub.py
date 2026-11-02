@@ -206,6 +206,11 @@ POSITION_SAVE_THROTTLE = 10.0  # seconds between state writes driven by position
 # format as state.json, so `_load` reads either; an older hub ignores it.
 STATE_BACKUP_SUFFIX = ".bak"
 STATE_BACKUP_FLUSH_TIMEOUT = 3.0  # seconds a graceful stop waits for a backup in flight
+# Worbus P2 (design §6.3): every user but the primary one (HUB_ND_USER) keeps their
+# station side files in this directory beside state.json, as `<key>.history` and
+# `<key>.stations`. The primary user's stay at today's `<HUB_STATE>.history` /
+# `.stations`, so a rollback to a hub without user spaces finds them.
+USERS_DIR_SUFFIX = ".users"
 
 # --- proxy tuning (shared by the AudioMuse and lb-bot proxies) ---
 PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls PER PROXY (each of the three
@@ -664,6 +669,32 @@ def _durable_signature(mixes: Any, tombstones: Any) -> Optional[str]:
                           sort_keys=True)
     except Exception:  # noqa: BLE001 — a hand-edited backup with the wrong shapes
         return None
+
+
+def _durable_signature_of(data: Any) -> Optional[str]:
+    """`_durable_signature` of a whole state.json payload, live or a parsed backup:
+    the primary user's mixes and tombstones at the top level, and every other
+    user's under `users` (theirs exist nowhere else either). A payload whose other
+    users hold none signs exactly as a file from before user spaces does, so the
+    first boot on this build does not rewrite a good backup."""
+    if not isinstance(data, dict):
+        return None
+    base = _durable_signature(data.get("mixes"), data.get("deletedSavedQueues"))
+    users = data.get("users")
+    if not users:
+        return base
+    if base is None or not isinstance(users, dict):
+        return None
+    parts = []
+    for key in sorted(users, key=str):
+        u = users[key]
+        if not isinstance(u, dict) or not (u.get("mixes") or u.get("deletedSavedQueues")):
+            continue
+        sig = _durable_signature(u.get("mixes"), u.get("deletedSavedQueues"))
+        if sig is None:
+            return None
+        parts.append([str(key), sig])
+    return json.dumps([base, parts]) if parts else base
 
 
 def _write_state_backup_blocking(path: str, payload: str) -> None:
@@ -3072,6 +3103,9 @@ def _station_depth(ceiling: int) -> int:
 
 
 def _write_text_atomic(path: str, payload: str) -> None:
+    # The directory too: another user's side files are in `<HUB_STATE>.users/`,
+    # which the first write of the first such user creates.
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(payload)
@@ -3395,35 +3429,20 @@ class _StationBatch:
         return self.deadline - time.monotonic()
 
 
-class StationEngine:
-    """The stations, their play history, and the two tiers they are computed from.
+class _StationShared:
+    """What every user's StationEngine shares, held once by the Hub (design §6.3):
+    the parsed-list caches, the upstream semaphores, the tier probe and its
+    verdicts, and the mood builds. None of it carries anything per user: the
+    nearest lists and Navidrome rows are library facts, and the semaphores bound
+    the hub's calls whichever user asked."""
 
-    Owned by the Hub (it reads the session and broadcasts through it); reached by
-    clients only through StationProxy.
-    """
-
-    def __init__(self, hub: "Hub") -> None:
-        self.hub = hub
-        self.stations: dict[str, Station] = {}
-        # The play history: [id, title key, at ms], oldest first. Ids and hashed
-        # keys only, never in health, welcome or a log line (§18.4).
-        self.history: list[list] = []
-        self._history_file = _SideFile(STATE_PATH + STATION_HISTORY_SUFFIX,
-                                       lambda: {"v": 1, "plays": self.history},
-                                       STATION_HISTORY_FLUSH_S, STATION_HISTORY_ON)
-        self._stations_file = _SideFile(STATE_PATH + STATION_STATE_SUFFIX,
-                                        lambda: {"v": 1, "stations": self.to_state()},
-                                        STATION_HISTORY_FLUSH_S)
+    def __init__(self) -> None:
         # Parsed nearest lists: (item, depth) -> (expiry, rows). Rows are shared
         # between stations; the total is bounded by STATION_LIST_CACHE_ROWS.
         self._lists: dict[tuple[str, int], tuple[float, list]] = {}
         self._auth_logged = False
-        self._locks: dict[str, asyncio.Lock] = {}
         self._computing = asyncio.Semaphore(STATION_COMPUTING_MAX)
         self._counting = asyncio.Semaphore(STATION_COUNT_INFLIGHT)
-        # saved queue id -> the station binding it while its frame goes out, before
-        # `session.stationId` names it: a second start must meet the binding then too.
-        self._binding: dict[str, str] = {}
         self._nd_sem = asyncio.Semaphore(STATION_CALLS_PER_REQUEST)
         # The tiers' last verdicts (None = never asked) and whether Navidrome
         # offers AudioMuse's sonic similarity (`getSonicSimilarTracks`).
@@ -3438,6 +3457,68 @@ class StationEngine:
         self._bg: set = set()
         # mood id -> the one `MoodService.merged` build asks are waiting on.
         self._mood_builds: dict[str, asyncio.Future] = {}
+
+
+def _shared_attr(name: str) -> property:
+    """A StationEngine attribute that is a view of its `_StationShared`: read and
+    written there, so every user's engine sees one cache, one probe verdict."""
+    return property(lambda self: getattr(self.shared, name),
+                    lambda self, value: setattr(self.shared, name, value))
+
+
+class StationEngine:
+    """One user's stations and play history, and the two tiers they are computed
+    from.
+
+    Per user (Worbus P2, design §6.3): `stations`, `history`, their side files,
+    `_binding` and the per-station locks; a station's likes, skips and cooldown
+    live in the station. It reads the session, and broadcasts, through `space`
+    (that user's UserSpace) and never anything hub-wide. Shared (`shared`, the
+    hub's `_StationShared`): the caches, semaphores and the tier probe, reached
+    through the attribute views below under their old names.
+
+    `space` is anything with `session`, `_save`, `_spawn`, `_broadcast`,
+    `_broadcast_session` (and optionally `moods`); the suites drive the engine
+    with a stub of exactly that. Reached by clients only through StationProxy.
+    """
+
+    _lists = _shared_attr("_lists")
+    _auth_logged = _shared_attr("_auth_logged")
+    _computing = _shared_attr("_computing")
+    _counting = _shared_attr("_counting")
+    _nd_sem = _shared_attr("_nd_sem")
+    tier2_ok = _shared_attr("tier2_ok")
+    tier1_ok = _shared_attr("tier1_ok")
+    sonic = _shared_attr("sonic")
+    _probed = _shared_attr("_probed")
+    _probe_at = _shared_attr("_probe_at")
+    _probe_soon = _shared_attr("_probe_soon")
+    _probe_lock = _shared_attr("_probe_lock")
+    _t1_cache = _shared_attr("_t1_cache")
+    _bg = _shared_attr("_bg")
+    _mood_builds = _shared_attr("_mood_builds")
+
+    def __init__(self, space: Any, shared: Optional[_StationShared] = None,
+                 side_base: Optional[str] = None) -> None:
+        self.space = space
+        self.shared = shared if shared is not None else _StationShared()
+        # The primary user's side files are today's `<HUB_STATE>.history` and
+        # `.stations`; another user's `<HUB_STATE>.users/<key>.*` (_space_side_base).
+        base = STATE_PATH if side_base is None else side_base
+        self.stations: dict[str, Station] = {}
+        # The play history: [id, title key, at ms], oldest first. Ids and hashed
+        # keys only, never in health, welcome or a log line (§18.4).
+        self.history: list[list] = []
+        self._history_file = _SideFile(base + STATION_HISTORY_SUFFIX,
+                                       lambda: {"v": 1, "plays": self.history},
+                                       STATION_HISTORY_FLUSH_S, STATION_HISTORY_ON)
+        self._stations_file = _SideFile(base + STATION_STATE_SUFFIX,
+                                        lambda: {"v": 1, "stations": self.to_state()},
+                                        STATION_HISTORY_FLUSH_S)
+        self._locks: dict[str, asyncio.Lock] = {}
+        # saved queue id -> the station binding it while its frame goes out, before
+        # `session.stationId` names it: a second start must meet the binding then too.
+        self._binding: dict[str, str] = {}
         self._load_history()
         self._load_stations()
 
@@ -3557,7 +3638,7 @@ class StationEngine:
         return self.stations.get(sid) if isinstance(sid, str) else None
 
     def bound(self) -> Optional[Station]:
-        sid = self.hub.session.station_id
+        sid = self.space.session.station_id
         return self.stations.get(sid) if sid else None
 
     def _drop(self, sid: str, why: str) -> None:
@@ -3567,11 +3648,11 @@ class StationEngine:
         if lock is not None and not lock.locked():
             self._locks.pop(sid, None)
         dlog(f"station {sid} dropped ({why})")
-        if self.hub.session.station_id == sid:
+        if self.space.session.station_id == sid:
             # The queue it belonged to no longer continues as anything.
-            self.hub.session.station_id = None
-            self.hub.session.bump()
-            self.hub._spawn(self.hub._broadcast_session())  # noqa: SLF001 — same module
+            self.space.session.station_id = None
+            self.space.session.bump()
+            self.space._spawn(self.space._broadcast_session())  # noqa: SLF001 — same module
 
     def _sweep(self) -> None:
         now = _now_ms()
@@ -3582,7 +3663,7 @@ class StationEngine:
     def _evict(self) -> None:
         if len(self.stations) <= STATION_MAX:
             return
-        bound = self.hub.session.station_id
+        bound = self.space.session.station_id
         victims = sorted((st for st in self.stations.values() if st.id != bound),
                          key=lambda st: st.used_at)
         for st in victims[:len(self.stations) - STATION_MAX]:
@@ -3602,7 +3683,7 @@ class StationEngine:
         if st.announced == sig or st.id not in self.stations:
             return
         st.announced = sig
-        await self.hub._broadcast(st.frame())  # noqa: SLF001 — same module
+        await self.space._broadcast(st.frame())  # noqa: SLF001 — same module
 
     @staticmethod
     async def _acquire(lock: Any, deadline: float) -> bool:
@@ -3641,7 +3722,7 @@ class StationEngine:
 
         def fire() -> None:
             self._probe_soon = None
-            self.hub._spawn(self.probe())  # noqa: SLF001 — same module
+            self.space._spawn(self.probe())  # noqa: SLF001 — same module
         self._probe_soon = loop.call_later(STATION_PROBE_RETRY, fire)
 
     async def _await_bounded(self, coro: Any, b: Optional[_StationBatch]) -> Optional[Any]:
@@ -4290,7 +4371,7 @@ class StationEngine:
         return out
 
     def _bound_queue_ids(self, st: Station) -> set:
-        s = self.hub.session
+        s = self.space.session
         if s.station_id != st.id:
             return set()
         return {t.get("id") for t in s.queue if isinstance(t, dict) and t.get("id")}
@@ -4332,7 +4413,7 @@ class StationEngine:
 
     # ----- moods (§18.5) -------------------------------------------------- #
     def _moods(self) -> Optional["MoodService"]:
-        return getattr(self.hub, "moods", None)
+        return getattr(self.space, "moods", None)
 
     def moods_usable(self) -> bool:
         """A mood can steer a station now: the mood service says AudioMuse and CLAP are
@@ -4521,7 +4602,7 @@ class StationEngine:
         self._sweep()
 
         def bound_conflict() -> Optional[tuple[int, dict]]:
-            s = self.hub.session
+            s = self.space.session
             if not bind or bind != s.saved_queue_id:
                 return None
             held = self._binding.get(bind)
@@ -4534,9 +4615,9 @@ class StationEngine:
         conflict = bound_conflict()
         if conflict is not None:
             return conflict
-        if bind and bind == self.hub.session.saved_queue_id:
+        if bind and bind == self.space.session.saved_queue_id:
             # The queue this station is about to continue: nothing in it is new.
-            exclude |= {t.get("id") for t in self.hub.session.queue
+            exclude |= {t.get("id") for t in self.space.session.queue
                         if isinstance(t, dict) and isinstance(t.get("id"), str)}
         now = _now_ms()
         st = Station(id=self._mint_id(), seed=seed, name="", character=character,
@@ -4582,7 +4663,7 @@ class StationEngine:
         self.stations[st.id] = st
         self._evict()
         self._stations_touch()
-        s = self.hub.session
+        s = self.space.session
         bound = bool(bind and bind == s.saved_queue_id and st.id in self.stations)
         # The station frame first: a client must never meet a `session.stationId`
         # naming a station whose frame it has not been sent. The binding is claimed
@@ -4597,7 +4678,7 @@ class StationEngine:
         if bound:
             s.station_id = st.id
             s.bump()
-            await self.hub._broadcast_session()  # noqa: SLF001 — same module
+            await self.space._broadcast_session()  # noqa: SLF001 — same module
         # (A bindSession naming another queue is not an error: `bound: false`.)
         dlog(f"station {st.id} started: {seed['kind']}, {character}, {len(tracks)} tracks, "
              f"engine {st.engine}, rungs {b.rungs}")
@@ -4813,7 +4894,7 @@ class StationEngine:
                 self._changed(st)
             return 200, await self._maybe_edit(st, kind, body)
         tid = body.get("trackId")
-        if kind in ("skip", "played") and self.hub.session.station_id == st.id:
+        if kind in ("skip", "played") and self.space.session.station_id == st.id:
             # The hub hears this station's queue itself (§18.3).
             return 200, {"rev": st.rev, "applied": False, "ignored": "session"}
         if not isinstance(tid, str) or not st.knows(tid):
@@ -4854,7 +4935,7 @@ class StationEngine:
         for. Without `apply`, or for a station the session is not bound to, exactly
         the old answer: the signal alone."""
         answer: dict = {"rev": st.rev, "applied": True}
-        if body.get("apply") is not True or self.hub.session.station_id != st.id:
+        if body.get("apply") is not True or self.space.session.station_id != st.id:
             return answer
         try:
             answer.update(await self._edit_queue(st, kind))
@@ -4871,10 +4952,10 @@ class StationEngine:
         since the next one may already be decoding. `removed` are the raw indices,
         in play order, of every row from the cut on that this station served; a
         row it never served (the user's own) stays."""
-        s = self.hub.session
+        s = self.space.session
         if s.station_id != st.id or not s.queue:
             return None
-        order = self.hub._play_order()  # noqa: SLF001 — same module
+        order = self.space._play_order()  # noqa: SLF001 — same module
         try:
             pos = order.index(s.index)
         except ValueError:
@@ -4893,7 +4974,7 @@ class StationEngine:
         Navidrome's getSong when Tier 1 is configured (id, title, artist, album,
         albumId, durationMs, coverArtId), the answer's own row otherwise or when
         getSong fails, and serverId copied from a queue track that carries one."""
-        server_id = next((t.get("serverId") for t in self.hub.session.queue
+        server_id = next((t.get("serverId") for t in self.space.session.queue
                           if isinstance(t, dict) and isinstance(t.get("serverId"), str)),
                          None)
 
@@ -4926,8 +5007,8 @@ class StationEngine:
         a new batch where the first of them was. One session mutation, computed
         against the session as it is when the batch is ready, sent to the playing
         device as `queueChanged` (never `load`: it keeps playing)."""
-        hub = self.hub
-        if hub._drain_task is not None:  # noqa: SLF001 — acts are held for a transfer
+        sp = self.space
+        if sp._drain_task is not None:  # noqa: SLF001 — acts are held for a transfer
             return {"edited": False, "reason": "transfer"}
         deadline = time.monotonic() + STATION_BUDGET_S
         lock = self._lock(st.id)
@@ -4936,14 +5017,14 @@ class StationEngine:
         try:
             plan = self._edit_plan(st)
             if plan is None:
-                return {"edited": False, "reason": "unbound" if hub.session.queue
+                return {"edited": False, "reason": "unbound" if sp.session.queue
                         else "empty"}
             tracks: list[dict] = []
             b: Optional[_StationBatch] = None
             if kind in ("character", "mood") and not st.stopped:
                 _cut, removed = plan
                 gone = set(removed)
-                keep = {t.get("id") for i, t in enumerate(hub.session.queue)
+                keep = {t.get("id") for i, t in enumerate(sp.session.queue)
                         if i not in gone and isinstance(t, dict)}
                 count = max(5, min(len(removed), 10))
                 if not await self._acquire(self._computing, deadline):
@@ -4957,13 +5038,13 @@ class StationEngine:
             else:
                 rows = []
             # The awaits above let the session move: judge it again as it is now.
-            if hub._drain_task is not None:  # noqa: SLF001
+            if sp._drain_task is not None:  # noqa: SLF001
                 return {"edited": False, "reason": "transfer"}
             plan = self._edit_plan(st)
             if plan is None:
                 return {"edited": False, "reason": "unbound"}
             cut, removed = plan
-            s = hub.session
+            s = sp.session
             gone = set(removed)
             present = {t.get("id") for i, t in enumerate(s.queue)
                        if i not in gone and isinstance(t, dict)}
@@ -4979,11 +5060,11 @@ class StationEngine:
                 return {"edited": {"removed": 0, "added": 0, "from": cut}}
             at = self._apply_edit(cut, removed, rows)
             s.bump()
-            hub._sync_current_saved_queue()  # noqa: SLF001 — the record follows the queue
-            await hub._do(hub._dev(s.active_device_id), "queueChanged",  # noqa: SLF001
+            sp._sync_current_saved_queue()  # noqa: SLF001 — the record follows the queue
+            await sp._do(sp._dev(s.active_device_id), "queueChanged",  # noqa: SLF001
                           tracks=s.queue, index=s.index)
-            await hub._broadcast_session()  # noqa: SLF001
-            await hub._broadcast_saved_queues()  # noqa: SLF001
+            await sp._broadcast_session()  # noqa: SLF001
+            await sp._broadcast_saved_queues()  # noqa: SLF001
             await self._announce(st)
             log(f"station {st.id}: {kind} edited the queue at play position {at}: "
                 f"{len(removed)} out, {len(rows)} in")
@@ -4997,7 +5078,7 @@ class StationEngine:
         Without shuffle they go where the first removed row was, or at the end when
         none was; with shuffle they are appended to the queue and placed in play
         order right after the cut (or at its end when none was removed)."""
-        s = self.hub.session
+        s = self.space.session
         gone = set(removed)
         shuffled = s.order is not None and len(s.order) == len(s.queue)
         remap: dict[int, int] = {}
@@ -5026,7 +5107,7 @@ class StationEngine:
 
     def _changed(self, st: Station) -> None:
         self._stations_touch()
-        self.hub._spawn(self._announce(st))  # noqa: SLF001 — same module
+        self.space._spawn(self._announce(st))  # noqa: SLF001 — same module
 
     @staticmethod
     def _judge(st: Station, key: str) -> bool:
@@ -5142,7 +5223,8 @@ class StationProxy(HttpProxy):
         if hub is None:
             return 503, json.dumps({"fallback": True, "error": "hub starting"}).encode(), \
                 "application/json"
-        status, payload = await hub.stations.route(route[1], body or {})
+        # The primary user's stations until sign-in (H2) gives the bearer a user.
+        status, payload = await hub.primary_space.stations.route(route[1], body or {})
         return status, json.dumps(payload).encode(), "application/json"
 
 
@@ -5389,7 +5471,7 @@ class MoodService:
         hub = self.hub
         if hub is not None:
             try:
-                await asyncio.wait_for(hub.stations._probed.wait(), 30)  # noqa: SLF001
+                await asyncio.wait_for(hub.station_shared._probed.wait(), 30)  # noqa: SLF001
             except asyncio.TimeoutError:
                 pass
         refresh = False
@@ -5922,11 +6004,44 @@ class Act:
 # --------------------------------------------------------------------------- #
 # Hub
 # --------------------------------------------------------------------------- #
-class Hub:
-    def __init__(self) -> None:
+def _space_key(user: Any) -> str:
+    """The key a user's space is filed under: Navidrome's `username`, compared
+    without regard to case (design §6.1). '' for anything that is not a name."""
+    return user.strip().lower() if isinstance(user, str) else ""
+
+
+def _space_side_base(key: str) -> str:
+    """Where a non-primary user's station side files live: `<HUB_STATE>.users/<key>`
+    plus today's suffixes (`.history`, `.stations`). The key is percent-encoded, so
+    a name with `/` or one that is `..` stays a file name inside `.users/`; a plain
+    name (letters, digits, `_.-`) is unchanged."""
+    return os.path.join(STATE_PATH + USERS_DIR_SUFFIX, urllib.parse.quote(key, safe=""))
+
+
+class UserSpace:
+    """One Navidrome user's part of the hub (Worbus P2, design §6.3): their session
+    and its active slot, their devices and sockets, saved queues and tombstones,
+    mixes, stations and play history, sleep timer, and the per-session machinery
+    that drives them (held acts and their drain task, the intent timers,
+    `_ended_judged`, the sleep timer's sender, the play-queue mirror worker).
+
+    Everything a frame, an act or a station touches for a user is read through the
+    space it belongs to; nothing here reaches another user's space. What is the
+    whole hub's (lb-bot's index hint, the state file and its backup, the command
+    echo's counter, the station caches and probe, the moods) is on `self.hub`.
+
+    The primary user's space (HUB_ND_USER) is persisted in state.json's top-level
+    keys and today's station side files, so a rollback finds it as it left it;
+    every other space is under `users` (Hub._state_payload).
+    """
+
+    def __init__(self, hub: "Hub", key: str, primary: bool) -> None:
+        self.hub = hub
+        self.key = key
+        self.primary = primary
         self.session = Session()
         self.devices: dict[str, Device] = {}
-        # Rolling saved-queue history (Continue Listening), authoritative + shared.
+        # Rolling saved-queue history (Continue Listening), authoritative for this user.
         # Keyed by record id; capped at SAVED_QUEUES_MAX, oldest by updatedAt evicted.
         self.saved_queues: dict[str, dict] = {}
         # Deletions remembered as {id: deletedAt} so a client that still holds the row
@@ -5942,12 +6057,6 @@ class Hub:
         # explicit act; nothing republishes it, so there is no race to arbitrate and
         # union-merge has nothing to merge.
         self.mixes: dict[str, dict] = {}
-        # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
-        # A HINT only: a client pulls on every welcome whatever it says, because
-        # a push missed while the hub was down would leave this stale.
-        self.lb_index: Optional[dict] = None
-        self._last_lb_index_save_at = 0.0
-        self._lb_index_trailing: Any = None  # the pending trailing save (loop handle)
         self._last_sq_progress_at = 0.0  # throttle the current record's cursor writes
         self._last_position_save_at = 0.0  # throttle position-only state persistence
         self._last_progress_sent = 0.0
@@ -5956,55 +6065,205 @@ class Hub:
         self._pre_intent_position = 0  # position_ms just BEFORE that seek/jump/skip
         self._index_intent_at = 0.0  # monotonic time of the last skip/jump to ANOTHER index
         self._pre_intent_index = 0  # the index that skip/jump left
-        # The command echo: one counter for the whole process, so a number is never
-        # reused for another device or after a reconnect (PROTOCOL §5.2).
-        self._do_seq = 0
-        self._stale_reports = 0  # /health: reports dropped for `applied` < need
-        self._echo_backstops = 0  # /health: times ECHO_BACKSTOP expired on a device
-        # Tasks nobody awaits (closing a superseded socket). asyncio keeps only weak
-        # references to tasks, so an unreferenced one can be collected mid-flight.
-        self._bg_tasks: set = set()
         self._mirror_task: Optional[asyncio.Task] = None  # single mirror worker
         self._mirror_pending = False  # a newer snapshot is waiting to be written
         self._mirror_latest: tuple = ([], None, 0)  # (ids, current, position_ms)
-        # The fsynced backup of state.json (STATE_BACKUP_SUFFIX). Same shape as the
-        # mirror above: one worker, latest payload wins, never two writers.
-        self._backup_task: Optional[asyncio.Task] = None
-        self._backup_pending = False
-        self._backup_latest: Optional[tuple[str, str]] = None  # (signature, payload)
-        # Signature of the newest backup written or queued; None = unknown, so the
-        # next save writes one. Set by _load() before anything can save.
-        self._backup_sig: Optional[str] = None
-        self._started_at = time.monotonic()
         # Transfers, and every act held behind one, in arrival order. One task
         # drains it (`_drain_held`), so transfers cannot interleave; it exists
-        # exactly while the hub is holding acts, and is created by the transfer
+        # exactly while the space is holding acts, and is created by the transfer
         # that starts the hold. See `_on_act`.
         self._held: Any = deque()
         self._drain_task: Optional[asyncio.Task] = None
-        # Monotonic id for every handoff, carried on do:release/released and
-        # do:load/loaded so a reply can be matched to the attempt that asked for it.
-        self._transfer_seq = 0
         # The sleep timer, if one is set, and the pending callback for its end.
         self._sleep: Optional[SleepTimer] = None
         self._sleep_handle: Any = None
         # Who its pause comes from: an `act` needs a sender, and this one has no
         # socket, so it is never stale, never acked and never sent an `error`.
         self._sleep_dev = Device(id="sleep-timer", name="sleep timer")
-        # The stations and their play history (PROTOCOL §18). Built before _load,
-        # which hands it the persisted stations.
-        self.stations = StationEngine(self)
-        self.moods = MoodService(self)
+        # This user's stations and play history (PROTOCOL §18), in their own side
+        # files; the caches and the probe they are computed with are the hub's.
+        self.stations = StationEngine(
+            self, hub.station_shared,
+            side_base=STATE_PATH if primary else _space_side_base(key))
         # The queue position an `ended` report was last judged at, so a receiver
         # repeating the flag does not count one play-through twice.
         self._ended_judged: Optional[tuple] = None
-        self._load()
-        # A timer the state file brought back counts down from here.
-        self._sleep_arm()
+
+    # ----- what the space borrows from the hub ------------------------------ #
+    # StationEngine reaches its owner through these five names (`session`, `_save`,
+    # `_spawn`, `_broadcast`, `_broadcast_session`) and `moods`; the space is that
+    # owner, so the engine reads this user's session and speaks to this user's sockets.
+    @property
+    def moods(self) -> "MoodService":
+        return self.hub.moods
+
+    @property
+    def sockets(self) -> list:
+        """The live sockets bound to this space: one per online device."""
+        return [d.ws for d in self.devices.values() if d.online and d.ws is not None]
+
+    def _save(self, blocking_backup: bool = False) -> None:
+        self.hub._save(blocking_backup)  # noqa: SLF001 — same module
+
+    def _spawn(self, coro: Any) -> None:
+        self.hub._spawn(coro)  # noqa: SLF001 — same module
+
+    # ----- persistence of one space (see Hub._apply_state / _state_payload) - #
+    def state_dict(self) -> dict:
+        """This space's part of state.json: exactly the keys a P1 state file has at
+        its top level, minus the hub's own (`lbIndex`)."""
+        timer = self._sleep
+        return {
+            "session": self.session.snapshot(),
+            # The sleep timer's wall-clock end (ms), with what a restart needs to
+            # show it again; all null when none is set. See `apply_state`.
+            "sleepTimerEndsAt": timer.ends_at if timer else None,
+            "sleepTimerMinutes": timer.minutes if timer else None,
+            "sleepTimerSetBy": timer.set_by if timer else None,
+            "savedQueues": self._saved_queues_list(),
+            "deletedSavedQueues": self.deleted_saved_queues,
+            "mixes": self._mixes_list(),
+            "devices": [
+                {"id": d.id, "name": d.name, "platform": d.platform, "kind": d.kind,
+                 "caps": d.caps, "volume": d.volume, "lastSeen": d.last_seen}
+                for d in self.devices.values()
+            ],
+        }
+
+    def apply_state(self, data: dict, where: str = "state") -> None:
+        """Apply a parsed state file, each section guarded on its own.
+
+        One `try` around the lot meant `"mixes": null`, or a single device row with
+        no `id`, aborted everything after it — and the hub then ran, and saved, with
+        only what had been applied so far. That turned one bad value into the loss
+        of every section behind it. A section that cannot be read is now logged and
+        skipped; the others load.
+
+        `data` is one space's keys: state.json's top level for the primary user
+        (a file from before user spaces is nothing else, so it migrates whole), or
+        one `users.<key>` entry. `lbIndex`, `deviceAuth` and `users` are the hub's
+        (Hub._apply_state).
+        """
+        def session() -> None:
+            s = data.get("session", {})
+            queue = s.get("queue", [])
+            if not isinstance(queue, list):
+                raise TypeError(f"queue is {type(queue).__name__}, not a list")
+            self.session = Session(
+                rev=s.get("rev", 0),
+                active_device_id=None,  # nothing is live yet after a restart
+                queue=queue,
+                index=s.get("index", 0),
+                order=s.get("order"),
+                position_ms=s.get("positionMs", 0),
+                is_playing=False,
+                repeat=s.get("repeat", "none"),
+                shuffle=s.get("shuffle", False),
+                updated_at=s.get("updatedAt", 0),
+                saved_queue_id=s.get("savedQueueId"),
+                source_kind=s.get("sourceKind", "manual"),
+                source_name=s.get("sourceName"),
+                station_id=_as_str(s.get("stationId"), 64),
+            )
+
+        def saved_queues() -> None:
+            # Saved-queue history (rolling, capped). Keyed by id for cheap upsert.
+            # Re-sanitised on the way in so a state.json written by an older build (which
+            # stored client values verbatim) can't keep breaking _save() forever.
+            for rec in data.get("savedQueues", []):
+                clean = self._sanitize_saved_queue(rec, SAVED_QUEUE_SONGS_HARD_MAX)
+                if clean is not None:
+                    self.saved_queues[clean["id"]] = clean
+
+        def mixes() -> None:
+            # Additive in exactly the way savedQueues is: there is no schema version
+            # and no migration path in this file, only `data.get(key, default)`. So a
+            # state.json from before mixes existed loads with zero of them, and an
+            # older hub reading a newer file silently drops the key rather than
+            # failing — which is the whole reason the collection can be added at all.
+            for raw_mix in data.get("mixes", []):
+                clean = self._sanitize_mix(raw_mix)
+                if clean is not None:
+                    self.mixes[clean["id"]] = clean
+
+        def stations() -> None:
+            # The stations live in <state>.stations (StationEngine). A state.json
+            # written by the first station build carried them here; read those
+            # once, when the side file brought none.
+            if not self.stations.stations and data.get("stations"):
+                self.stations.load_state(data.get("stations"))
+
+        def tombstones() -> None:
+            for rid, at in (data.get("deletedSavedQueues") or {}).items():
+                try:
+                    self.deleted_saved_queues[rid] = int(at)
+                except (TypeError, ValueError):
+                    continue
+
+        def devices() -> None:
+            for d in data.get("devices", []):
+                try:  # per row: one bad device must not cost the whole registry
+                    did = d["id"]
+                    if not isinstance(did, str) or not did:
+                        raise ValueError(f"id is {did!r}")
+                    self.devices[did] = Device(
+                        id=did, name=d.get("name", "Unknown"),
+                        platform=d.get("platform", "unknown"),
+                        caps=d.get("caps", ["controller"]),
+                        kind=_as_kind(d.get("kind")),
+                        # Never anything but an int 0..100, whatever the file holds:
+                        # the row is relayed as it is and a client reads null as 100.
+                        volume=_as_int(d.get("volume"), 100, 0, 100),
+                        # _as_int: _prune_devices compares this on every sweep, long
+                        # after this guard is gone.
+                        last_seen=_as_int(d.get("lastSeen")),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log(f"{where}: skipped an unreadable device row:", e)
+
+        def sleep_timer() -> None:
+            # Only a timer that is still running comes back. One whose end passed
+            # while the hub was down is dropped and pauses nothing: firing it late
+            # would stop whatever the user has started since.
+            ends_at = data.get("sleepTimerEndsAt")
+            if ends_at is None:
+                return
+            left = (int(ends_at) - time.time() * 1000) / 1000
+            if left <= 0:
+                log("sleep timer ran out while the hub was down: dropped")
+                return
+            minutes = _as_int(data.get("sleepTimerMinutes"),
+                              int(left / SLEEP_MINUTE_S) + 1, 1, SLEEP_MINUTES_MAX)
+            # Never longer than it was set for: a wall clock that was wrong when
+            # the timer was set, or was stepped back since, must not stretch it.
+            left = min(left, minutes * SLEEP_MINUTE_S)
+            self._sleep = SleepTimer(
+                minutes=minutes, set_by=_as_str(data.get("sleepTimerSetBy"), 128),
+                ends_at=int((time.time() + left) * 1000),
+                deadline=time.monotonic() + left)
+            log(f"sleep timer restored: {left:.0f}s left of {minutes} min")
+
+        for name, section in (("session", session), ("savedQueues", saved_queues),
+                              ("mixes", mixes), ("stations", stations),
+                              ("deletedSavedQueues", tombstones), ("devices", devices),
+                              ("sleepTimer", sleep_timer)):
+            try:
+                section()
+            except Exception as e:  # noqa: BLE001
+                log(f"{where}: skipped unreadable {name}:", e)
+        # A queue bound to a station the file no longer holds continues as nothing.
+        if self.session.station_id not in self.stations.stations:
+            self.session.station_id = None
+        try:
+            self._prune_devices()
+        except Exception as e:  # noqa: BLE001
+            log(f"{where}: device pruning failed:", e)
 
     def _next_transfer_id(self) -> str:
-        self._transfer_seq += 1
-        return f"t{self._transfer_seq}"
+        # One counter for the whole hub, so a transfer id names one handoff in the
+        # log whichever user's it was.
+        self.hub._transfer_seq += 1  # noqa: SLF001 — same module
+        return f"t{self.hub._transfer_seq}"  # noqa: SLF001
 
     def _mark_play_intent(self) -> None:
         self._play_intent_at = time.monotonic()
@@ -6089,12 +6348,6 @@ class Hub:
         except Exception as e:  # noqa: BLE001 — steering must never break playback
             log("station departure failed:", e)
 
-    def _spawn(self, coro: Any) -> None:
-        """Run `coro` in the background, holding a reference until it is done."""
-        task = asyncio.create_task(coro)
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
-
     # ----- the command echo (PROTOCOL §5.2-5.3) ---------------------------- #
     def _echo_expect(self, dev: Optional[Device], seq: Optional[int] = None) -> Optional[int]:
         """Raise `dev`'s need to a stamped directive's number and return that number.
@@ -6108,8 +6361,9 @@ class Hub:
         if dev is None or ECHO_CAP not in (dev.caps or []):
             return None
         if seq is None:
-            self._do_seq += 1
-            seq = self._do_seq
+            # The hub's one counter (PROTOCOL §5.2), whichever user's device.
+            self.hub._do_seq += 1  # noqa: SLF001 — same module
+            seq = self.hub._do_seq  # noqa: SLF001
         if seq > dev.echo_need:
             dev.echo_need = seq
             # Past the backstop the clock is spent: the device stays on the old rule
@@ -6175,7 +6429,7 @@ class Hub:
             # dropped for it starts this clock again (see _on_report).
             return
         dev.echo_backstop = True
-        self._echo_backstops += 1
+        self.hub._echo_backstops += 1  # noqa: SLF001 — same module
         log(f"echo backstop: {dev.name} ({dev.id[:8]}) has not confirmed do seq {seq} "
             f"after {ECHO_BACKSTOP:.0f}s (need {dev.echo_need}); its reports go by the "
             f"{INTENT_GRACE:.0f}s rule until it catches up")
@@ -6261,198 +6515,6 @@ class Hub:
             s.bump()
             await self._broadcast_session()
 
-    # ----- persistence ----------------------------------------------------- #
-    def _load(self) -> None:
-        """Boot: read state.json, or fall back to its backup, or start fresh.
-
-        Parsing is kept apart from applying. A file that cannot be PARSED is set
-        aside under a `.corrupt-<UTC>` name and the backup is loaded instead; it
-        used to be logged and then overwritten by the first save, which is how a
-        damaged file became a lost one. A file that parses is APPLIED section by
-        section (see `_apply_state`).
-        """
-        bak_path = STATE_PATH + STATE_BACKUP_SUFFIX
-        status, data = _read_state_file(STATE_PATH)
-        restored = False
-        if status != "ok":
-            if status == "corrupt":
-                aside = _set_aside_state_file(STATE_PATH)
-                if aside:
-                    log(f"state file unreadable — set aside as {aside}")
-            bak_status, data = _read_state_file(bak_path)
-            if bak_status == "corrupt":
-                aside = _set_aside_state_file(bak_path)
-                if aside:
-                    log(f"state backup unreadable too — set aside as {aside}")
-            if bak_status != "ok":
-                log("state file empty, starting fresh" if status == "empty"
-                    else "no prior state, starting fresh")
-                # Nothing irreplaceable exists yet, so nothing is owed a backup: the
-                # empty state counts as already backed up, and the backup file first
-                # appears with the first mix or tombstone.
-                self._backup_sig = _durable_signature([], {})
-                return
-            restored = True
-            log(f"state file {status} — restoring from {bak_path}")
-
-        self._apply_state(data)
-        log(f"loaded state: {len(self.session.queue)} queued, {len(self.devices)} known devices")
-
-        if restored:
-            # Put state.json back at once rather than on the first broadcast: until
-            # then the backup would be the only copy.
-            self._backup_sig = _durable_signature(data.get("mixes"),
-                                                  data.get("deletedSavedQueues"))
-            self._save(blocking_backup=True)
-            return
-        # A clean load. Bring the backup in line if it disagrees with what was just
-        # loaded — it is stale, unreadable, or (first boot on this build, with a mix
-        # or tombstone already in the file) not there yet. state.json wins.
-        bak_status, bak = _read_state_file(bak_path)
-        if bak_status == "ok":
-            self._backup_sig = _durable_signature(bak.get("mixes"),
-                                                  bak.get("deletedSavedQueues"))
-        elif bak_status == "corrupt":
-            self._backup_sig = None
-        else:
-            self._backup_sig = _durable_signature([], {})
-        try:
-            payload, sig = self._state_payload()
-        except Exception as e:  # noqa: BLE001
-            log("failed to build the state backup:", e)
-            return
-        self._request_backup(sig, payload, blocking=True)
-
-    def _apply_state(self, data: dict) -> None:
-        """Apply a parsed state file, each section guarded on its own.
-
-        One `try` around the lot meant `"mixes": null`, or a single device row with
-        no `id`, aborted everything after it — and the hub then ran, and saved, with
-        only what had been applied so far. That turned one bad value into the loss
-        of every section behind it. A section that cannot be read is now logged and
-        skipped; the others load.
-        """
-        def session() -> None:
-            s = data.get("session", {})
-            queue = s.get("queue", [])
-            if not isinstance(queue, list):
-                raise TypeError(f"queue is {type(queue).__name__}, not a list")
-            self.session = Session(
-                rev=s.get("rev", 0),
-                active_device_id=None,  # nothing is live yet after a restart
-                queue=queue,
-                index=s.get("index", 0),
-                order=s.get("order"),
-                position_ms=s.get("positionMs", 0),
-                is_playing=False,
-                repeat=s.get("repeat", "none"),
-                shuffle=s.get("shuffle", False),
-                updated_at=s.get("updatedAt", 0),
-                saved_queue_id=s.get("savedQueueId"),
-                source_kind=s.get("sourceKind", "manual"),
-                source_name=s.get("sourceName"),
-                station_id=_as_str(s.get("stationId"), 64),
-            )
-
-        def saved_queues() -> None:
-            # Saved-queue history (rolling, capped). Keyed by id for cheap upsert.
-            # Re-sanitised on the way in so a state.json written by an older build (which
-            # stored client values verbatim) can't keep breaking _save() forever.
-            for rec in data.get("savedQueues", []):
-                clean = self._sanitize_saved_queue(rec, SAVED_QUEUE_SONGS_HARD_MAX)
-                if clean is not None:
-                    self.saved_queues[clean["id"]] = clean
-
-        def mixes() -> None:
-            # Additive in exactly the way savedQueues is: there is no schema version
-            # and no migration path in this file, only `data.get(key, default)`. So a
-            # state.json from before mixes existed loads with zero of them, and an
-            # older hub reading a newer file silently drops the key rather than
-            # failing — which is the whole reason the collection can be added at all.
-            for raw_mix in data.get("mixes", []):
-                clean = self._sanitize_mix(raw_mix)
-                if clean is not None:
-                    self.mixes[clean["id"]] = clean
-
-        def stations() -> None:
-            # The stations live in <state>.stations (StationEngine). A state.json
-            # written by the first station build carried them here; read those
-            # once, when the side file brought none.
-            if not self.stations.stations and data.get("stations"):
-                self.stations.load_state(data.get("stations"))
-
-        def lb_index() -> None:
-            # Additive like `mixes`: a state.json from before the index mirror
-            # simply has no hint, and welcome omits the field until lb-bot pushes.
-            self.lb_index = _lb_index_hint(data.get("lbIndex"))
-
-        def tombstones() -> None:
-            for rid, at in (data.get("deletedSavedQueues") or {}).items():
-                try:
-                    self.deleted_saved_queues[rid] = int(at)
-                except (TypeError, ValueError):
-                    continue
-
-        def devices() -> None:
-            for d in data.get("devices", []):
-                try:  # per row: one bad device must not cost the whole registry
-                    did = d["id"]
-                    if not isinstance(did, str) or not did:
-                        raise ValueError(f"id is {did!r}")
-                    self.devices[did] = Device(
-                        id=did, name=d.get("name", "Unknown"),
-                        platform=d.get("platform", "unknown"),
-                        caps=d.get("caps", ["controller"]),
-                        kind=_as_kind(d.get("kind")),
-                        # Never anything but an int 0..100, whatever the file holds:
-                        # the row is relayed as it is and a client reads null as 100.
-                        volume=_as_int(d.get("volume"), 100, 0, 100),
-                        # _as_int: _prune_devices compares this on every sweep, long
-                        # after this guard is gone.
-                        last_seen=_as_int(d.get("lastSeen")),
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log("state: skipped an unreadable device row:", e)
-
-        def sleep_timer() -> None:
-            # Only a timer that is still running comes back. One whose end passed
-            # while the hub was down is dropped and pauses nothing: firing it late
-            # would stop whatever the user has started since.
-            ends_at = data.get("sleepTimerEndsAt")
-            if ends_at is None:
-                return
-            left = (int(ends_at) - time.time() * 1000) / 1000
-            if left <= 0:
-                log("sleep timer ran out while the hub was down: dropped")
-                return
-            minutes = _as_int(data.get("sleepTimerMinutes"),
-                              int(left / SLEEP_MINUTE_S) + 1, 1, SLEEP_MINUTES_MAX)
-            # Never longer than it was set for: a wall clock that was wrong when
-            # the timer was set, or was stepped back since, must not stretch it.
-            left = min(left, minutes * SLEEP_MINUTE_S)
-            self._sleep = SleepTimer(
-                minutes=minutes, set_by=_as_str(data.get("sleepTimerSetBy"), 128),
-                ends_at=int((time.time() + left) * 1000),
-                deadline=time.monotonic() + left)
-            log(f"sleep timer restored: {left:.0f}s left of {minutes} min")
-
-        for name, section in (("session", session), ("savedQueues", saved_queues),
-                              ("mixes", mixes), ("stations", stations),
-                              ("lbIndex", lb_index),
-                              ("deletedSavedQueues", tombstones), ("devices", devices),
-                              ("sleepTimer", sleep_timer)):
-            try:
-                section()
-            except Exception as e:  # noqa: BLE001
-                log(f"state: skipped unreadable {name}:", e)
-        # A queue bound to a station the file no longer holds continues as nothing.
-        if self.session.station_id not in self.stations.stations:
-            self.session.station_id = None
-        try:
-            self._prune_devices()
-        except Exception as e:  # noqa: BLE001
-            log("state: device pruning failed:", e)
-
     def _prune_devices(self) -> None:
         """Drop known devices not seen within DEVICE_TTL_DAYS (0 = keep forever).
 
@@ -6472,175 +6534,6 @@ class Hub:
         if stale:
             log(f"pruned {len(stale)} device(s) not seen in {DEVICE_TTL_DAYS}d")
         return len(stale)
-
-    async def _device_sweep_loop(self) -> None:
-        """Expire stale picker rows while the hub runs, not just at startup."""
-        while True:
-            await asyncio.sleep(DEVICE_SWEEP_INTERVAL)
-            try:
-                if self._prune_devices():
-                    self._save()
-                    await self._broadcast_devices()
-                self.stations._sweep()  # noqa: SLF001 — same module
-            except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
-                log("device sweep error:", e)
-
-    def health(self) -> dict:
-        """Liveness snapshot for the HTTP health endpoint.
-
-        Deliberately carries NO session intent (no active device, queue contents or
-        play-state): the port is a plain unauthenticated HTTP probe.
-        """
-        return {
-            "status": "ok",
-            "uptimeSeconds": int(time.monotonic() - self._started_at),
-            "devices": len(self.devices),
-            "online": sum(1 for d in self.devices.values() if d.online),
-            # The command echo at work (PROTOCOL §5.3). `staleReports` counts
-            # reports dropped because they were read before a directive took
-            # effect: above zero means the rule is doing its job. `echoBackstops`
-            # counts receivers that left a directive unconfirmed for
-            # ECHO_BACKSTOP: above zero means one is breaking its contract.
-            "staleReports": self._stale_reports,
-            "echoBackstops": self._echo_backstops,
-        }
-
-    def _state_payload(self) -> tuple[str, Optional[str]]:
-        """state.json's text, serialised once, plus the signature of its
-        irreplaceable part (see `_durable_signature`)."""
-        mixes = self._mixes_list()
-        timer = self._sleep
-        data = {
-            "session": self.session.snapshot(),
-            # The sleep timer's wall-clock end (ms), with what a restart needs to
-            # show it again; all null when none is set. See `_apply_state`.
-            "sleepTimerEndsAt": timer.ends_at if timer else None,
-            "sleepTimerMinutes": timer.minutes if timer else None,
-            "sleepTimerSetBy": timer.set_by if timer else None,
-            "savedQueues": self._saved_queues_list(),
-            "deletedSavedQueues": self.deleted_saved_queues,
-            "mixes": mixes,
-            "lbIndex": self.lb_index,
-            "devices": [
-                {"id": d.id, "name": d.name, "platform": d.platform, "kind": d.kind,
-                 "caps": d.caps, "volume": d.volume, "lastSeen": d.last_seen}
-                for d in self.devices.values()
-            ],
-        }
-        return json.dumps(data), _durable_signature(mixes, self.deleted_saved_queues)
-
-    def _save(self, blocking_backup: bool = False) -> None:
-        # Synchronous, on the loop, and NOT fsynced — on purpose. This runs on every
-        # session broadcast, and a second writer in a thread could land an older
-        # payload last. Durability for the part that needs it is the backup's job.
-        try:
-            # Built inside the try: _saved_queues_list() sorts records, and a persistence
-            # failure must not escape into whichever act handler happened to trigger it.
-            payload, sig = self._state_payload()
-            os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-            tmp = STATE_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp, STATE_PATH)
-        except Exception as e:  # noqa: BLE001
-            log("failed to save state:", e)
-            return
-        self._request_backup(sig, payload, blocking=blocking_backup)
-
-    def _request_backup(self, sig: Optional[str], payload: str,
-                        blocking: bool = False) -> None:
-        """Queue a durable copy of `payload` if its irreplaceable part has changed.
-
-        Called on every save, and a no-op on nearly all of them: position, queue and
-        device changes leave the signature alone, so they cost no fsync. Single
-        flight, like the play-queue mirror — the newest payload replaces a waiting
-        one and one worker does the writing.
-        """
-        if sig is None or sig == self._backup_sig:
-            return
-        self._backup_sig = sig
-        self._backup_latest = (sig, payload)
-        if self._backup_task is not None and not self._backup_task.done():
-            self._backup_pending = True  # the running worker picks it up
-            return
-        if not blocking:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                blocking = True  # no loop (boot, or a test driving _save directly)
-        if blocking:
-            # Nothing is being served and no worker exists, so write it here.
-            self._backup_latest = None
-            self._write_backup(sig, payload)
-            return
-        self._backup_pending = True
-        self._backup_task = asyncio.create_task(self._backup_worker())
-
-    def _write_backup(self, sig: str, payload: str) -> None:
-        try:
-            _write_state_backup_blocking(STATE_PATH + STATE_BACKUP_SUFFIX, payload)
-        except Exception as e:  # noqa: BLE001
-            self._backup_failed(sig, e)
-
-    def _backup_failed(self, sig: str, err: Exception) -> None:
-        log("failed to write state backup:", err)
-        # Forget the signature so the next save tries again — unless a newer one
-        # has been queued since, in which case that attempt is already on its way.
-        if self._backup_sig == sig:
-            self._backup_sig = None
-
-    async def _backup_worker(self) -> None:
-        try:
-            while self._backup_pending:
-                self._backup_pending = False
-                sig, payload = self._backup_latest
-                self._backup_latest = None
-                try:
-                    await asyncio.to_thread(
-                        _write_state_backup_blocking,
-                        STATE_PATH + STATE_BACKUP_SUFFIX, payload)
-                except Exception as e:  # noqa: BLE001
-                    self._backup_failed(sig, e)
-        finally:
-            self._backup_task = None
-
-    def set_lb_index(self, hint: dict) -> None:
-        """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE),
-        with a trailing save for the last throttled push.
-
-        Written at once: a new epoch, the change a restarted hub must not forget,
-        since it is what tells a client its whole mirror is void; and (Worbus P1)
-        a `progress` that appears, goes, or reaches `unindexed: 0`. A build's
-        final push usually lands inside the window of the one before it, and
-        lb-bot does not send it again, so a hub killed before the trailing save
-        came back showing a bar stuck at its last count."""
-        old = self.lb_index
-        new_epoch = old is None or old.get("epoch") != hint["epoch"]
-        old_progress = (old or {}).get("progress")
-        progress = hint.get("progress")
-        bar_edge = ((old_progress is None) != (progress is None)
-                    or (progress is not None and progress["unindexed"] == 0
-                        and progress != old_progress))
-        self.lb_index = dict(hint)
-        now = time.monotonic()
-        if (new_epoch or bar_edge
-                or now - self._last_lb_index_save_at >= LB_INDEX_SAVE_THROTTLE):
-            self._save_lb_index()
-            return
-        if self._lb_index_trailing is None:
-            delay = self._last_lb_index_save_at + LB_INDEX_SAVE_THROTTLE - now
-            try:
-                self._lb_index_trailing = asyncio.get_running_loop().call_later(
-                    max(delay, 0.0), self._save_lb_index)
-            except RuntimeError:  # no loop (a test driving this directly)
-                pass
-
-    def _save_lb_index(self) -> None:
-        if self._lb_index_trailing is not None:
-            self._lb_index_trailing.cancel()
-            self._lb_index_trailing = None
-        self._last_lb_index_save_at = time.monotonic()
-        self._save()
 
     # ----- send helpers ---------------------------------------------------- #
     async def _send(self, dev: Optional[Device], obj: dict) -> None:
@@ -7374,95 +7267,6 @@ class Hub:
         except Exception:  # noqa: BLE001 — closing is best-effort by definition
             pass
 
-    async def handler(self, ws: Any) -> None:
-        dev: Optional[Device] = None
-        # PROTOCOL §2: clients connect to /connect. `/` is still accepted (older
-        # builds of both clients used it) but logged so it can be retired.
-        path = (getattr(ws, "request", None) and ws.request.path) or getattr(ws, "path", "/")
-        path = (path or "/").split("?")[0].rstrip("/") or "/"
-        if path not in ("/connect", "/"):
-            await self._close(ws, 4004, "bad path")
-            return
-        if path == "/":
-            dlog("client connected on deprecated path '/'; use /connect")
-        try:
-            # First frame MUST be hello + valid token.
-            raw = await asyncio.wait_for(ws.recv(), timeout=10)
-            msg = json.loads(raw)
-            if not isinstance(msg, dict):
-                await self._close(ws, 4002, "protocol")
-                return
-            token_ok = not TOKEN or hmac.compare_digest(str(msg.get("token") or ""), TOKEN)
-            if msg.get("t") != "hello" or not token_ok:
-                got = str(msg.get("token") or "")
-                name = (msg.get("device") or {}).get("name", "?")
-                # Length only, never a prefix of what was supplied. The prefix was there to
-                # catch a quoted value from docker --env-file, and the length difference it
-                # produces says the same thing without putting four characters of somebody's
-                # secret in a log file that gets pasted into bug reports.
-                log(f"AUTH REJECTED for {name!r}: supplied token has length {len(got)}, "
-                    f"expected {len(TOKEN)} — check HUB_TOKEN "
-                    f"(note: docker --env-file does NOT strip quotes, which shows up here "
-                    f"as a length two greater than expected)")
-                await ws.send(json.dumps({"t": "error", "code": "auth", "message": "bad token"}))
-                await self._close(ws, 4001, "auth")
-                return
-
-            # Before registering, so a device is never half-announced while its
-            # welcome waits. A no-op once the hub's first lb-bot probe is in.
-            await LB.wait_first_probe(LB_PROBE_STARTUP_WAIT)
-            # NOTHING may suspend between here and the write of `welcome`. _register
-            # adopts the socket, so from that line every directive for this device
-            # is written to it, and `welcome` has to be the first frame on it: it is
-            # where both sides zero the command echo (PROTOCOL §5.2), and a `do`
-            # ahead of it would be numbered for a connection that has not begun.
-            # `ws.send` writes its frame before it first suspends.
-            dev, arrival = self._register(msg.get("device", {}), ws)
-            welcome = {
-                "t": "welcome",
-                "deviceId": dev.id,
-                "features": list(HUB_FEATURES),
-                "session": self._session_snapshot(),
-                "savedQueues": self._saved_queues_list(),
-                "mixes": self._mixes_list(),
-                "devices": [d.info(self.session.active_device_id) for d in self.devices.values()],
-                # lb-bot's availability and the routes this hub proxies — the
-                # `/lb/status` answer, delivered without a client awaiting it.
-                "lb": LB.welcome_info(),
-                # The station the session is bound to (§18.2), or null: a device
-                # joining mid-station learns `after` without a round trip.
-                "station": self.stations.welcome_station(),
-            }
-            if self.lb_index is not None:
-                welcome["lbIndex"] = dict(self.lb_index)
-            self._echo_reset(dev)
-            dev.session_rev_sent = welcome["session"]["rev"]
-            await self._send(dev, welcome)
-            await self._broadcast_devices()
-            log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}; {arrival}")
-
-            async for raw in ws:
-                if dev.ws is not ws:
-                    # Superseded: a newer socket registered this id and this one is
-                    # being closed in the background. What it still delivers was
-                    # sent on a connection the hub has moved on from. A report on it
-                    # carries the old connection's `applied`, and a `released` or
-                    # `loaded` would answer a question now put to the new socket;
-                    # those fall to their timeouts.
-                    dlog(f"frame from a superseded socket of {dev.name}/{dev.id[:8]} dropped")
-                    continue
-                try:
-                    await self._on_message(dev, json.loads(raw))
-                except Exception as e:  # noqa: BLE001 — never let one bad frame kill the socket
-                    log("message error:", e)
-        except (asyncio.TimeoutError, json.JSONDecodeError):
-            await self._close(ws, 4002, "protocol")
-        except websockets.ConnectionClosed:
-            pass
-        finally:
-            if dev:
-                await self._disconnect(dev, ws)
-
     def _register(self, desc: dict, ws: Any) -> tuple[Device, str]:
         """Bind `ws` to the device `desc` names. Returns it, and a note for the log
         on where it came from (new, back after N s, replacing a live socket).
@@ -7666,7 +7470,7 @@ class Hub:
                 # Read before a directive took effect: every field in it may be the
                 # state just left. Dropped whole; the receiver owes a fresh report
                 # the moment `applied` moves.
-                self._stale_reports += 1
+                self.hub._stale_reports += 1  # noqa: SLF001 — same module
                 if not dev.echo_sent:
                     # Nothing is timing this wait (the clock for that directive was
                     # stopped while the device did not hold the session). A drop
@@ -8592,6 +8396,482 @@ class Hub:
                                "message": f"{target.name} could not start playback"})
 
 
+class Hub:
+    """The process: one `UserSpace` per Navidrome user, and what is the whole hub's.
+
+    Per user (the space): see UserSpace. Hub-wide: the spaces themselves and who
+    the primary user is, the device credentials (`deviceAuth`, hashes only, filled
+    in by sign-in), lb-bot's index hint, state.json and its fsynced backup, the
+    command echo's counter and its /health counts, the transfer id counter, the
+    station engines' shared caches and probe (`station_shared`), and the moods.
+
+    `primary_user` is HUB_ND_USER lower-cased: the account the hub's service
+    calls run as, and the space today's state migrates to (design §6.1, §6.3).
+    """
+
+    # Pure helpers that callers (and the suites) reach on the Hub class.
+    SQ_TRACK_FIELDS = UserSpace.SQ_TRACK_FIELDS
+    _sanitize_mix = staticmethod(UserSpace._sanitize_mix)
+
+    def __init__(self) -> None:
+        self.primary_user = _space_key(ND_USER)
+        # key (lower-cased Navidrome username) -> that user's space. Created lazily
+        # by `space_for`; the primary user's exists from the start.
+        self.spaces: dict[str, UserSpace] = {}
+        # sha256(device secret) hex -> {"user", "deviceId", "createdAt"}. Never the
+        # secret itself (Global Constraints). Filled in by sign-in (H2).
+        self.device_auth: dict[str, dict] = {}
+        # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
+        # A HINT only: a client pulls on every welcome whatever it says, because
+        # a push missed while the hub was down would leave this stale.
+        self.lb_index: Optional[dict] = None
+        self._last_lb_index_save_at = 0.0
+        self._lb_index_trailing: Any = None  # the pending trailing save (loop handle)
+        # The command echo: one counter for the whole process, so a number is never
+        # reused for another device or after a reconnect (PROTOCOL §5.2).
+        self._do_seq = 0
+        self._stale_reports = 0  # /health: reports dropped for `applied` < need
+        self._echo_backstops = 0  # /health: times ECHO_BACKSTOP expired on a device
+        # Monotonic id for every handoff, carried on do:release/released and
+        # do:load/loaded so a reply can be matched to the attempt that asked for it.
+        self._transfer_seq = 0
+        # Tasks nobody awaits (closing a superseded socket). asyncio keeps only weak
+        # references to tasks, so an unreferenced one can be collected mid-flight.
+        self._bg_tasks: set = set()
+        # The fsynced backup of state.json (STATE_BACKUP_SUFFIX). One worker, latest
+        # payload wins, never two writers.
+        self._backup_task: Optional[asyncio.Task] = None
+        self._backup_pending = False
+        self._backup_latest: Optional[tuple[str, str]] = None  # (signature, payload)
+        # Signature of the newest backup written or queued; None = unknown, so the
+        # next save writes one. Set by _load() before anything can save.
+        self._backup_sig: Optional[str] = None
+        self._started_at = time.monotonic()
+        # The stations' caches, semaphores and tier probe, shared by every user's
+        # StationEngine. Built before any space.
+        self.station_shared = _StationShared()
+        self.moods = MoodService(self)
+        # The primary user's space is built before _load, which hands it today's
+        # top-level state (its StationEngine reads today's side files as it is built).
+        self.space_for(self.primary_user)
+        self._load()
+        # A timer the state file brought back counts down from here.
+        for sp in self.spaces.values():
+            sp._sleep_arm()  # noqa: SLF001 — same module
+
+    # ----- the spaces ------------------------------------------------------ #
+    @property
+    def primary_space(self) -> UserSpace:
+        return self.spaces[self.primary_user]
+
+    def space_for(self, user: str) -> UserSpace:
+        """The space of `user` (compared lower-cased), created on first use."""
+        key = _space_key(user)
+        sp = self.spaces.get(key)
+        if sp is None:
+            if not key and self.primary_user:
+                raise ValueError("a space needs a user name")
+            sp = self.spaces[key] = UserSpace(self, key, primary=key == self.primary_user)
+        return sp
+
+    def _spawn(self, coro: Any) -> None:
+        """Run `coro` in the background, holding a reference until it is done."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    def close_stations(self) -> None:
+        """Graceful stop: every user's play history and stations written now."""
+        for sp in self.spaces.values():
+            sp.stations.close()
+
+    async def _broadcast(self, obj: dict) -> None:
+        """A frame for every connected device of every user: library facts (`lb`,
+        `index`, `library`) and, until H3 narrows it, `fill`."""
+        await asyncio.gather(*(sp._broadcast(obj) for sp in list(self.spaces.values())),  # noqa: SLF001
+                             return_exceptions=True)
+
+    # ----- persistence ----------------------------------------------------- #
+    def _load(self) -> None:
+        """Boot: read state.json, or fall back to its backup, or start fresh.
+
+        Parsing is kept apart from applying. A file that cannot be PARSED is set
+        aside under a `.corrupt-<UTC>` name and the backup is loaded instead; it
+        used to be logged and then overwritten by the first save, which is how a
+        damaged file became a lost one. A file that parses is APPLIED section by
+        section (see `_apply_state`).
+        """
+        bak_path = STATE_PATH + STATE_BACKUP_SUFFIX
+        status, data = _read_state_file(STATE_PATH)
+        restored = False
+        if status != "ok":
+            if status == "corrupt":
+                aside = _set_aside_state_file(STATE_PATH)
+                if aside:
+                    log(f"state file unreadable — set aside as {aside}")
+            bak_status, data = _read_state_file(bak_path)
+            if bak_status == "corrupt":
+                aside = _set_aside_state_file(bak_path)
+                if aside:
+                    log(f"state backup unreadable too — set aside as {aside}")
+            if bak_status != "ok":
+                log("state file empty, starting fresh" if status == "empty"
+                    else "no prior state, starting fresh")
+                # Nothing irreplaceable exists yet, so nothing is owed a backup: the
+                # empty state counts as already backed up, and the backup file first
+                # appears with the first mix or tombstone.
+                self._backup_sig = _durable_signature([], {})
+                return
+            restored = True
+            log(f"state file {status} — restoring from {bak_path}")
+
+        self._apply_state(data)
+        prim = self.primary_space
+        others = len(self.spaces) - 1
+        log(f"loaded state: {len(prim.session.queue)} queued, {len(prim.devices)} known devices"
+            + (f"; {others} other user space(s)" if others else ""))
+
+        if restored:
+            # Put state.json back at once rather than on the first broadcast: until
+            # then the backup would be the only copy.
+            self._backup_sig = _durable_signature_of(data)
+            self._save(blocking_backup=True)
+            return
+        # A clean load. Bring the backup in line if it disagrees with what was just
+        # loaded — it is stale, unreadable, or (first boot on this build, with a mix
+        # or tombstone already in the file) not there yet. state.json wins.
+        bak_status, bak = _read_state_file(bak_path)
+        if bak_status == "ok":
+            self._backup_sig = _durable_signature_of(bak)
+        elif bak_status == "corrupt":
+            self._backup_sig = None
+        else:
+            self._backup_sig = _durable_signature([], {})
+        try:
+            payload, sig = self._state_payload()
+        except Exception as e:  # noqa: BLE001
+            log("failed to build the state backup:", e)
+            return
+        self._request_backup(sig, payload, blocking=True)
+
+    def _apply_state(self, data: dict) -> None:
+        """Apply a parsed state file. The top-level keys are the primary user's
+        space (UserSpace.apply_state); `users` holds every other user's, each under
+        the same keys; `lbIndex` and `deviceAuth` are the hub's. Each part is
+        guarded on its own, as each section inside a space is: one unreadable user
+        costs that user, never the owner or the others.
+        """
+        self.primary_space.apply_state(data)
+
+        def lb_index() -> None:
+            # Additive like `mixes`: a state.json from before the index mirror
+            # simply has no hint, and welcome omits the field until lb-bot pushes.
+            self.lb_index = _lb_index_hint(data.get("lbIndex"))
+
+        def device_auth() -> None:
+            # Additive: a file from before sign-in has none. Only well-formed rows:
+            # a sha256 hex key bound to a user and a device id.
+            raw = data.get("deviceAuth")
+            for h, row in (raw if isinstance(raw, dict) else {}).items():
+                if not (isinstance(h, str) and len(h) == 64
+                        and all(c in "0123456789abcdef" for c in h)):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                user, did = _space_key(row.get("user")), row.get("deviceId")
+                if not user or not isinstance(did, str) or not did:
+                    continue
+                self.device_auth[h] = {"user": user, "deviceId": did,
+                                       "createdAt": _as_int(row.get("createdAt"), 0, 0)}
+
+        def users() -> None:
+            raw = data.get("users")
+            if raw is None:
+                return
+            if not isinstance(raw, dict):
+                raise TypeError(f"users is {type(raw).__name__}, not an object")
+            for name, section in raw.items():
+                key = _space_key(name)
+                if not key or key == self.primary_user or key in self.spaces:
+                    # The primary user is the top level; a second spelling of a key
+                    # already read would overwrite it.
+                    log(f"state: skipped users entry {str(name)[:64]!r}")
+                    continue
+                if not isinstance(section, dict):
+                    log(f"state: skipped unreadable users entry {key[:64]!r}")
+                    continue
+                self.space_for(key).apply_state(section, where=f"state users.{key[:64]}")
+
+        for name, section in (("lbIndex", lb_index), ("deviceAuth", device_auth),
+                              ("users", users)):
+            try:
+                section()
+            except Exception as e:  # noqa: BLE001
+                log(f"state: skipped unreadable {name}:", e)
+
+    async def _device_sweep_loop(self) -> None:
+        """Expire stale picker rows while the hub runs, not just at startup."""
+        while True:
+            await asyncio.sleep(DEVICE_SWEEP_INTERVAL)
+            for sp in list(self.spaces.values()):
+                try:  # per space: one user's failure must not skip the others
+                    if sp._prune_devices():  # noqa: SLF001 — same module
+                        self._save()
+                        await sp._broadcast_devices()  # noqa: SLF001
+                    sp.stations._sweep()  # noqa: SLF001
+                except Exception as e:  # noqa: BLE001 — a sweep must never kill the hub
+                    log("device sweep error:", e)
+
+    def health(self) -> dict:
+        """Liveness snapshot for the HTTP health endpoint.
+
+        Deliberately carries NO session intent (no active device, queue contents or
+        play-state): the port is a plain unauthenticated HTTP probe.
+        """
+        return {
+            "status": "ok",
+            "uptimeSeconds": int(time.monotonic() - self._started_at),
+            # Counts over every user's space; nothing names a user or a device.
+            "devices": sum(len(sp.devices) for sp in self.spaces.values()),
+            "online": sum(1 for sp in self.spaces.values()
+                          for d in sp.devices.values() if d.online),
+            # The command echo at work (PROTOCOL §5.3). `staleReports` counts
+            # reports dropped because they were read before a directive took
+            # effect: above zero means the rule is doing its job. `echoBackstops`
+            # counts receivers that left a directive unconfirmed for
+            # ECHO_BACKSTOP: above zero means one is breaking its contract.
+            "staleReports": self._stale_reports,
+            "echoBackstops": self._echo_backstops,
+        }
+
+    def _state_payload(self) -> tuple[str, Optional[str]]:
+        """state.json's text, serialised once, plus the signature of its
+        irreplaceable part (see `_durable_signature_of`).
+
+        The layout keeps a rollback whole (design §6.3): the primary user's space
+        is in exactly the top-level keys a P1 hub reads, so that hub finds the
+        owner's state as it left it and ignores the two new keys; every other
+        user is under `users`, each with the same keys; device credentials
+        (hashes only) are under `deviceAuth`."""
+        data = self.primary_space.state_dict()
+        data["lbIndex"] = self.lb_index
+        data["users"] = {key: sp.state_dict() for key, sp in self.spaces.items()
+                         if key != self.primary_user}
+        data["deviceAuth"] = self.device_auth
+        return json.dumps(data), _durable_signature_of(data)
+
+    def _save(self, blocking_backup: bool = False) -> None:
+        # Synchronous, on the loop, and NOT fsynced — on purpose. This runs on every
+        # session broadcast, and a second writer in a thread could land an older
+        # payload last. Durability for the part that needs it is the backup's job.
+        try:
+            # Built inside the try: _saved_queues_list() sorts records, and a persistence
+            # failure must not escape into whichever act handler happened to trigger it.
+            payload, sig = self._state_payload()
+            os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, STATE_PATH)
+        except Exception as e:  # noqa: BLE001
+            log("failed to save state:", e)
+            return
+        self._request_backup(sig, payload, blocking=blocking_backup)
+
+    def _request_backup(self, sig: Optional[str], payload: str,
+                        blocking: bool = False) -> None:
+        """Queue a durable copy of `payload` if its irreplaceable part has changed.
+
+        Called on every save, and a no-op on nearly all of them: position, queue and
+        device changes leave the signature alone, so they cost no fsync. Single
+        flight, like the play-queue mirror — the newest payload replaces a waiting
+        one and one worker does the writing.
+        """
+        if sig is None or sig == self._backup_sig:
+            return
+        self._backup_sig = sig
+        self._backup_latest = (sig, payload)
+        if self._backup_task is not None and not self._backup_task.done():
+            self._backup_pending = True  # the running worker picks it up
+            return
+        if not blocking:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                blocking = True  # no loop (boot, or a test driving _save directly)
+        if blocking:
+            # Nothing is being served and no worker exists, so write it here.
+            self._backup_latest = None
+            self._write_backup(sig, payload)
+            return
+        self._backup_pending = True
+        self._backup_task = asyncio.create_task(self._backup_worker())
+
+    def _write_backup(self, sig: str, payload: str) -> None:
+        try:
+            _write_state_backup_blocking(STATE_PATH + STATE_BACKUP_SUFFIX, payload)
+        except Exception as e:  # noqa: BLE001
+            self._backup_failed(sig, e)
+
+    def _backup_failed(self, sig: str, err: Exception) -> None:
+        log("failed to write state backup:", err)
+        # Forget the signature so the next save tries again — unless a newer one
+        # has been queued since, in which case that attempt is already on its way.
+        if self._backup_sig == sig:
+            self._backup_sig = None
+
+    async def _backup_worker(self) -> None:
+        try:
+            while self._backup_pending:
+                self._backup_pending = False
+                sig, payload = self._backup_latest
+                self._backup_latest = None
+                try:
+                    await asyncio.to_thread(
+                        _write_state_backup_blocking,
+                        STATE_PATH + STATE_BACKUP_SUFFIX, payload)
+                except Exception as e:  # noqa: BLE001
+                    self._backup_failed(sig, e)
+        finally:
+            self._backup_task = None
+
+    def set_lb_index(self, hint: dict) -> None:
+        """Adopt a pushed index head and persist it, throttled (LB_INDEX_SAVE_THROTTLE),
+        with a trailing save for the last throttled push.
+
+        Written at once: a new epoch, the change a restarted hub must not forget,
+        since it is what tells a client its whole mirror is void; and (Worbus P1)
+        a `progress` that appears, goes, or reaches `unindexed: 0`. A build's
+        final push usually lands inside the window of the one before it, and
+        lb-bot does not send it again, so a hub killed before the trailing save
+        came back showing a bar stuck at its last count."""
+        old = self.lb_index
+        new_epoch = old is None or old.get("epoch") != hint["epoch"]
+        old_progress = (old or {}).get("progress")
+        progress = hint.get("progress")
+        bar_edge = ((old_progress is None) != (progress is None)
+                    or (progress is not None and progress["unindexed"] == 0
+                        and progress != old_progress))
+        self.lb_index = dict(hint)
+        now = time.monotonic()
+        if (new_epoch or bar_edge
+                or now - self._last_lb_index_save_at >= LB_INDEX_SAVE_THROTTLE):
+            self._save_lb_index()
+            return
+        if self._lb_index_trailing is None:
+            delay = self._last_lb_index_save_at + LB_INDEX_SAVE_THROTTLE - now
+            try:
+                self._lb_index_trailing = asyncio.get_running_loop().call_later(
+                    max(delay, 0.0), self._save_lb_index)
+            except RuntimeError:  # no loop (a test driving this directly)
+                pass
+
+    def _save_lb_index(self) -> None:
+        if self._lb_index_trailing is not None:
+            self._lb_index_trailing.cancel()
+            self._lb_index_trailing = None
+        self._last_lb_index_save_at = time.monotonic()
+        self._save()
+
+    async def handler(self, ws: Any) -> None:
+        dev: Optional[Device] = None
+        space: Optional[UserSpace] = None
+        close = UserSpace._close  # noqa: SLF001 — same module
+        # PROTOCOL §2: clients connect to /connect. `/` is still accepted (older
+        # builds of both clients used it) but logged so it can be retired.
+        path = (getattr(ws, "request", None) and ws.request.path) or getattr(ws, "path", "/")
+        path = (path or "/").split("?")[0].rstrip("/") or "/"
+        if path not in ("/connect", "/"):
+            await close(ws, 4004, "bad path")
+            return
+        if path == "/":
+            dlog("client connected on deprecated path '/'; use /connect")
+        try:
+            # First frame MUST be hello + valid token.
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            msg = json.loads(raw)
+            if not isinstance(msg, dict):
+                await close(ws, 4002, "protocol")
+                return
+            token_ok = not TOKEN or hmac.compare_digest(str(msg.get("token") or ""), TOKEN)
+            if msg.get("t") != "hello" or not token_ok:
+                got = str(msg.get("token") or "")
+                name = (msg.get("device") or {}).get("name", "?")
+                # Length only, never a prefix of what was supplied. The prefix was there to
+                # catch a quoted value from docker --env-file, and the length difference it
+                # produces says the same thing without putting four characters of somebody's
+                # secret in a log file that gets pasted into bug reports.
+                log(f"AUTH REJECTED for {name!r}: supplied token has length {len(got)}, "
+                    f"expected {len(TOKEN)} — check HUB_TOKEN "
+                    f"(note: docker --env-file does NOT strip quotes, which shows up here "
+                    f"as a length two greater than expected)")
+                await ws.send(json.dumps({"t": "error", "code": "auth", "message": "bad token"}))
+                await close(ws, 4001, "auth")
+                return
+
+            # Before registering, so a device is never half-announced while its
+            # welcome waits. A no-op once the hub's first lb-bot probe is in.
+            await LB.wait_first_probe(LB_PROBE_STARTUP_WAIT)
+            # NOTHING may suspend between here and the write of `welcome`. _register
+            # adopts the socket, so from that line every directive for this device
+            # is written to it, and `welcome` has to be the first frame on it: it is
+            # where both sides zero the command echo (PROTOCOL §5.2), and a `do`
+            # ahead of it would be numbered for a connection that has not begun.
+            # `ws.send` writes its frame before it first suspends.
+            #
+            # Which user's space this connection is bound to, for its whole life.
+            # Until sign-in (H2) every accepted hello is the legacy shared token,
+            # which is the primary user (design §6.2).
+            space = self.primary_space
+            dev, arrival = space._register(msg.get("device", {}), ws)  # noqa: SLF001
+            welcome = {
+                "t": "welcome",
+                "deviceId": dev.id,
+                "features": list(HUB_FEATURES),
+                "session": space._session_snapshot(),  # noqa: SLF001
+                "savedQueues": space._saved_queues_list(),  # noqa: SLF001
+                "mixes": space._mixes_list(),  # noqa: SLF001
+                "devices": [d.info(space.session.active_device_id)
+                            for d in space.devices.values()],
+                # lb-bot's availability and the routes this hub proxies — the
+                # `/lb/status` answer, delivered without a client awaiting it.
+                "lb": LB.welcome_info(),
+                # The station the session is bound to (§18.2), or null: a device
+                # joining mid-station learns `after` without a round trip.
+                "station": space.stations.welcome_station(),
+            }
+            if self.lb_index is not None:
+                welcome["lbIndex"] = dict(self.lb_index)
+            space._echo_reset(dev)  # noqa: SLF001
+            dev.session_rev_sent = welcome["session"]["rev"]
+            await space._send(dev, welcome)  # noqa: SLF001
+            await space._broadcast_devices()  # noqa: SLF001
+            log(f"+ {dev.name} ({dev.id[:8]}) connected; caps={dev.caps}; {arrival}")
+
+            async for raw in ws:
+                if dev.ws is not ws:
+                    # Superseded: a newer socket registered this id and this one is
+                    # being closed in the background. What it still delivers was
+                    # sent on a connection the hub has moved on from. A report on it
+                    # carries the old connection's `applied`, and a `released` or
+                    # `loaded` would answer a question now put to the new socket;
+                    # those fall to their timeouts.
+                    dlog(f"frame from a superseded socket of {dev.name}/{dev.id[:8]} dropped")
+                    continue
+                try:
+                    await space._on_message(dev, json.loads(raw))  # noqa: SLF001
+                except Exception as e:  # noqa: BLE001 — never let one bad frame kill the socket
+                    log("message error:", e)
+        except (asyncio.TimeoutError, json.JSONDecodeError):
+            await close(ws, 4002, "protocol")
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            if dev and space is not None:
+                await space._disconnect(dev, ws)  # noqa: SLF001
+
+
+
 # --------------------------------------------------------------------------- #
 # Serving the proxy on the WebSocket port
 #
@@ -8711,9 +8991,17 @@ def _is_example_secret(value: str) -> bool:
 
 
 def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
-                           preview_url: str, preview_secret: str) -> Optional[str]:
+                           preview_url: str, preview_secret: str, *,
+                           navidrome_url: Optional[str] = None,
+                           nd_user: Optional[str] = None,
+                           nd_pass: Optional[str] = None) -> Optional[str]:
     """Why the hub must not start with this configuration, or None. Pure: the
-    values are passed in, so the decision is testable without starting a hub."""
+    values are passed in, so the decision is testable without starting a hub.
+
+    The service account (Worbus P2, design §6.1) is checked when it is passed,
+    and `_check_auth_config` always passes it; None means "not part of this
+    question", for a caller asking only about the token or the preview secret.
+    A refusal names the setting, never a value."""
     if _is_example_secret(token):
         return ("HUB_TOKEN is still the example value; set your own "
                 "(for example `openssl rand -hex 16`).")
@@ -8740,6 +9028,16 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if not preview_secret.strip():
             return ("PREVIEW_SECRET is not set but PREVIEW_URL is; set your own "
                     "(for example `openssl rand -hex 16`), or unset PREVIEW_URL.")
+    # Required since Worbus P2: users sign in against this Navidrome, the service
+    # account re-reads them, and HUB_ND_USER is the primary user, whose space
+    # today's state migrates to. Checked last, so the lines above keep their order.
+    for name, value in (("NAVIDROME_URL", navidrome_url), ("HUB_ND_USER", nd_user),
+                        ("HUB_ND_PASS", nd_pass)):
+        if value is not None and not value.strip():
+            return (f"{name} is not set.\n"
+                    "The hub signs users in against its own Navidrome and keeps the "
+                    "primary user's state for HUB_ND_USER, so NAVIDROME_URL, HUB_ND_USER "
+                    "and HUB_ND_PASS (the service account) are all required.")
     return None
 
 
@@ -8747,7 +9045,9 @@ def _check_auth_config() -> None:
     """Refuse to run as an open control plane, or with the example secrets.
     See ALLOW_INSECURE_NO_AUTH and startup_config_refusal."""
     refusal = startup_config_refusal(TOKEN, HOST, ALLOW_INSECURE_NO_AUTH,
-                                     PREVIEW_URL, PREVIEW_SECRET)
+                                     PREVIEW_URL, PREVIEW_SECRET,
+                                     navidrome_url=NAVIDROME_URL, nd_user=ND_USER,
+                                     nd_pass=ND_PASS)
     if refusal:
         raise SystemExit(refusal)
     if not TOKEN:
@@ -8826,7 +9126,9 @@ async def main() -> None:
     sweep = asyncio.create_task(hub._device_sweep_loop())  # noqa: SLF001 — same module
     # The station engine's tier probe (PROTOCOL §18.1: every 10 min, and after a
     # failure), for the characters route's `available` and `engine`.
-    station_probe = (asyncio.create_task(hub.stations.probe_loop())
+    # The probe is the hub's (`station_shared`): run through the primary user's
+    # engine, its verdicts are every engine's.
+    station_probe = (asyncio.create_task(hub.primary_space.stations.probe_loop())
                      if STATION.enabled else None)
     # The hub's own lb-bot probe, for `welcome.lb` (see LB_PROBE_STARTUP_WAIT).
     lb_probe = asyncio.create_task(LB.probe_loop()) if LB.enabled else None
@@ -8860,7 +9162,7 @@ async def main() -> None:
         station_probe.cancel()
     if mood_warm is not None:
         mood_warm.cancel()
-    hub.stations.close()   # the play history, written now rather than in 30 s
+    hub.close_stations()   # every user's play history, written now rather than in 30 s
 
     health_server.close()
     await health_server.wait_closed()
@@ -8871,11 +9173,13 @@ async def main() -> None:
                                    STATE_BACKUP_FLUSH_TIMEOUT)
         except Exception:  # noqa: BLE001
             pass
-    if hub._mirror_task is not None and not hub._mirror_task.done():
-        try:  # let a debounced savePlayQueue write finish (best-effort, short)
-            await asyncio.wait_for(asyncio.shield(hub._mirror_task), 3)
-        except Exception:  # noqa: BLE001
-            pass
+    for sp in list(hub.spaces.values()):
+        task = sp._mirror_task  # noqa: SLF001 — same module
+        if task is not None and not task.done():
+            try:  # let a debounced savePlayQueue write finish (best-effort, short)
+                await asyncio.wait_for(asyncio.shield(task), 3)
+            except Exception:  # noqa: BLE001
+                pass
     log("hub stopped; state flushed")
 
 

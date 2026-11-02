@@ -38,7 +38,10 @@ Cases:
      same seed serves nothing played, by id or by title key;
   9. AudioMuse down: engine tier1 through getSonicSimilarTracks, and through
      getSimilarSongs2 when Navidrome has no sonicSimilarity;
- 10. nothing configured: the probe answers configured:false, start 503 fallback;
+ 10. nothing configured (no HUB_TOKEN, loopback; P2 requires the service account):
+     the probe answers configured:false, start 503 fallback;
+     10b. nothing reachable (dead Navidrome, no AudioMuse): configured, unavailable,
+     start 503 fallback, an unknown station 404;
  11. the deepest list asked for stays under PROXY_MAX_RESPONSE;
  12. the 12 s budget runs from a request's arrival: a third start queued behind
      two slow ones still answers inside it, `partial`.
@@ -74,6 +77,7 @@ from test_edits import TOKEN, Client, _free_port  # noqa: E402
 FEATS = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 NEIGHBOURHOOD = 0.3
 ND_USER, ND_PASS = "station-test-user", "station-test-pass-9x7"
+DEAD_NAVIDROME = "http://127.0.0.1:9"  # nothing listens: a refused connection
 # A live row, measured 2026-10-16: 1000 rows of similar_tracks = 405,202 bytes.
 LIVE_ROW_BYTES = 406
 
@@ -396,10 +400,10 @@ def spawn(port, state, audiomuse=None, navidrome=None, extra=None, log_path=None
         env.pop(k, None)
     if audiomuse:
         env.update(AUDIOMUSE_URL=audiomuse, AUDIOMUSE_TOKEN=am_token)
-    if navidrome:
-        env["NAVIDROME_URL"] = navidrome
-    if audiomuse or navidrome:
-        env.update(HUB_ND_USER=ND_USER, HUB_ND_PASS=ND_PASS)
+    # Worbus P2: the service account is required at start-up, so it is always
+    # set; with no Navidrome under test, a dead loopback address stands in for it.
+    env["NAVIDROME_URL"] = navidrome or DEAD_NAVIDROME
+    env.update(HUB_ND_USER=ND_USER, HUB_ND_PASS=ND_PASS)
     env.update(extra or {})
     out = open(log_path, "ab") if log_path else subprocess.DEVNULL
     proc = subprocess.Popen([sys.executable, "hub.py"], env=env, cwd=HUB_DIR,
@@ -1040,9 +1044,13 @@ async def tier1_suite(failures):
         failures.append("getRandomSongs was called on the tier1 path")
 
     # ----- 10. nothing configured ------------------------------------------- #
+    # Worbus P2 (controller ruling R12): the service account is required, so a hub
+    # that starts always has Tier 1 configured. The disabled station proxy is still
+    # reached with no HUB_TOKEN (loopback, HUB_ALLOW_INSECURE_NO_AUTH): this case's
+    # assertions are unchanged, under that configuration.
     port = _free_port()
     state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    proc = spawn(port, state)
+    proc = spawn(port, state, extra={"HUB_TOKEN": "", "HUB_ALLOW_INSECURE_NO_AUTH": "true"})
     try:
         await asyncio.to_thread(wait_up, port)
         st_, ch = await acall(port, "GET", "/sonic/station/characters")
@@ -1057,6 +1065,31 @@ async def tier1_suite(failures):
                              {"stationId": "st_1_beef", "after": 0})
         if st_ != 503 or a.get("fallback") is not True:
             failures.append(f"nothing configured: next must be 503 fallback: {st_} {a}")
+    finally:
+        stop(proc)
+        unlink_all(state)
+
+    # ----- 10b. nothing reachable (Worbus P2, R12) --------------------------- #
+    # A real deployment with its Navidrome down and no AudioMuse: the token set, the
+    # required service account pointing at a dead address. Stations are configured
+    # and unavailable; a start falls back; a station nobody started is unknown.
+    port = _free_port()
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    proc = spawn(port, state)
+    try:
+        await asyncio.to_thread(wait_up, port)
+        st_, ch = await acall(port, "GET", "/sonic/station/characters")
+        if st_ != 200 or ch.get("configured") is not True or ch.get("available") is not False \
+                or ch.get("engine") is not None or len(ch.get("characters", [])) != 3:
+            failures.append(f"nothing reachable: the probe {st_} {ch}")
+        st_, a = await acall(port, "POST", "/sonic/station/start", {
+            "seed": {"kind": "track", "ids": ["L01_0"]}})
+        if st_ != 503 or a.get("fallback") is not True:
+            failures.append(f"nothing reachable: start must be 503 fallback: {st_} {a}")
+        st_, a = await acall(port, "POST", "/sonic/station/next",
+                             {"stationId": "st_1_beef", "after": 0})
+        if st_ != 404 or a.get("code") != "station_unknown":
+            failures.append(f"nothing reachable: next must be 404 station_unknown: {st_} {a}")
     finally:
         stop(proc)
         unlink_all(state)
@@ -1424,7 +1457,9 @@ async def inprocess_checks(failures):
             async def route(self, path, body):
                 seen.append((path, sorted(body)))
                 return 200, {"ok": True}
-        hubmod.HUB_INSTANCE = types.SimpleNamespace(stations=_Stations())
+        # Worbus P2: StationProxy reaches the engine through the (primary) space.
+        hubmod.HUB_INSTANCE = types.SimpleNamespace(
+            primary_space=types.SimpleNamespace(stations=_Stations()))
         foreign = {"/sonic/station/start": ({"seed": {"kind": "yourMix"}},
                                             ["after", "stationId", "trackId", "kind", "value"]),
                    "/sonic/station/next": ({"stationId": "st_1_x", "after": 0},

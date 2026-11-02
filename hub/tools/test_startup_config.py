@@ -178,7 +178,10 @@ def check_subprocess() -> list[str]:
         failures += _refused(tmp, "example PREVIEW_SECRET", PREVIEW_LINE, HUB_TOKEN=REAL_32,
                              PREVIEW_URL="http://127.0.0.1:9", PREVIEW_SECRET=EXAMPLE_PREVIEW)
     with tempfile.TemporaryDirectory() as tmp:
-        failures += _starts(tmp, "32-character HUB_TOKEN", HUB_TOKEN=REAL_32)
+        # Worbus P2: with the service account it requires (nothing calls it here).
+        failures += _starts(tmp, "32-character HUB_TOKEN", HUB_TOKEN=REAL_32,
+                            NAVIDROME_URL="http://127.0.0.1:9", HUB_ND_USER="owner",
+                            HUB_ND_PASS="test-pass")
     return failures
 
 

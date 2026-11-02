@@ -141,6 +141,7 @@ async def test_fsync_only_for_the_irreplaceable():
                 writer["active"] -= 1
 
     async def drained(h):
+        h = h.hub  # Worbus P2: the backup worker is the hub's, not the space's
         return await until(lambda: getattr(h, "_backup_task", None) is None
                            and not getattr(h, "_backup_pending", False))
 
@@ -149,7 +150,9 @@ async def test_fsync_only_for_the_irreplaceable():
     if real_writer is not None:
         hubmod._write_state_backup_blocking = tracking_writer
     try:
-        h = hubmod.Hub()
+        # Worbus P2: the session, devices, mixes and tombstones are the primary
+        # user's space's (its `_save` is the hub's).
+        h = hubmod.Hub().primary_space
         now = int(time.time() * 1000)
 
         # ----- 1. bookkeeping saves are free -------------------------------- #
@@ -232,7 +235,7 @@ async def test_fsync_only_for_the_irreplaceable():
         await drained(h)
         if "On A Share" not in (mix_names(bak) or []):
             failures.append("a refused directory fsync lost the backup write")
-        if getattr(h, "_backup_sig", None) is None:
+        if getattr(h.hub, "_backup_sig", None) is None:
             failures.append("a refused directory fsync was treated as a failed "
                             "backup (it would be retried on every save)")
     finally:
@@ -275,7 +278,8 @@ def test_boot_brings_the_backup_in_line():
                     f.write(content if isinstance(content, bytes)
                             else json.dumps(content).encode())
         fsyncs["n"] = 0
-        return hubmod.Hub(), tmpdir, fsyncs
+        # Worbus P2: the primary user's space holds what these checks read.
+        return hubmod.Hub().primary_space, tmpdir, fsyncs
 
     os.fsync = counting_fsync
     dirs = []
@@ -560,8 +564,14 @@ async def main():
 
 def _inherited_env() -> dict:
     """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
-    hub refuse to start (B-303), and this suite starts its hubs without previews."""
-    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
+    hub refuse to start (B-303), and this suite starts its hubs without previews.
+    Plus the service account Worbus P2 requires at start-up (startup_config_refusal);
+    nothing here calls Navidrome, so a dead loopback address stands in for it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
+    env.setdefault("NAVIDROME_URL", "http://127.0.0.1:9")
+    env.setdefault("HUB_ND_USER", "owner")
+    env.setdefault("HUB_ND_PASS", "test-pass")
+    return env
 
 
 if __name__ == "__main__":

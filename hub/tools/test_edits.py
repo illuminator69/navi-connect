@@ -520,8 +520,14 @@ async def test_audit_fixes():
 
 def _inherited_env() -> dict:
     """os.environ without PREVIEW_*: an exported PREVIEW_URL with no secret makes a
-    hub refuse to start (B-303), and this suite starts its hubs without previews."""
-    return {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
+    hub refuse to start (B-303), and this suite starts its hubs without previews.
+    Plus the service account Worbus P2 requires at start-up (startup_config_refusal);
+    nothing here calls Navidrome, so a dead loopback address stands in for it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PREVIEW_")}
+    env.setdefault("NAVIDROME_URL", "http://127.0.0.1:9")
+    env.setdefault("HUB_ND_USER", "owner")
+    env.setdefault("HUB_ND_PASS", "test-pass")
+    return env
 
 
 if __name__ == "__main__":
