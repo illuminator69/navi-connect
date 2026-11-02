@@ -9763,6 +9763,26 @@ async def _serve_health(hub: Hub, reader: asyncio.StreamReader,
 _EXAMPLE_SECRET_PREFIX = "change-me"
 
 
+# `.env.example`'s commented service-account placeholders (ruling R13), refused if
+# a copy is uncommented without being filled in. tools/test_startup_config.py reads
+# them out of the file, so the two cannot drift apart.
+_ND_EXAMPLE_VALUES = {"NAVIDROME_URL": "https://navidrome.example.com",
+                      "HUB_ND_USER": "your-navidrome-username",
+                      "HUB_ND_PASS": "your-navidrome-password"}
+
+
+def _unquote(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    return v
+
+
+def _is_nd_example(name: str, value: str) -> bool:
+    want = _ND_EXAMPLE_VALUES.get(name)
+    return want is not None and _unquote(value).rstrip("/").lower() == want
+
+
 def _is_example_secret(value: str) -> bool:
     v = value.strip()
     # `docker run --env-file` keeps quotes literally (compose strips them), so a
@@ -9820,6 +9840,9 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
                     "The hub signs users in against its own Navidrome and keeps the "
                     "primary user's state for HUB_ND_USER, so NAVIDROME_URL, HUB_ND_USER "
                     "and HUB_ND_PASS (the service account) are all required.")
+        if value is not None and _is_nd_example(name, value):
+            # R13: `.env.example`'s commented placeholder, uncommented as it is.
+            return f"{name} is still the example value; set your own."
     return None
 
 

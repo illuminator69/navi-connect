@@ -20,6 +20,7 @@ Exits non-zero on failure.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -206,6 +207,27 @@ def check_env_example() -> list[str]:
                                   env.get("PREVIEW_URL", ""),
                                   env.get("PREVIEW_SECRET", "")) != TOKEN_LINE:
         failures.append(".env.example's HUB_TOKEN is not refused as the example value")
+    # Worbus P2, ruling R13: the service account's lines stay commented, and each
+    # placeholder, uncommented as it is, is refused by name (never by value).
+    placeholders: dict[str, str] = {}
+    with open(os.path.join(HUB_DIR, ".env.example"), encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"^#\s*(NAVIDROME_URL|HUB_ND_USER|HUB_ND_PASS)=(\S+)\s*$", line.strip())
+            if m:
+                placeholders[m.group(1)] = m.group(2)
+    if set(placeholders) != {"NAVIDROME_URL", "HUB_ND_USER", "HUB_ND_PASS"}:
+        failures.append(f".env.example's commented service account lines: {sorted(placeholders)}")
+    good = {"navidrome_url": "http://navidrome:4533", "nd_user": "owner", "nd_pass": "pw"}
+    kw = {"NAVIDROME_URL": "navidrome_url", "HUB_ND_USER": "nd_user", "HUB_ND_PASS": "nd_pass"}
+    for name, value in placeholders.items():
+        for v in (value, f'"{value}"', value.upper()):
+            got = hub.startup_config_refusal(REAL_32, "0.0.0.0", False, "", "",
+                                             **{**good, kw[name]: v})
+            if got != f"{name} is still the example value; set your own.":
+                failures.append(f".env.example's {name} placeholder ({v!r}) is not refused "
+                                f"by name: {got!r}")
+    if hub.startup_config_refusal(REAL_32, "0.0.0.0", False, "", "", **good) is not None:
+        failures.append("a filled-in service account is refused")
     return failures
 
 
@@ -221,7 +243,8 @@ def main() -> int:
           "preview-secret-ignored-without-PREVIEW_URL/"
           "whitespace-only-is-empty/quoted-placeholder-refused/"
           "subprocess-exit-and-line-no-state-file/"
-          "subprocess-32-char-binds/env-example-enables-no-service-or-nd-creds")
+          "subprocess-32-char-binds/env-example-enables-no-service-or-nd-creds/"
+          "env-example-service-account-placeholders-refused")
     return 0
 
 

@@ -27,7 +27,13 @@ and fans out state to controllers.
 3. **Audio never flows through the hub.** Receivers resolve `/rest/stream` from
    Navidrome themselves (both clients already do). The hub moves track *ids* and
    metadata only.
-4. **Single user.** One shared secret. No per-user device ownership, no ACLs.
+4. **One space per Navidrome user** (Worbus project 2). A device signs in with the
+   Navidrome account it already holds (§3.3) and gets its own credential; each user
+   has their own session, devices, saved queues, mixes, stations, play history and
+   sleep timer, and never sees or moves another's. Rights are Navidrome's: lb-bot
+   learns who is calling (§15) and applies its own admin rules. The **primary user**
+   is the account the hub runs as (`HUB_ND_USER`); the shared `HUB_TOKEN` is still
+   accepted as that user while `HUB_ACCEPT_SHARED_TOKEN` is on.
 5. **Survives restarts.** The hub persists session + device registry to disk
    (like the existing bot's `lb_bot_state.json`). Optional mirror to Navidrome
    `savePlayQueue` for interop with other Subsonic clients (§9).
@@ -67,15 +73,17 @@ it is purely a controller. Every device is always a potential controller.
 
 | Code | Meaning | Client response |
 |---|---|---|
-| `4001` | bad or missing token | stop; do not retry until settings change |
+| `4001` | bad shared token (or the shared token while `HUB_ACCEPT_SHARED_TOKEN` is off) | stop; do not retry until settings change |
 | `4002` | protocol violation (bad first frame, malformed JSON) | reconnect with backoff |
 | `4003` | superseded — another socket registered this same `device.id` | **stand down**; for a cast bridge that means 5 minutes (§12.2) |
 | `4004` | bad path (not `/connect`) | fix the URL; do not retry |
+| `4005` | signed out: the device secret is unknown or revoked (signed out, swept, re-signed-in elsewhere, the user deleted from Navidrome), or the hello carried no credential | preceded by `error {code:"signed_out"}`; make **one** silent sign-in (§3.3) with the stored Navidrome account, then show "Signed out of the Worbus Server" |
 
 ### 3.1 Connection handshake
 
 ```
-Client → Hub : { "t":"hello", "token":"<shared-secret>",
+Client → Hub : { "t":"hello", "auth": { "deviceSecret":"<from §3.3>" },   // or, legacy:
+                 "token":"<HUB_TOKEN>",
                  "device": { "id":"<persisted-uuid|null>", "name":"Feishin-PC",
                              "platform":"desktop|android", "kind":"computer",
                              "caps":["receiver","controller"],
@@ -83,6 +91,7 @@ Client → Hub : { "t":"hello", "token":"<shared-secret>",
 Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                  "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station",
                               "stationEdits"],
+                 "user": { "name":"bob", "admin":false, "primary":false },  // §3.3
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899",
@@ -92,7 +101,28 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                                                      // §15.3, once heard; `progress` §15.7
 ```
 
-- Bad/missing `token` → hub sends `{ "t":"error", "code":"auth", ... }` and closes.
+- **Credentials (Worbus P2).** `auth.deviceSecret` binds the connection to the
+  space of the user the secret was issued to (§3.3). An unknown or revoked secret,
+  or a hello with no credential at all, gets
+  `{"t":"error","code":"signed_out","message":"Signed out of the Worbus Server."}`
+  and close `4005`. The legacy `token` is still accepted as the **primary user**
+  while `HUB_ACCEPT_SHARED_TOKEN` is true (the default); a wrong one, or any one
+  while it is false, gets `{ "t":"error", "code":"auth", ... }` and close `4001`.
+  (A hub started with no `HUB_TOKEN`, loopback only, takes a hello with no
+  credential as the primary user, as before.)
+- **The secret decides the id.** With `auth.deviceSecret`, `device.id` is the id
+  the secret is bound to, whatever the hello claims; the one exception is a
+  `cast-` id whose `bridgedBy` is that bound id, which registers that cast id in
+  the same user's space (§12.2: a bridge per speaker per user). So no secret can
+  claim another user's device or register a speaker for another user, and another
+  socket on the same id is superseded (`4003`) only within that user's space.
+- `welcome.user` is who the connection acts for: Navidrome's username, its
+  `adminRole` (`admin`) and whether it is the primary user. A legacy-token socket
+  is `{name: <HUB_ND_USER>, admin: true, primary: true}` until the hub has read
+  the primary user's real flag from Navidrome. When the flags change (§3.3) the
+  hub sends `{"t":"user","user":{name, admin, primary}}` to that user's sockets;
+  clients apply it like `welcome.user`, so admin actions appear or vanish in
+  place. An older hub sends neither: a client then behaves as today.
 - If `device.id` is null the hub mints a UUID; the client persists it and reuses
   it on every future `hello` (so reconnects don't create duplicate devices).
 - `kind` says what the device is, for the icon a picker draws: `computer`, `phone`,
@@ -164,6 +194,66 @@ verdict on the hardware:
 A verdict expires: if the asserting bridge stops renewing it (90 s), the hub
 demotes it back to `null` rather than keep asserting a speaker is up — or down —
 on the strength of a report from a bridge that may itself be wedged.
+
+### 3.3 Signing a device in (`/hub/signin`, `/hub/signout`) — Worbus P2
+
+Plain HTTP on the hub's main port, like the proxies (§14). Every client is already
+signed in to Navidrome; the Navidrome account is the key.
+
+```
+POST /hub/signin   {"username","salt","token","deviceId"?,"name","platform","kind"?}
+  -> 200 {"deviceId","deviceSecret","user":{"name","admin","primary"}}
+```
+
+- `token = md5(password + salt)`, lower-case hex, and `salt` is at least 6 random
+  characters: Subsonic token auth, so the password itself never reaches the hub.
+- The hub checks the pair with **the user's own** `GET {NAVIDROME_URL}/rest/getUser.view`
+  authenticated as that user (off its event loop, 8 s). `status: ok` and the user
+  record are the proof, and give the canonical (stored, lower-case) name and
+  `adminRole`. The pair is then dropped: never stored, never logged.
+- `deviceSecret` is `token_urlsafe(32)`. The hub keeps only its SHA-256, bound to
+  `(user, deviceId)`. A re-sign-in of the same device replaces the old secret.
+- **Which `deviceId`:** one this user already has is kept (an upgraded client keeps
+  its name, volume and place in the picker); an unknown one, or another user's,
+  is replaced by a freshly minted id. Clients **adopt and persist** the returned
+  id and use it in `hello.device.id` and as their cast bridge's `bridgedBy`.
+- Sign-in creates no device row; the first hello does.
+
+| Status | Body | When | Client says |
+|---|---|---|---|
+| 400 | `{"code":"bad_request"}` | a field missing or malformed | — |
+| 401 | `{"code":"navidrome_refused"}` | Navidrome rejected the pair (code 40, 50, any `failed`) | "This Worbus Server's Navidrome doesn't know this account. It may use a different Navidrome server." |
+| 503 | `{"code":"navidrome_unreachable"}` | Navidrome did not answer as Navidrome (refused, timeout, 5xx, not a Subsonic body); **not counted** | "The Worbus Server can't reach its Navidrome right now." |
+| 429 | `{"code":"too_many_attempts"}` | 5 **refused** sign-ins for this (remote address, lower-cased username) in the last 600 s; Navidrome is not asked | "Too many attempts. Try again in a few minutes." |
+
+An older hub answers `405` (a POST outside its proxies) or `404`: on 404, 405, or a
+reply that is not this route's JSON, a client falls back to the token field.
+
+```
+POST /hub/signout   Authorization: Bearer <deviceSecret>
+  -> 200 {}          (unknown secret: 401 {"code":"signed_out"})
+```
+
+Forgets that device's credential; the device row stays, so a later sign-in by the
+same user keeps its id. A socket still open on it is closed with `4005`.
+
+**Using the secret.** In `hello.auth.deviceSecret` (§3.1), and as the bearer on
+every HTTP route (`Authorization: Bearer <deviceSecret>`, §14, §15, §18). The
+legacy `HUB_TOKEN` bearer is the primary user while `HUB_ACCEPT_SHARED_TOKEN` is
+on; off, it is `401` on client routes (lb-bot's inbound pushes, §15.1, keep using
+`HUB_TOKEN`: it is the service secret).
+
+**Expiry and freshness.**
+- A credential lasts while its device row does: the 7-day idle sweep removes both,
+  and a credential whose device never said hello expires 7 days after sign-in.
+- A Navidrome password change does not revoke devices; deleting the user does.
+- The hub re-reads every signed-in user's `adminRole` with its service account
+  (Navidrome's native API: `POST /auth/login` once, then `GET /api/user`) on a
+  user's connect or lb call when the flags are older than 10 minutes, and every
+  10 minutes while any socket is open. A changed flag sends the `user` frame
+  (§3.1); a user the list no longer holds is signed out (`4005`). A failed read
+  changes nothing. A service account Navidrome refuses (not an admin) leaves the
+  flags as they were at sign-in.
 
 ---
 
@@ -503,14 +593,21 @@ socket stays perfectly healthy. See §3.2 and §12.2.
 | `savedQueues` | `{ queues:[<SavedQueue>...] }` | saved-queue history changed (§8.3); also in `welcome` |
 | `mixes` | `{ mixes:[<Mix>...] }` | "Mixed for You" recipes changed (§17); also in `welcome` |
 | `library` | `{ event, releaseMbid?, rgid?, artist?, album?, ndArtistId?, ndAlbumIds?, row? }` | lb-bot placed an album (`albumPlaced`), Navidrome indexed it (`albumIndexed`), or an artist's discography scan ended (`artistScanned`) (§15.1). Empty fields are omitted, so an `artistScanned` frame has no `releaseMbid` |
-| `fill` | `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
+| `fill` | **admin users' sockets only** (Worbus P2; a legacy-token socket is the primary user's). `{ kind, key, ... }` — for `kind: "album"` the `album/status` view minus `files[]`, keyed by `rgid`; for `kind: "gap"` a gap summary keyed by review-group id; for `kind: "wishlist"` a landing keyed by `rgid` | lb-bot's ledger moved (state or throttled progress) (§15.1). Touches nothing in the library, so clients update one ledger row and refetch nothing |
 | `index` | `{ seq, epoch, progress? }` | lb-bot's library-index head moved, or its first-run build's `progress` did (§15.3, §15.7). Carries no rows: clients pull `/lb/index/changes` from their own cursor. Not a library event either — nothing is refetched |
 | `station` | `{ stationId, seq, rev, character, exhausted, stopped, name, origin }` | a station's cursor, steering, character or exhaustion changed (§18.2). Only with `"station"` in `welcome.features` |
-| `lb` | `{ available, routes, webUrl, downloads? }` — the same object as `welcome.lb` | the object **changed**: the hub's verdict on lb-bot's availability, or lb-bot's downloads mode (§15.3, §15.7). Clients apply it exactly like `welcome.lb` |
+| `user` | `{ user: {name, admin, primary} }` | that user's flags changed in Navidrome (§3.3). Only to that user's sockets |
+| `lb` | `{ available, routes, webUrl, downloads?, identity? }` — the same object as `welcome.lb` | the object **changed**: the hub's verdict on lb-bot's availability, or lb-bot's downloads mode (§15.3, §15.7). Clients apply it exactly like `welcome.lb` |
 | `error` | `{ code, message }` | auth, bad target, etc. Codes: `bad_action`, `target_offline`, `target_unreachable` (§3.2), `not_a_receiver`, `not_supported` (§5.1), `load_failed` (§7.1), `no_active_device`, `unknown_saved_queue` (§8.3), `unknown_mix` / `bad_mix` (§17). All but `auth` and `load_failed` answer an act, and are sent only when that act carried no `cid`: with one, the code is in its `ack` (below) |
 
 Controllers render `session` + `progress`; receivers ignore `progress` for their
 own id.
+
+**Who hears what (Worbus P2).** `session`, `progress`, `devices`, `savedQueues`,
+`mixes`, `station` and a transfer's `error`s go only to the sockets of the user
+whose space they belong to; a `transfer` can only target a device in the sender's
+own space. `library`, `index` and `lb` are library facts and go to every user;
+`fill` goes to admins only.
 
 **`t:"ack"` — the answer to an act that carried a `cid`** (to its sender only):
 
@@ -919,12 +1016,22 @@ unmodified Subsonic clients (Symfonium, DSub) pick up "where you left off" via
 
 ## 10. Security
 
-- Single **shared secret** (`HUB_TOKEN`) in `hello`. Wrong/absent → close.
-- Intended to run inside the Unraid `media` Docker network alongside Navidrome
-  and the existing bot. If exposed beyond LAN, front with TLS (reverse proxy) —
-  the token is a bearer credential and must not cross plaintext WAN.
-- No media or Navidrome credentials ever transit the hub; receivers hold their
-  own Navidrome auth (as they do today).
+- **Per-device credentials** (Worbus P2, §3.3): a device signs in with its
+  Navidrome account and holds its own secret; the hub stores only its SHA-256.
+  `HUB_TOKEN` stays required: it is the hub ↔ lb-bot service secret, and, while
+  `HUB_ACCEPT_SHARED_TOKEN` is on, the legacy credential of the primary user.
+- **What Navidrome credentials the hub holds or sees.** It runs as a Navidrome
+  service account (`NAVIDROME_URL`, `HUB_ND_USER`, `HUB_ND_PASS`, all required):
+  for the `savePlayQueue` mirror (§9, the primary user's session only), the Sonic
+  Fingerprint it asks AudioMuse for (§14, the primary user's listening only), the
+  stations' Navidrome lookups, and re-reading users' flags. At sign-in it sees a
+  user's salt and token pair once, uses it for one `getUser`, and keeps nothing
+  of it. Stream URLs in a session carry the receiving client's own Navidrome
+  token, and stay inside that user's space.
+- Never written to state, logged (beyond a length) or broadcast: a password, a
+  salt, a Subsonic token, a device secret, the service account's JWT.
+- If exposed beyond LAN, front with TLS (reverse proxy): secrets are bearer
+  credentials and must not cross plaintext WAN.
 
 ---
 
@@ -977,10 +1084,18 @@ Chromecast is simply another client. A bridging client discovers Cast devices ov
 mDNS and opens **one hub WebSocket per speaker**, registering it as
 
 ```json
-{"t":"hello","token":"…","device":{
+{"t":"hello","auth":{"deviceSecret":"<the bridging client's own secret>"},"device":{
   "id":"cast-<txt.id>","name":"<txt.fn>","platform":"chromecast","kind":"tv",
   "caps":["receiver","loadAck"],"bridgedBy":"<bridging client's device id>"}}
 ```
+
+**Speakers are per user (Worbus P2).** The bridge authenticates with its own
+client's device secret, and `bridgedBy` must be that client's bound device id
+(§3.1); the speaker then registers in that user's space. So one bridge per speaker
+becomes one per speaker **per user**, under the same wire id `cast-<id>`; if two
+users cast to one speaker, the last LOAD wins, and the losing bridge notices the
+foreign content in `RECEIVER_STATUS`/`MEDIA_STATUS` and reports the speaker
+released. A legacy-token bridge registers in the primary user's space.
 
 so it joins the ordinary device picker and transfer flow. Casting is therefore a
 normal `transfer`, and transfer-with-resume (§7) works unmodified. Audio never
@@ -1084,8 +1199,9 @@ Enabled when `AUDIOMUSE_URL` is set **and** `HUB_TOKEN` is non-empty (an empty
 token would make it an open relay). Otherwise `/sonic/*` answers `503` — except
 the probe, which answers `{"configured": false}`.
 
-**Auth:** `Authorization: Bearer <HUB_TOKEN>` — the same secret as `hello`,
-compared with `hmac.compare_digest`. Missing/wrong → `401`, no upstream call.
+**Auth:** `Authorization: Bearer <deviceSecret>` (§3.3), or the legacy
+`HUB_TOKEN` (the primary user, while `HUB_ACCEPT_SHARED_TOKEN` is on; compared
+with `hmac.compare_digest`). Missing/wrong → `401`, no upstream call.
 
 **Routes** (a whitelist — an unlisted path or method is `404` with no upstream
 call, and unlisted parameters/body keys are dropped rather than relayed):
@@ -1100,6 +1216,10 @@ call, and unlisted parameters/body keys are dropped rather than relayed):
 
 The hub injects `Authorization: Bearer $AUDIOMUSE_TOKEN` and, on the fingerprint
 route, `navidrome_user` / `navidrome_password` from `HUB_ND_USER` / `HUB_ND_PASS`.
+So the fingerprint is the **primary user's** listening: any other caller gets
+`403 {"code":"primary_only"}` with no upstream call (Worbus P2), and so does the
+station source Your mix (§18.1). Clients hide both, and the `fingerprint` kind of
+mix, for a user who is not primary.
 **Clients never send any of those** — a client-supplied `navidrome_password` is
 dropped like any other unlisted parameter.
 
@@ -1140,13 +1260,30 @@ carries `Authorization: Bearer <HUB_TOKEN>`. That is the one shared secret: lb-b
 holds the same value as `LB_BOT_HUB_TOKEN` and already sends it on its pushes into
 the hub (§15.1), and it treats the bearer as an admin caller. An older lb-bot
 ignores the header. lb-bot's login is a second boundary, not a replacement: the
-whitelist stays the only thing a device holding `HUB_TOKEN` can reach, and lb-bot
-cannot tell one device from another through the hub (per-user identity is
-Worbus project 2). The bearer is never put in a URL or a log line. An lb-bot whose
+whitelist stays the only thing a device can reach through the hub, and since
+Worbus project 2 lb-bot learns which user is calling (below). The bearer is never put in a URL or a log line. An lb-bot whose
 `LB_BOT_HUB_TOKEN` is not the hub's `HUB_TOKEN` answers `401` on every route while
 its open `/api/health` still reads it as available: the hub relays that `401` (lb-bot's
 `{"code": "signin_required"}`, like its `403 {"code": "admin_only"}`) as it came, on the two
 screen reads of §15.6 too, and names the setting to fix in its own log, at most every 10 minutes.
+
+**Who is calling (Worbus P2).** Every proxied lb call carries, besides the bearer,
+`X-Worbus-User: <Navidrome username>` (UTF-8 bytes), `X-Worbus-Admin: 1|0` and
+`X-Worbus-Primary: 1|0`, always all three, for the caller the request's credential
+names (§3.3; a legacy `HUB_TOKEN` client is the primary user). lb-bot trusts them
+only with the service bearer and applies its own rights table: a non-admin gets
+`403 {"code":"admin_only"}` from lb-bot, a non-primary user `403
+{"code":"primary_only"}` on listening; the hub relays both as they come. lb-bot
+advertises that it reads the headers with `"identity": 1` in `/api/health`; the
+hub reads it in its probe and adds `"identity": true` to `welcome.lb` and the `lb`
+frame. **While lb-bot has no `identity`** (an older lb-bot, which would treat every
+caller as an admin), every lb call from anyone but the primary user answers `503
+{"code":"lbbot_too_old","error":"This Worbus Server's lb-bot is too old for
+signed-in users."}`, admins included, and the client renders lb-bot as
+unavailable. The hub's cache and in-flight coalescing are keyed by the caller's
+class `(admin, primary)` on every lb route, never by name, so an answer lb-bot
+shapes by role (fills, Fresh's `artistPlays`, the wishlist's `addedBy`, Scan
+now's limits) never crosses roles.
 
 Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 `/lb/*` answers `503` — except `/lb/status`, which answers `{"configured": false}`.
@@ -2924,7 +3061,7 @@ still answers (below, `configured: false`) and every other route answers `503 {f
 ```jsonc
 { "seed": { "kind": "track",   "ids": ["<songId>"],         "name": "Cinnamon Girl" }
        // | { "kind": "tracks",  "ids": ["…", "…"] (1–12),  "name": "Norman Fucking Rockwell!" }
-       // | { "kind": "yourMix" }
+       // | { "kind": "yourMix" }   (the primary user only: else 403 {"code":"primary_only"}, §14)
   "character": "balanced",   // close | balanced | explore; absent = default
   "count": 20,               // 1–50, default 20
   "exclude": ["<songId>", …],// what is already queued (≤1000 ids)
