@@ -251,7 +251,10 @@ on; off, it is `401` on client routes (lb-bot's inbound pushes, §15.1, keep usi
   (Navidrome's native API: `POST /auth/login` once, then `GET /api/user`) on a
   user's connect or lb call when the flags are older than 10 minutes, and every
   10 minutes while any socket is open. A changed flag sends the `user` frame
-  (§3.1); a user the list no longer holds is signed out (`4005`). A failed read
+  (§3.1); a user the list no longer holds is signed out (`4005`), and their space
+  (queues, devices, mixes, stations, play history) is archived, never deleted and never
+  handed on: a new account of the same name starts empty. The primary user is never
+  archived. A failed read
   changes nothing. A service account Navidrome refuses (not an admin) leaves the
   flags as they were at sign-in.
 - **At most one read is attempted per 10 minutes, whatever its outcome.** A read

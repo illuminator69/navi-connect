@@ -24,6 +24,11 @@ with their station files at `<HUB_STATE>.users/<key>.history` / `.stations`.
   4. test_station_side_files_per_user: each user's play history and stations are
      written to and read from their own side files; the primary user's stay at
      today's paths; a key that is not a plain file name cannot leave `.users/`.
+  5. test_deleted_user_space_archived (R37): a user Navidrome no longer has is
+     moved to `archivedUsers` under `<key>@<unix time>`, side files into
+     `<HUB_STATE>.archive/`; a new space of the same name is empty; nothing is
+     deleted; the primary user is never archived; the backup carries the archive.
+     (The rollback check, 2, also runs with an archived user in the file.)
 
 In process, no sockets. Exits non-zero on failure.
 """
@@ -278,6 +283,13 @@ def test_primary_space_stays_in_top_level_keys(tmp: str) -> list[str]:
     bob.deleted_saved_queues["q_bob_gone"] = NOW
     bob.stations.stations["st_bob"] = hubmod.Station.from_state(_station("st_bob"))
     bob.stations._history_add("bob-tr", "cafe")  # noqa: SLF001
+    # R37: an archived user is in the file too, and a P1 hub must not see them.
+    carol = h.space_for("carol")
+    carol.session.queue = [{"id": "carol-tr", "title": "Carol's"}]
+    carol.devices["carol-phone"] = hubmod.Device(id="carol-phone", name="Carol phone",
+                                                 last_seen=NOW)
+    if h._archive_space("carol") is None:  # noqa: SLF001
+        failures.append("carol's space was not archived")
     h._save()  # noqa: SLF001
     for sp in h.spaces.values():
         sp.stations.close()
@@ -310,6 +322,8 @@ def test_primary_space_stays_in_top_level_keys(tmp: str) -> list[str]:
         leaked.append("station")
     if any(p[0] == "bob-tr" for p in old.stations.history):
         leaked.append("play history")
+    if any(t.get("id") == "carol-tr" for t in old.session.queue) or "carol-phone" in old.devices:
+        leaked.append("archived user's queue or device")
     if leaked:
         failures.append(f"the rollback sees bob's {', '.join(leaked)} as the owner's")
     return failures
@@ -476,6 +490,97 @@ def test_station_side_files_per_user(tmp: str) -> list[str]:
     o3 = h2.spaces.get("../x/y")
     if o3 is None or [p[0] for p in o3.stations.history] != ["odd-tr"]:
         failures.append("the odd key's history did not round-trip through its encoded file")
+    return failures
+
+
+# --------------------------------------------------------------------------- #
+# R37: a deleted user's space is archived, not inherited
+# --------------------------------------------------------------------------- #
+def test_deleted_user_space_archived(tmp: str) -> list[str]:
+    failures: list[str] = []
+    state = os.path.join(tmp, "state.json")
+    fx = write_fixture(state)
+    h = new_hub(state)
+    bob = h.space_for("bob")
+    bob.session.queue = [{"id": "bob-tr", "title": "Bob's"}]
+    bob.devices["bob-phone"] = hubmod.Device(id="bob-phone", name="Bob phone", last_seen=NOW)
+    if bob._save_mix({"name": "Bob mix", "kind": "genre", "seedId": "g2"}) is None:  # noqa: SLF001
+        failures.append("could not save a mix in bob's space")
+    bob.deleted_saved_queues["q_bob_gone"] = NOW
+    bob.stations.stations["st_bob"] = hubmod.Station.from_state(_station("st_bob"))
+    bob.stations._stations_touch()  # noqa: SLF001
+    bob.stations._history_add("bob-tr", "cafe")  # noqa: SLF001
+    h._save()  # noqa: SLF001
+    live = os.path.join(state + ".users", "bob")
+    for suffix in (hubmod.STATION_HISTORY_SUFFIX, hubmod.STATION_STATE_SUFFIX):
+        if not os.path.exists(live + suffix):
+            failures.append(f"precondition: bob's {suffix} side file was not written")
+
+    if h._archive_space(h.primary_user) is not None or h.primary_user not in h.spaces:  # noqa: SLF001
+        failures.append("the primary user's space was archived")
+    akey = h._archive_space("bob")  # noqa: SLF001
+    h._save(blocking_backup=True)  # noqa: SLF001
+    if not (isinstance(akey, str) and akey.startswith("bob@")
+            and akey[4:].isdigit()):
+        failures.append(f"the archive key is {akey!r}, not bob@<unix time>")
+        return failures
+    if "bob" in h.spaces:
+        failures.append("bob's space is still live after archiving")
+    for suffix in (hubmod.STATION_HISTORY_SUFFIX, hubmod.STATION_STATE_SUFFIX):
+        if os.path.exists(live + suffix):
+            failures.append(f"bob's {suffix} side file is still where a new bob reads it")
+    entry = h.archived_users.get(akey) or {}
+    side = os.path.join(tmp, entry.get("sideFiles") or "missing")
+    try:
+        with open(side + hubmod.STATION_HISTORY_SUFFIX, encoding="utf-8") as f:
+            plays = [p[0] for p in json.load(f)["plays"]]
+        with open(side + hubmod.STATION_STATE_SUFFIX, encoding="utf-8") as f:
+            sts = [x["id"] for x in json.load(f)["stations"]]
+    except Exception as e:  # noqa: BLE001
+        failures.append(f"the archived side files are not at {entry.get('sideFiles')!r}: {e!r}")
+        plays, sts = [], []
+    if plays != ["bob-tr"] or sts != ["st_bob"]:
+        failures.append(f"the archived side files hold {plays} / {sts}")
+    if not os.path.realpath(side).startswith(os.path.realpath(state + ".archive") + os.sep):
+        failures.append(f"the archived side files are outside .archive/: {side}")
+
+    # A late write by the archived space's engine goes to the archive, not to `.users/bob`.
+    bob.stations._history_add("late-tr", "beef")  # noqa: SLF001
+    if os.path.exists(live + hubmod.STATION_HISTORY_SUFFIX):
+        failures.append("a late write of the archived space recreated .users/bob.history")
+
+    # Reloaded: no bob space; the archive whole; a new bob starts empty.
+    h2 = new_hub(state)
+    if "bob" in h2.spaces:
+        failures.append("bob's space came back from the file after archiving")
+    got = (h2.archived_users.get(akey) or {})
+    sp_state = got.get("space") or {}
+    q = [t.get("id") for t in (sp_state.get("session") or {}).get("queue", [])]
+    devs = [d.get("id") for d in sp_state.get("devices", [])] if isinstance(
+        sp_state.get("devices"), list) else list((sp_state.get("devices") or {}).keys())
+    mixes = json.dumps(sp_state.get("mixes"))
+    if got.get("user") != "bob" or q != ["bob-tr"] or "bob-phone" not in json.dumps(devs) \
+            or "Bob mix" not in mixes or "q_bob_gone" not in json.dumps(sp_state):
+        failures.append(f"the archive does not hold bob's data: user {got.get('user')!r}, "
+                        f"queue {q}, devices {devs}, mix {'Bob mix' in mixes}")
+    nb = h2.space_for("bob")
+    if (nb.session.queue or nb.devices or nb.mixes or nb.deleted_saved_queues
+            or nb.stations.stations or nb.stations.history):
+        failures.append(f"a new bob inherited data: queue {len(nb.session.queue)}, devices "
+                        f"{list(nb.devices)}, mixes {len(nb.mixes)}, stations "
+                        f"{list(nb.stations.stations)}, history {len(nb.stations.history)}")
+    check_primary_holds_fixture("after archiving bob", h2.primary_space, fx, failures)
+    for sp in h2.spaces.values():
+        sp.stations.close()
+    with open(state + ".bak", encoding="utf-8") as f:
+        if akey not in (json.load(f).get("archivedUsers") or {}):
+            failures.append("the backup does not carry the archive")
+
+    # A second archive of the same name in the same second gets its own key.
+    h2.space_for("bob").session.queue = [{"id": "bob2-tr", "title": "x"}]
+    akey2 = h2._archive_space("bob")  # noqa: SLF001
+    if akey2 is None or akey2 == akey or akey not in h2.archived_users:
+        failures.append(f"a second archive of bob is {akey2!r}, beside {akey!r}")
     return failures
 
 
@@ -658,6 +763,7 @@ def main() -> int:
              test_primary_space_stays_in_top_level_keys,
              test_other_users_round_trip_under_users,
              test_station_side_files_per_user,
+             test_deleted_user_space_archived,
              test_side_file_stem_long_names,
              test_primary_user_change_moves_spaces,
              test_move_to_a_user_without_a_space]
@@ -679,7 +785,8 @@ def main() -> int:
         return 1
     print("PASS - state migration: p1-file-loads-as-primary/rollback-keeps-owner-top-level"
           f"({ROLLBACK_PARSER})/other-users-round-trip-under-users/"
-          "station-side-files-per-user/long-name-stem-hashed/"
+          "station-side-files-per-user/deleted-user-space-archived-not-inherited/"
+          "long-name-stem-hashed/"
           "primary-user-change-moves-spaces-both-ways+rollback/move-to-a-new-user")
     return 0
 

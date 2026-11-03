@@ -91,6 +91,12 @@ naming the missing setting (never a value), and with `.env.example`'s placeholde
 - **Changing `HUB_ND_USER` moves state**: on the next start the old primary user's
   space goes under `users` and the new one's (or an empty one) comes to the top
   level, logged once by name. Nothing is deleted.
+- **A user deleted from Navidrome is archived, not inherited.** When a complete user
+  list no longer holds them, their devices are signed out and their space moves to
+  `archivedUsers` in `state.json` (as `<name>@<unix time>`), with their station files
+  in `state.json.archive/`. A new account of the same name starts empty. Nothing is
+  deleted, the primary user is never archived, and a rollback ignores the archive.
+  Restoring one is a manual state edit.
 - **Deploy order: lb-bot, then this hub, then the clients.** A new hub in front of an
   old lb-bot serves only the primary user's lb calls; new clients in front of an old
   hub find no sign-in route and show the token field, as before.

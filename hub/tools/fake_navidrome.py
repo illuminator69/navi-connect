@@ -22,7 +22,8 @@ ruling R10, measured on Navidrome 0.64.2 by lane W, 2026-11-02):
       else 200 and a list of {id, userName, name, isAdmin} with `X-Total-Count`
       (the number of users, as Navidrome's REST API sends it). `list_limit` cuts
       the list to its first N rows and leaves `X-Total-Count` the whole number:
-      a paginated answer (R21).
+      a paginated answer (R21). `unlisted` leaves users out of the list and of
+      its count, a complete list without them (they can still log in).
 
 Modes (`fake.mode`) for the Subsonic and native routes alike: "ok", "hang"
 (answers after `hang_s`, past the hub's 8 s budget), "500".
@@ -63,6 +64,7 @@ class FakeNavidrome:
         self.user_list_calls = 0
         self.login_limit: int | None = None   # logins answered before 429s start
         self.list_limit: int | None = None    # /api/user rows returned (R21), None = all
+        self.unlisted: set[str] = set()       # users left out of /api/user (and its count)
         self.play_queues: list[dict] = []     # every savePlayQueue: {"u", "ids", ...}
         self._tokens: dict[str, str] = {}     # jwt -> user
         self.server: socketserver.TCPServer | None = None
@@ -216,7 +218,7 @@ class FakeNavidrome:
         if rec is None or not rec["admin"]:
             return 403, b'{"error":"Forbidden"}', None
         rows = [{"id": n, "userName": n, "name": n, "isAdmin": r["admin"]}
-                for n, r in self.users.items()]
+                for n, r in self.users.items() if n not in self.unlisted]
         total = len(rows)
         if self.list_limit is not None:
             rows = rows[:self.list_limit]

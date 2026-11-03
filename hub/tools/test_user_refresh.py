@@ -15,7 +15,8 @@ and 401 to one it did not issue.
   test_deleted_user_gets_4005            bob is deleted: while Navidrome answers 500
                                          nothing happens; once it answers, his socket
                                          gets signed_out + 4005, his credentials go,
-                                         his space's data stays (R16)
+                                         his space is archived with its data (R37), and
+                                         a new bob account signs in to an empty space
   test_non_admin_service_account_keeps_signin_flags
                                          HUB_ND_USER=carol (not an admin): /api/user
                                          answers 403; alice keeps the admin flag she
@@ -28,7 +29,11 @@ and 401 to one it did not issue.
   test_partial_user_list_signs_nobody_out
                                          (R21) /api/user answering fewer rows than its
                                          X-Total-Count: bob, missing from it, stays
-                                         signed in; alice, listed, is still demoted
+                                         signed in and is not archived (R37); alice,
+                                         listed, is still demoted
+  test_primary_user_never_archived       (R37) a complete list without the primary
+                                         user: their space stays at the top level and
+                                         their socket stays open
 
 Exits non-zero on failure.
 """
@@ -147,14 +152,43 @@ async def t_deleted(nd: FakeNavidrome) -> list[str]:
             raw = json.load(fh)
         if any(r.get("user") == "bob" for r in raw.get("deviceAuth", {}).values()):
             f.append("bob's credentials are still in deviceAuth")
-        q = [t.get("id") for t in raw.get("users", {}).get("bob", {}).get("session", {})
-             .get("queue", [])]
-        if q != ["BOBKEEP"]:
-            f.append(f"bob's space data was not kept (R16): queue {q}")
+        # R37: archived, not left under `users` for the next bob.
+        if "bob" in raw.get("users", {}):
+            f.append("bob's space is still under `users` after his deletion")
+        arch = {k: v for k, v in (raw.get("archivedUsers") or {}).items()
+                if k.startswith("bob@")}
+        entry = next(iter(arch.values()), {})
+        q = [t.get("id") for t in (entry.get("space") or {}).get("session", {}).get("queue", [])]
+        devs = json.dumps((entry.get("space") or {}).get("devices"))
+        if len(arch) != 1 or q != ["BOBKEEP"] or bp["deviceId"] not in devs:
+            f.append(f"bob's archive: {len(arch)} entr(y/ies), queue {q}, his device "
+                     f"{'kept' if bp['deviceId'] in devs else 'missing'}")
         again = await Sock().hello(h.ws_url, {"id": bp["deviceId"], "name": "bob"},
                                    secret=bp["deviceSecret"])
         if await again.wait_closed() != 4005:
             f.append(f"bob's secret still connects after his deletion ({again.close_code})")
+        # A new account named bob: a fresh space, nothing of the old one.
+        nd.users["bob"] = {"password": "new-bob-pass-77", "admin": False}
+        st, nb = await h.signin("bob", password="new-bob-pass-77", deviceId=bp["deviceId"])
+        if st != 200:
+            f.append(f"the new bob's sign-in answered {st} {nb}")
+        else:
+            s2 = await Sock().hello(h.ws_url, {"id": nb["deviceId"], "name": "new bob"},
+                                    secret=nb["deviceSecret"])
+            w = s2.first("welcome") or {}
+            wq = [t.get("id") for t in (w.get("session") or {}).get("queue", [])]
+            wd = [d.get("id") for d in w.get("devices", [])]
+            if wq or wd != [nb["deviceId"]] or w.get("savedQueues") or w.get("mixes"):
+                f.append(f"the new bob inherited the old one's space: queue {wq}, devices "
+                         f"{wd}, savedQueues {len(w.get('savedQueues') or [])}")
+            if nb["deviceId"] == bp["deviceId"]:
+                f.append("the new bob was handed the old bob's device id")
+            await s2.close()
+            await asyncio.sleep(0.3)
+            with open(h.state, encoding="utf-8") as fh:
+                raw2 = json.load(fh)
+            if not any(k.startswith("bob@") for k in raw2.get("archivedUsers") or {}):
+                f.append("the old bob's archive did not survive the new bob's sign-in")
         nd.users["bob"] = saved
     finally:
         nd.mode = "ok"
@@ -271,6 +305,8 @@ async def t_partial_list(nd: FakeNavidrome) -> list[str]:
             raw = json.load(fh)
         if not any(r.get("user") == "bob" for r in raw.get("deviceAuth", {}).values()):
             f.append("a partial /api/user list dropped bob's credentials")
+        if raw.get("archivedUsers") or "bob" not in raw.get("users", {}):
+            f.append("a partial /api/user list archived bob's space (R37)")
         frame = next((fr for fr in alice.frames if fr.get("t") == "user"), None)
         if frame != {"t": "user", "user": {"name": "alice", "admin": False, "primary": False}}:
             f.append(f"alice, listed in the partial answer, heard {frame} (flags not updated)")
@@ -283,13 +319,49 @@ async def t_partial_list(nd: FakeNavidrome) -> list[str]:
     return f
 
 
+async def t_primary_not_archived(nd: FakeNavidrome) -> list[str]:
+    """R37: the primary user is never archived, even by a complete list that does
+    not name them (the service account's own user)."""
+    f = []
+    h = HubProc(nd.url, **FAST)
+    try:
+        await h.up()
+        owner, _ = await _connect(h, "owner")
+        await owner.ws.send(json.dumps({"t": "act", "action": "setQueue",
+                                        "tracks": [{"id": "OWNKEEP", "title": "x"}],
+                                        "index": 0, "positionMs": 0, "play": False}))
+        if not await _until(lambda: nd.user_list_calls >= 1, 6):
+            f.append("no refresh read the user list within 6 s")
+        nd.unlisted = {"owner"}
+        calls = nd.user_list_calls
+        await _until(lambda: nd.user_list_calls >= calls + 2, 8)
+        await asyncio.sleep(0.5)
+        if nd.user_list_calls < calls + 2:
+            f.append("the list without owner was not read twice within 8 s")
+        if owner.close_code is not None:
+            f.append(f"the primary user was signed out ({owner.close_code})")
+        with open(h.state, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if raw.get("archivedUsers"):
+            f.append(f"archived: {sorted(raw['archivedUsers'])}")
+        q = [t.get("id") for t in raw.get("session", {}).get("queue", [])]
+        if q != ["OWNKEEP"]:
+            f.append(f"the primary user's top-level queue is {q}")
+        await owner.close()
+    finally:
+        nd.unlisted = set()
+        h.stop()
+    return f
+
+
 async def main_async() -> list[str]:
     failures: list[str] = []
     for name, fn in (("test_idle_socket_hears_demotion", t_demotion),
                      ("test_deleted_user_gets_4005", t_deleted),
                      ("test_non_admin_service_account_keeps_signin_flags", t_service_not_admin),
                      ("test_failed_reads_back_off", t_backoff),
-                     ("test_partial_user_list_signs_nobody_out", t_partial_list)):
+                     ("test_partial_user_list_signs_nobody_out", t_partial_list),
+                     ("test_primary_user_never_archived", t_primary_not_archived)):
         nd = FakeNavidrome({k: (v[0], v[1]) for k, v in USERS.items()}).start()
         try:
             got = await fn(nd)
@@ -309,9 +381,9 @@ def main() -> int:
         return 1
     print("PASS - user refresh: idle-socket-hears-demotion+no-fill-after/one-login-jwt-cached/"
           "relogin-once-on-401/deleted-user-4005-after-500s-change-nothing/"
-          "deleted-user-space-kept/non-admin-service-account-keeps-flags-logged-once/"
+          "deleted-user-space-archived-new-bob-empty/non-admin-service-account-keeps-flags-logged-once/"
           "failed-reads-back-off(429,500)-one-login-per-interval/"
-          "partial-user-list-signs-nobody-out")
+          "partial-user-list-signs-nobody-out-archives-nothing/primary-user-never-archived")
     return 0
 
 

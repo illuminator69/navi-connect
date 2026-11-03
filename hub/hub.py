@@ -243,6 +243,12 @@ STATE_BACKUP_FLUSH_TIMEOUT = 3.0  # seconds a graceful stop waits for a backup i
 # `<key>.stations`. The primary user's stay at today's `<HUB_STATE>.history` /
 # `.stations`, so a rollback to a hub without user spaces finds them.
 USERS_DIR_SUFFIX = ".users"
+# Worbus P2 R37: a user Navidrome no longer has is archived, never deleted and never
+# handed to the next holder of the name. Their space goes to state.json's
+# `archivedUsers` under `<key>@<unix time>`, and their station side files move into
+# this directory beside state.json, under that archive key's stem (a directory of
+# its own, so an archive can never collide with a live user named `bob@1762...`).
+ARCHIVE_DIR_SUFFIX = ".archive"
 
 # --- proxy tuning (shared by the AudioMuse and lb-bot proxies) ---
 PROXY_MAX_INFLIGHT = 4      # concurrent upstream calls PER PROXY (each of the three
@@ -720,8 +726,16 @@ def _durable_signature_of(data: Any) -> Optional[str]:
     if not isinstance(data, dict):
         return None
     sig = _durable_signature_users(data)
+    if sig is None:
+        return None
+    # R37: an archived space's mixes and tombstones exist nowhere else either (they
+    # left `users` when it was archived): the archive's keys join the signature, so
+    # the backup is rewritten when a user is archived. Empty, nothing changes.
+    archived = data.get("archivedUsers")
+    if isinstance(archived, dict) and archived:
+        sig = json.dumps([sig, {"archived": sorted(str(k) for k in archived)}])
     auth = data.get("deviceAuth")
-    if sig is None or not auth:
+    if not auth:
         return sig
     # The device credentials (hashes only) too: a secret cannot be re-derived, so a
     # restore from a backup older than a sign-in would sign that device out (H1
@@ -6513,6 +6527,12 @@ def _space_side_stem(key: str) -> str:
     return "sha256-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _archive_side_base(archive_key: str) -> str:
+    """Where an archived space's station side files live (R37):
+    `<HUB_STATE>.archive/<stem of the archive key>` plus today's suffixes."""
+    return os.path.join(STATE_PATH + ARCHIVE_DIR_SUFFIX, _space_side_stem(archive_key))
+
+
 def _space_side_base(key: str) -> str:
     """Where a non-primary user's station side files live: `<HUB_STATE>.users/<stem>`
     plus today's suffixes (`.history`, `.stations`); see `_space_side_stem`."""
@@ -8924,6 +8944,13 @@ class Hub:
         # sha256(device secret) hex -> {"user", "deviceId", "createdAt"}. Never the
         # secret itself (Global Constraints). Filled in by sign-in (H2).
         self.device_auth: dict[str, dict] = {}
+        # R37: the spaces of users Navidrome no longer has, as they were when the
+        # refresh found them gone: "<key>@<unix time>" -> {"user", "archivedAt"
+        # (ms), "sideFiles" (their side files' base, relative to state.json's
+        # directory), "space" (the space's state, the same keys as a `users`
+        # entry)}. Kept verbatim and never loaded as a space; persisted as
+        # `archivedUsers`, which a P1 hub ignores. Restoring one is a manual edit.
+        self.archived_users: dict[str, dict] = {}
         # What Navidrome last said about each signed-in user: key -> {"name" (its
         # canonical username), "admin" (adminRole), "checkedAt" (ms)}. Read at
         # sign-in, refreshed by H4; persisted as `userFlags` so a restart keeps it.
@@ -9191,7 +9218,7 @@ class Hub:
         """Re-read every signed-in user's flags in one call. A changed flag sends
         `{"t": "user", ...}` to that user's sockets; a user Navidrome's list (a
         200) no longer holds is signed out: their credentials are dropped and
-        their sockets get `signed_out` and 4005; their space's data stays (R16).
+        their sockets get `signed_out` and 4005; their space is archived, never deleted (R37).
         Unreachable, a timeout, a 5xx or a 429 changes nothing (R10); a service
         account Navidrome refuses keeps the sign-in flags, logged once. A partial
         list (R21) updates the users it holds and signs nobody out.
@@ -9238,18 +9265,65 @@ class Hub:
             return listed if complete else None
 
     async def _sign_out_user(self, key: str) -> None:
-        """Navidrome no longer has `key`: every device of theirs is signed out."""
+        """Navidrome no longer has `key` (a complete list said so, R21): every
+        device of theirs is signed out, and their space is archived (R37), so a
+        later account of the same name starts with an empty one. Never the
+        primary user's."""
         rows = [h for h, r in self.device_auth.items() if r["user"] == key]
         for h in rows:
             del self.device_auth[h]
         self.user_flags.pop(key, None)
         sp = self.spaces.get(key)
         sockets = list(sp.sockets) if sp is not None else []
+        archived = self._archive_space(key)
         log(f"user refresh: {key!r} is gone from Navidrome; {len(rows)} device "
-            f"credential(s) dropped, {len(sockets)} socket(s) signed out")
+            f"credential(s) dropped, {len(sockets)} socket(s) signed out"
+            + (f"; their space archived as {archived!r}" if archived else ""))
         self._save()
         await asyncio.gather(*(self._signed_out(ws) for ws in sockets),
                              return_exceptions=True)
+
+    def _archive_space(self, key: str) -> Optional[str]:
+        """R37: move `key`'s space out of `users` into `archived_users`, its station
+        side files into `<HUB_STATE>.archive/`. Nothing is deleted. Returns the
+        archive key, or None (no such space, or the primary user, who is never
+        archived). The space object lives on only for its sockets' last moments:
+        it is no longer in `self.spaces`, so nothing of it is saved again, and its
+        side files now point into the archive, so a late write lands there and
+        never at the name a new account of the same name would read."""
+        if key == self.primary_user:
+            return None
+        sp = self.spaces.get(key)
+        if sp is None:
+            return None
+        stamp = int(time.time())
+        akey, n = f"{key}@{stamp}", 1
+        while akey in self.archived_users:
+            n += 1
+            akey = f"{key}@{stamp}-{n}"
+        if sp._sleep_handle is not None:  # noqa: SLF001 — same module
+            sp._sleep_handle.cancel()  # noqa: SLF001
+            sp._sleep_handle = None  # noqa: SLF001
+        base = _archive_side_base(akey)
+        engine = sp.stations
+        for side, suffix in ((engine._history_file, STATION_HISTORY_SUFFIX),  # noqa: SLF001
+                             (engine._stations_file, STATION_STATE_SUFFIX)):  # noqa: SLF001
+            side.flush()   # any pending write lands first, at the old name
+            target = base + suffix
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                os.replace(side.path, target)
+            except FileNotFoundError:
+                pass       # nothing written yet
+            except OSError as e:
+                log(f"could not archive {os.path.basename(side.path)}:", e)
+            side.path = target
+        self.archived_users[akey] = {
+            "user": key, "archivedAt": int(time.time() * 1000),
+            "sideFiles": os.path.relpath(base, os.path.dirname(STATE_PATH) or "."),
+            "space": sp.state_dict()}
+        del self.spaces[key]
+        return akey
 
     def _refresh_due(self) -> bool:
         """The R10 back-off: no read was attempted within USER_REFRESH_SECS."""
@@ -9491,8 +9565,16 @@ class Hub:
                     "admin": row.get("admin") is True,
                     "checkedAt": _as_int(row.get("checkedAt"), 0, 0)}
 
+        def archived_users() -> None:
+            # Additive (R37): kept as written, never applied as a space.
+            raw = data.get("archivedUsers")
+            for k, entry in (raw if isinstance(raw, dict) else {}).items():
+                if isinstance(k, str) and k and isinstance(entry, dict):
+                    self.archived_users[k] = entry
+
         for name, section in (("lbIndex", lb_index), ("deviceAuth", device_auth),
-                              ("userFlags", user_flags), ("users", users)):
+                              ("userFlags", user_flags), ("users", users),
+                              ("archivedUsers", archived_users)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
@@ -9615,6 +9697,8 @@ class Hub:
                          if key != self.primary_user}
         data["deviceAuth"] = self.device_auth
         data["userFlags"] = self.user_flags
+        # R37: deleted users' spaces, archived; a P1 hub ignores the key.
+        data["archivedUsers"] = self.archived_users
         # Whose space the top level is (R15); a P1 hub ignores it.
         data["primaryUser"] = self.primary_user
         return json.dumps(data), _durable_signature_of(data)
