@@ -23,7 +23,9 @@ ruling R10, measured on Navidrome 0.64.2 by lane W, 2026-11-02):
       (the number of users, as Navidrome's REST API sends it). `list_limit` cuts
       the list to its first N rows and leaves `X-Total-Count` the whole number:
       a paginated answer (R21). `unlisted` leaves users out of the list and of
-      its count, a complete list without them (they can still log in).
+      its count, a complete list without them (they can still log in). Each row's
+      `id` is the account's own: kept while its record lives, new for a record
+      put in its place (a user deleted and re-created, R38).
 
 Modes (`fake.mode`) for the Subsonic and native routes alike: "ok", "hang"
 (answers after `hang_s`, past the hub's 8 s budget), "500".
@@ -41,6 +43,7 @@ import socketserver
 import threading
 import time
 import urllib.parse
+import uuid
 
 
 def _subsonic(payload: dict) -> bytes:
@@ -217,7 +220,12 @@ class FakeNavidrome:
         rec = self.users.get(user)
         if rec is None or not rec["admin"]:
             return 403, b'{"error":"Forbidden"}', None
-        rows = [{"id": n, "userName": n, "name": n, "isAdmin": r["admin"]}
+        # Navidrome's own id per account, as the real list carries it (lane W
+        # measured `id`, `userName`, `isAdmin`): stable for a record, new for a new
+        # one, so a user deleted and re-created (a new dict under the same name)
+        # gets a new id (R38).
+        rows = [{"id": r.setdefault("id", str(uuid.uuid4())), "userName": n, "name": n,
+                 "isAdmin": r["admin"]}
                 for n, r in self.users.items() if n not in self.unlisted]
         total = len(rows)
         if self.list_limit is not None:

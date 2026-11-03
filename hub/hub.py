@@ -3958,7 +3958,7 @@ class StationEngine:
     _mood_builds = _shared_attr("_mood_builds")
 
     def __init__(self, space: Any, shared: Optional[_StationShared] = None,
-                 side_base: Optional[str] = None) -> None:
+                 side_base: Optional[str] = None, load: bool = True) -> None:
         self.space = space
         self.shared = shared if shared is not None else _StationShared()
         # The primary user's side files are today's `<HUB_STATE>.history` and
@@ -3978,8 +3978,11 @@ class StationEngine:
         # saved queue id -> the station binding it while its frame goes out, before
         # `session.stationId` names it: a second start must meet the binding then too.
         self._binding: dict[str, str] = {}
-        self._load_history()
-        self._load_stations()
+        # `load=False` (R37): the files at this name are a deleted user's that could
+        # not be moved aside; they are in the archive, and this engine overwrites them.
+        if load:
+            self._load_history()
+            self._load_stations()
 
     # ----- configuration ---------------------------------------------------- #
     @staticmethod
@@ -6556,10 +6559,16 @@ class UserSpace:
     every other space is under `users` (Hub._state_payload).
     """
 
-    def __init__(self, hub: "Hub", key: str, primary: bool) -> None:
+    def __init__(self, hub: "Hub", key: str, primary: bool,
+                 load_side_files: bool = True) -> None:
         self.hub = hub
         self.key = key
         self.primary = primary
+        # Navidrome's own id for the account this space belongs to (R38), learned at
+        # the first refresh that lists the name; None until then. A refresh that
+        # lists the name under another id means the account was deleted and
+        # re-created: this space is archived, never handed to the new account.
+        self.navidrome_id: Optional[str] = None
         self.session = Session()
         self.devices: dict[str, Device] = {}
         # Rolling saved-queue history (Continue Listening), authoritative for this user.
@@ -6605,7 +6614,8 @@ class UserSpace:
         # files; the caches and the probe they are computed with are the hub's.
         self.stations = StationEngine(
             self, hub.station_shared,
-            side_base=STATE_PATH if primary else _space_side_base(key))
+            side_base=STATE_PATH if primary else _space_side_base(key),
+            load=load_side_files)
         # The queue position an `ended` report was last judged at, so a receiver
         # repeating the flag does not count one play-through twice.
         self._ended_judged: Optional[tuple] = None
@@ -6649,6 +6659,8 @@ class UserSpace:
                  "caps": d.caps, "volume": d.volume, "lastSeen": d.last_seen}
                 for d in self.devices.values()
             ],
+            # R38: Navidrome's id for this account (a P1 hub ignores the key).
+            "navidromeId": self.navidrome_id,
         }
 
     def apply_state(self, data: dict, where: str = "state") -> None:
@@ -6764,10 +6776,14 @@ class UserSpace:
                 deadline=time.monotonic() + left)
             log(f"sleep timer restored: {left:.0f}s left of {minutes} min")
 
+        def navidrome_id() -> None:
+            nid = data.get("navidromeId")
+            self.navidrome_id = nid if isinstance(nid, str) and nid else None
+
         for name, section in (("session", session), ("savedQueues", saved_queues),
                               ("mixes", mixes), ("stations", stations),
                               ("deletedSavedQueues", tombstones), ("devices", devices),
-                              ("sleepTimer", sleep_timer)):
+                              ("sleepTimer", sleep_timer), ("navidromeId", navidrome_id)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
@@ -8967,6 +8983,8 @@ class Hub:
         # read is spawned, so two calls in one loop tick cannot both start one.
         self._refresh_attempted_at = -math.inf
         self._refresh_partial_logged = False
+        # Navidrome's user ids from the last list read (R38), by key.
+        self._listed_ids: dict[str, str] = {}
         self._refresh_refused_logged = False
         # lb-bot's index head as last pushed (`{seq, epoch}`), relayed in `welcome`.
         # A HINT only: a client pulls on every welcome whatever it says, because
@@ -9023,7 +9041,21 @@ class Hub:
         if sp is None:
             if not key and self.primary_user:
                 raise ValueError("a space needs a user name")
-            sp = self.spaces[key] = UserSpace(self, key, primary=key == self.primary_user)
+            primary = key == self.primary_user
+            # R37: an archived user of this name whose side files could not be
+            # moved or renamed aside left them at this name. They are in the
+            # archive; this space does not read them, and writes its own over them.
+            stale = [e for e in self.archived_users.values()
+                     if not primary and e.get("user") == key and e.get("sideFilesLeft")]
+            sp = self.spaces[key] = UserSpace(self, key, primary=primary,
+                                              load_side_files=not stale)
+            if stale:
+                sp.stations.persist_now()
+                files = (sp.stations._history_file, sp.stations._stations_file)  # noqa: SLF001
+                if all(f._disk_gen == f._gen for f in files if f.enabled):  # noqa: SLF001
+                    for e in stale:
+                        e.pop("sideFilesLeft", None)
+                    log(f"{key!r}: an archived user's leftover side files overwritten")
         return sp
 
     # ----- who is calling (design §6.2) ------------------------------------ #
@@ -9206,9 +9238,14 @@ class Hub:
             if st != "ok" or not isinstance(body, list):
                 return "unavailable", None
             users: dict[str, bool] = {}
+            ids: dict[str, str] = {}
             for row in body:
                 if isinstance(row, dict) and isinstance(row.get("userName"), str):
-                    users[_space_key(row["userName"])] = row.get("isAdmin") is True
+                    key = _space_key(row["userName"])
+                    users[key] = row.get("isAdmin") is True
+                    if isinstance(row.get("id"), str) and row["id"]:
+                        ids[key] = row["id"]
+            self._listed_ids = ids
             if total is not None and total > len(body):
                 return "partial", users
             return "ok", users
@@ -9240,6 +9277,8 @@ class Hub:
                 log(f"user refresh: Navidrome's user list holds {len(listed)} user(s) and "
                     "says there are more; nobody missing from it is signed out")
             now = int(time.time() * 1000)
+            ids = dict(self._listed_ids)
+            await self._note_account_ids(ids)
             known = set(self.user_flags) | {r["user"] for r in self.device_auth.values()}
             for key in sorted(known):
                 if key == self.primary_user and key not in listed:
@@ -9283,6 +9322,32 @@ class Hub:
         await asyncio.gather(*(self._signed_out(ws) for ws in sockets),
                              return_exceptions=True)
 
+    async def _note_account_ids(self, ids: dict[str, str]) -> None:
+        """R38: Navidrome's id for each listed name. A space learns its id the
+        first time a list names it; a later list naming it under another id means
+        the account was deleted and re-created between two refreshes, which the
+        name alone cannot show. That space is archived and its devices signed out
+        (`_sign_out_user`), so the new account starts in a fresh space. The
+        primary user's space only takes the new id, never archived."""
+        changed = False
+        for key, nid in sorted(ids.items()):
+            sp = self.spaces.get(key)
+            if sp is None or sp.navidrome_id == nid:
+                continue
+            if sp.navidrome_id is None or key == self.primary_user:
+                if sp.navidrome_id is not None:
+                    log(f"user refresh: the primary user {key!r} has a new Navidrome id; "
+                        "their space keeps it")
+                sp.navidrome_id = nid
+                changed = True
+                continue
+            log(f"user refresh: {key!r} is a different Navidrome account than this "
+                "space's (deleted and re-created); treated as deleted")
+            await self._sign_out_user(key)
+            changed = True
+        if changed:
+            self._save()
+
     def _archive_space(self, key: str) -> Optional[str]:
         """R37: move `key`'s space out of `users` into `archived_users`, its station
         side files into `<HUB_STATE>.archive/`. Nothing is deleted. Returns the
@@ -9305,7 +9370,10 @@ class Hub:
             sp._sleep_handle.cancel()  # noqa: SLF001
             sp._sleep_handle = None  # noqa: SLF001
         base = _archive_side_base(akey)
+        here = os.path.dirname(STATE_PATH) or "."
         engine = sp.stations
+        aside: list[str] = []
+        left = False
         for side, suffix in ((engine._history_file, STATION_HISTORY_SUFFIX),  # noqa: SLF001
                              (engine._stations_file, STATION_STATE_SUFFIX)):  # noqa: SLF001
             side.flush()   # any pending write lands first, at the old name
@@ -9317,11 +9385,29 @@ class Hub:
                 pass       # nothing written yet
             except OSError as e:
                 log(f"could not archive {os.path.basename(side.path)}:", e)
+                # Not at the name a new account of this name reads: renamed aside,
+                # or, failing that, flagged so a new space skips it (`space_for`).
+                orphan = f"{side.path}.orphan-{stamp}"
+                try:
+                    os.replace(side.path, orphan)
+                    aside.append(os.path.relpath(orphan, here))
+                except FileNotFoundError:
+                    pass
+                except OSError as e2:
+                    log(f"could not set {os.path.basename(side.path)} aside either:", e2)
+                    left = True
             side.path = target
-        self.archived_users[akey] = {
-            "user": key, "archivedAt": int(time.time() * 1000),
-            "sideFiles": os.path.relpath(base, os.path.dirname(STATE_PATH) or "."),
-            "space": sp.state_dict()}
+        # The archive's own copy, from memory: complete whether or not a move above
+        # worked (a failed write is logged; the file set aside still holds it).
+        engine.persist_now()
+        entry = {"user": key, "archivedAt": int(time.time() * 1000),
+                 "sideFiles": os.path.relpath(base, here),
+                 "space": sp.state_dict()}
+        if aside:
+            entry["sideFilesAside"] = aside
+        if left:
+            entry["sideFilesLeft"] = True
+        self.archived_users[akey] = entry
         del self.spaces[key]
         return akey
 
@@ -9573,8 +9659,8 @@ class Hub:
                     self.archived_users[k] = entry
 
         for name, section in (("lbIndex", lb_index), ("deviceAuth", device_auth),
-                              ("userFlags", user_flags), ("users", users),
-                              ("archivedUsers", archived_users)):
+                              ("userFlags", user_flags), ("archivedUsers", archived_users),
+                              ("users", users)):
             try:
                 section()
             except Exception as e:  # noqa: BLE001
@@ -9913,6 +9999,10 @@ class Hub:
             # Before registering, so a device is never half-announced while its
             # welcome waits. A no-op once the hub's first lb-bot probe is in.
             await LB.wait_first_probe(LB_PROBE_STARTUP_WAIT)
+            if self.spaces.get(space.key) is not space:
+                # Archived while this hello waited (R37, R38): its user is gone.
+                await refuse_signed_out("its user's space was archived while it waited")
+                return
             # NOTHING may suspend between here and the write of `welcome`. _register
             # adopts the socket, so from that line every directive for this device
             # is written to it, and `welcome` has to be the first frame on it: it is

@@ -28,6 +28,9 @@ with their station files at `<HUB_STATE>.users/<key>.history` / `.stations`.
      moved to `archivedUsers` under `<key>@<unix time>`, side files into
      `<HUB_STATE>.archive/`; a new space of the same name is empty; nothing is
      deleted; the primary user is never archived; the backup carries the archive.
+  6. test_archive_side_file_move_fails (R37): the move into the archive fails; the
+     archive is written from memory, the leftover is renamed aside, or (when that
+     fails too) flagged, and a new space of the name never reads it.
      (The rollback check, 2, also runs with an archived user in the file.)
 
 In process, no sockets. Exits non-zero on failure.
@@ -584,6 +587,71 @@ def test_deleted_user_space_archived(tmp: str) -> list[str]:
     return failures
 
 
+def test_archive_side_file_move_fails(tmp: str) -> list[str]:
+    failures: list[str] = []
+    real_replace = hubmod.os.replace
+    for case in ("move fails", "move and rename aside fail"):
+        sub = os.path.join(tmp, case.replace(" ", "-"))
+        os.makedirs(sub)
+        state = os.path.join(sub, "state.json")
+        write_fixture(state)
+        h = new_hub(state)
+        bob = h.space_for("bob")
+        bob.stations.stations["st_bob"] = hubmod.Station.from_state(_station("st_bob"))
+        bob.stations._stations_touch()  # noqa: SLF001
+        bob.stations._history_add("bob-tr", "cafe")  # noqa: SLF001
+        live = {os.path.join(state + ".users", "bob") + sfx
+                for sfx in (hubmod.STATION_HISTORY_SUFFIX, hubmod.STATION_STATE_SUFFIX)}
+
+        def flaky(src, dst, *a, _case=case, **k):
+            if src in live and (".archive" in str(dst) or _case.endswith("aside fail")):
+                raise PermissionError(13, "forced by the test", str(dst))
+            return real_replace(src, dst, *a, **k)
+        hubmod.os.replace = flaky
+        try:
+            akey = h._archive_space("bob")  # noqa: SLF001
+        finally:
+            hubmod.os.replace = real_replace
+        h._save()  # noqa: SLF001
+        entry = h.archived_users.get(akey) or {}
+        side = os.path.join(sub, entry.get("sideFiles") or "missing")
+        try:
+            with open(side + hubmod.STATION_HISTORY_SUFFIX, encoding="utf-8") as f:
+                plays = [p[0] for p in json.load(f)["plays"]]
+        except Exception as e:  # noqa: BLE001
+            plays = [repr(e)]
+        if plays != ["bob-tr"]:
+            failures.append(f"{case}: the archive's history (from memory) is {plays}")
+        if case == "move fails":
+            if len(entry.get("sideFilesAside") or []) != 2 or entry.get("sideFilesLeft"):
+                failures.append(f"{case}: the entry says aside {entry.get('sideFilesAside')}, "
+                                f"left {entry.get('sideFilesLeft')}")
+            if any(os.path.exists(p) for p in live):
+                failures.append(f"{case}: a leftover is still at the live name")
+        elif entry.get("sideFilesLeft") is not True:
+            failures.append(f"{case}: the entry is not flagged sideFilesLeft: {sorted(entry)}")
+        nb = h.space_for("bob")
+        if nb.stations.history or nb.stations.stations:
+            failures.append(f"{case}: a new bob read the old files: history "
+                            f"{[p[0] for p in nb.stations.history]}, stations "
+                            f"{list(nb.stations.stations)}")
+        h._save()  # noqa: SLF001
+        if case != "move fails":
+            if entry.get("sideFilesLeft"):
+                failures.append(f"{case}: the flag stayed after the new space overwrote the files")
+            with open(os.path.join(state + ".users", "bob") + hubmod.STATION_HISTORY_SUFFIX,
+                      encoding="utf-8") as f:
+                if "bob-tr" in f.read():
+                    failures.append(f"{case}: the old history is still at the live name")
+        h2 = new_hub(state)
+        b2 = h2.spaces.get("bob")
+        if b2 is None or b2.stations.history or b2.stations.stations:
+            failures.append(f"{case}: after a restart the new bob holds the old files")
+        for sp in list(h.spaces.values()) + list(h2.spaces.values()):
+            sp.stations.close()
+    return failures
+
+
 # --------------------------------------------------------------------------- #
 # 5 (R14): a long name's side files
 # --------------------------------------------------------------------------- #
@@ -764,6 +832,7 @@ def main() -> int:
              test_other_users_round_trip_under_users,
              test_station_side_files_per_user,
              test_deleted_user_space_archived,
+             test_archive_side_file_move_fails,
              test_side_file_stem_long_names,
              test_primary_user_change_moves_spaces,
              test_move_to_a_user_without_a_space]
@@ -786,6 +855,7 @@ def main() -> int:
     print("PASS - state migration: p1-file-loads-as-primary/rollback-keeps-owner-top-level"
           f"({ROLLBACK_PARSER})/other-users-round-trip-under-users/"
           "station-side-files-per-user/deleted-user-space-archived-not-inherited/"
+          "archive-move-fails-leftover-aside-or-skipped/"
           "long-name-stem-hashed/"
           "primary-user-change-moves-spaces-both-ways+rollback/move-to-a-new-user")
     return 0

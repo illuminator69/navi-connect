@@ -34,6 +34,14 @@ and 401 to one it did not issue.
   test_primary_user_never_archived       (R37) a complete list without the primary
                                          user: their space stays at the top level and
                                          their socket stays open
+  test_recreated_account_gets_fresh_space
+                                         (R38) bob deleted and re-created between two
+                                         refreshes (same name, new Navidrome id): the
+                                         old space is archived, the old secret gets
+                                         4005, the new account starts empty; refreshes
+                                         with an unchanged id archive nothing
+  test_primary_user_new_id_not_archived  (R38) the primary user under a new id: the
+                                         stored id follows, nothing is archived
 
 Exits non-zero on failure.
 """
@@ -354,6 +362,107 @@ async def t_primary_not_archived(nd: FakeNavidrome) -> list[str]:
     return f
 
 
+def _state(h: HubProc) -> dict:
+    with open(h.state, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+async def t_recreated(nd: FakeNavidrome) -> list[str]:
+    f = []
+    saved = nd.users["bob"]
+    h = HubProc(nd.url, **FAST)
+    try:
+        await h.up()
+        bob, bp = await _connect(h, "bob")
+        await bob.ws.send(json.dumps({"t": "act", "action": "setQueue",
+                                      "tracks": [{"id": "OLDBOB", "title": "x"}],
+                                      "index": 0, "positionMs": 0, "play": False}))
+        if not await _until(lambda: nd.user_list_calls >= 1, 6):
+            f.append("no refresh read the user list within 6 s")
+        calls = nd.user_list_calls
+        await _until(lambda: nd.user_list_calls >= calls + 2, 8)
+        await asyncio.sleep(0.5)
+        raw = _state(h)
+        old_id = saved.get("id")
+        if (raw.get("users", {}).get("bob") or {}).get("navidromeId") != old_id or not old_id:
+            f.append(f"bob's space did not learn his Navidrome id: "
+                     f"{(raw.get('users', {}).get('bob') or {}).get('navidromeId')!r}")
+        if raw.get("archivedUsers") or bob.close_code is not None:
+            f.append("refreshes with an unchanged id archived or signed out bob")
+        # Deleted and re-created between two refreshes: same name, a new account.
+        nd.users["bob"] = {"password": "recreated-bob-61", "admin": False}
+        await bob.wait_closed(8)
+        if bob.close_code != 4005 or not any(fr.get("code") == "signed_out"
+                                             for fr in bob.frames):
+            f.append(f"the old bob's socket: close {bob.close_code}")
+        await asyncio.sleep(0.3)
+        raw = _state(h)
+        arch = [v for k, v in (raw.get("archivedUsers") or {}).items() if k.startswith("bob@")]
+        q = [t.get("id") for t in ((arch[0].get("space") or {}).get("session") or {})
+             .get("queue", [])] if arch else []
+        if len(arch) != 1 or q != ["OLDBOB"]:
+            f.append(f"the old bob's space was not archived: {len(arch)} entr(y/ies), queue {q}")
+        if any(r.get("user") == "bob" for r in raw.get("deviceAuth", {}).values()):
+            f.append("the old bob's credentials survived")
+        again = await Sock().hello(h.ws_url, {"id": bp["deviceId"], "name": "bob"},
+                                   secret=bp["deviceSecret"])
+        if await again.wait_closed() != 4005:
+            f.append(f"the old bob's secret still connects ({again.close_code})")
+        st, nb = await h.signin("bob", password="recreated-bob-61")
+        if st != 200:
+            f.append(f"the new bob's sign-in answered {st} {nb}")
+            return f
+        s2 = await Sock().hello(h.ws_url, {"id": nb["deviceId"], "name": "new bob"},
+                                secret=nb["deviceSecret"])
+        w = s2.first("welcome") or {}
+        wq = [t.get("id") for t in (w.get("session") or {}).get("queue", [])]
+        wd = [d.get("id") for d in w.get("devices", [])]
+        if wq or wd != [nb["deviceId"]]:
+            f.append(f"the new bob inherited: queue {wq}, devices {wd}")
+        new_id = nd.users["bob"].get("id")
+        await _until(lambda: (_state(h).get("users", {}).get("bob") or {})
+                     .get("navidromeId") == new_id, 6)
+        if (_state(h).get("users", {}).get("bob") or {}).get("navidromeId") != new_id:
+            f.append("the new bob's space did not learn the new id")
+        if s2.close_code is not None:
+            f.append(f"the new bob was signed out ({s2.close_code})")
+        await s2.close()
+    finally:
+        nd.users["bob"] = saved
+        h.stop()
+    return f
+
+
+async def t_primary_new_id(nd: FakeNavidrome) -> list[str]:
+    f = []
+    saved = nd.users["owner"]
+    h = HubProc(nd.url, **FAST)
+    try:
+        await h.up()
+        owner, _ = await _connect(h, "owner")
+        await owner.ws.send(json.dumps({"t": "act", "action": "setQueue",
+                                        "tracks": [{"id": "OWNID", "title": "x"}],
+                                        "index": 0, "positionMs": 0, "play": False}))
+        if not await _until(lambda: _state(h).get("navidromeId") == saved.get("id")
+                            and saved.get("id"), 6):
+            f.append(f"the primary space did not learn its id: {_state(h).get('navidromeId')!r}")
+        nd.users["owner"] = {"password": saved["password"], "admin": True}
+        await _until(lambda: _state(h).get("navidromeId") == nd.users["owner"].get("id"), 8)
+        await asyncio.sleep(0.3)
+        raw = _state(h)
+        if raw.get("navidromeId") != nd.users["owner"].get("id"):
+            f.append("the primary space did not take its new id")
+        if raw.get("archivedUsers") or owner.close_code is not None:
+            f.append(f"the primary user was archived or signed out ({owner.close_code})")
+        if [t.get("id") for t in raw.get("session", {}).get("queue", [])] != ["OWNID"]:
+            f.append("the primary user's queue was lost")
+        await owner.close()
+    finally:
+        nd.users["owner"] = saved
+        h.stop()
+    return f
+
+
 async def main_async() -> list[str]:
     failures: list[str] = []
     for name, fn in (("test_idle_socket_hears_demotion", t_demotion),
@@ -361,7 +470,9 @@ async def main_async() -> list[str]:
                      ("test_non_admin_service_account_keeps_signin_flags", t_service_not_admin),
                      ("test_failed_reads_back_off", t_backoff),
                      ("test_partial_user_list_signs_nobody_out", t_partial_list),
-                     ("test_primary_user_never_archived", t_primary_not_archived)):
+                     ("test_primary_user_never_archived", t_primary_not_archived),
+                     ("test_recreated_account_gets_fresh_space", t_recreated),
+                     ("test_primary_user_new_id_not_archived", t_primary_new_id)):
         nd = FakeNavidrome({k: (v[0], v[1]) for k, v in USERS.items()}).start()
         try:
             got = await fn(nd)
@@ -383,7 +494,8 @@ def main() -> int:
           "relogin-once-on-401/deleted-user-4005-after-500s-change-nothing/"
           "deleted-user-space-archived-new-bob-empty/non-admin-service-account-keeps-flags-logged-once/"
           "failed-reads-back-off(429,500)-one-login-per-interval/"
-          "partial-user-list-signs-nobody-out-archives-nothing/primary-user-never-archived")
+          "partial-user-list-signs-nobody-out-archives-nothing/primary-user-never-archived/"
+          "recreated-account-gets-fresh-space/primary-user-new-id-not-archived")
     return 0
 
 

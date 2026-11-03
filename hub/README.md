@@ -96,7 +96,11 @@ naming the missing setting (never a value), and with `.env.example`'s placeholde
   `archivedUsers` in `state.json` (as `<name>@<unix time>`), with their station files
   in `state.json.archive/`. A new account of the same name starts empty. Nothing is
   deleted, the primary user is never archived, and a rollback ignores the archive.
-  Restoring one is a manual state edit.
+  Restoring one is a manual state edit. Each space also remembers Navidrome's id for
+  its account (`navidromeId`), so an account deleted and re-created under the same name
+  between two reads is archived the same way. A Navidrome restore that changes user
+  ids therefore archives every user but the primary one once (their data kept; their
+  devices sign in again).
 - **Deploy order: lb-bot, then this hub, then the clients.** A new hub in front of an
   old lb-bot serves only the primary user's lb calls; new clients in front of an old
   hub find no sign-in route and show the token field, as before.
