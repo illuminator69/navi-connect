@@ -292,8 +292,88 @@ def check_hub_name() -> list[str]:
     return failures
 
 
+def check_public_url() -> list[str]:
+    """Worbus P3, H2: HUB_PUBLIC_URL, normalised and refused."""
+    failures: list[str] = []
+    n = hub.normalise_public_url
+
+    def same(label, got, want):
+        if got != want:
+            failures.append(f"{label}: {got!r}, want {want!r}")
+
+    def refused(label, value):
+        try:
+            got = n(value)
+        except hub.ConfigRefusal as e:
+            msg = str(e)
+            if not msg.startswith("HUB_PUBLIC_URL"):
+                failures.append(f"{label}: the refusal does not name the setting: {msg!r}")
+            if "\n" in msg:
+                failures.append(f"{label}: the refusal is not one line: {msg!r}")
+            return
+        failures.append(f"{label}: accepted as {got!r}, must be refused")
+
+    # unset
+    same("unset", n(None), None)
+    same("blank is unset", n("   "), None)
+    # https_public_url_becomes_wss
+    same("wss kept", n("wss://hub.example.org"), "wss://hub.example.org")
+    same("https becomes wss", n("https://hub.example.org"), "wss://hub.example.org")
+    same("scheme case", n("HTTPS://hub.example.org"), "wss://hub.example.org")
+    same("port kept", n("https://hub.example.org:8443"), "wss://hub.example.org:8443")
+    same("host lower-cased", n("wss://Hub.Example.ORG"), "wss://hub.example.org")
+    same("quoted (docker env-file)", n("'wss://hub.example.org'"), "wss://hub.example.org")
+    same("ipv6 host", n("wss://[2001:db8::1]:8443"), "wss://[2001:db8::1]:8443")
+    # trailing_connect_and_slash_dropped
+    same("trailing slash", n("wss://hub.example.org/"), "wss://hub.example.org")
+    same("trailing /connect", n("wss://hub.example.org/connect"), "wss://hub.example.org")
+    same("trailing /connect/", n("wss://hub.example.org/connect/"), "wss://hub.example.org")
+    same("https with /connect", n("https://hub.example.org:8443/connect"),
+         "wss://hub.example.org:8443")
+    same("padding", n("  wss://hub.example.org/connect \n"), "wss://hub.example.org")
+    # path_kept
+    same("path kept", n("wss://example.org/worbus"), "wss://example.org/worbus")
+    same("path kept, slash dropped", n("https://example.org/a/b/"), "wss://example.org/a/b")
+    same("path kept, /connect dropped", n("wss://example.org/worbus/connect"),
+         "wss://example.org/worbus")
+    same("path case kept", n("wss://example.org/Worbus"), "wss://example.org/Worbus")
+    same("/connect only as the last segment", n("wss://example.org/connectx"),
+         "wss://example.org/connectx")
+    # public_url_ws_refused / http / no host / placeholder
+    refused("public_url_ws_refused", "ws://hub.example.org")
+    refused("public_url_ws_refused (upper case)", "WS://hub.example.org")
+    refused("public_url_http_refused", "http://hub.example.org")
+    refused("other scheme", "ftp://hub.example.org")
+    refused("no scheme", "hub.example.org")
+    refused("public_url_no_host_refused (scheme only)", "wss://")
+    refused("public_url_no_host_refused (path only)", "wss:///worbus")
+    refused("public_url_no_host_refused (port only)", "https://:8443")
+    refused("bad port", "wss://hub.example.org:notaport")
+    refused("credentials in the url", "wss://user:pw@hub.example.org")
+    refused("query", "wss://hub.example.org/?x=1")
+    refused("spaces", "wss://hub .example.org")
+    refused("public_url_placeholder_refused", "wss://hub.example.com")
+    refused("public_url_placeholder_refused (https form)", "https://hub.example.com/")
+    refused("public_url_placeholder_refused (/connect, upper case)", "WSS://Hub.Example.com/connect")
+    # The refusal never repeats the whole value (it names the setting).
+    try:
+        n("ws://hub.example.org/with-a-very-long-secret-looking-path-1234567890")
+    except hub.ConfigRefusal as e:
+        if "1234567890" in str(e):
+            failures.append(f"the refusal repeats the value: {e}")
+    # Through startup_config_refusal: a refusal is returned, not raised.
+    r = hub.startup_config_refusal
+    nd = dict(navidrome_url="http://127.0.0.1:9", nd_user="owner", nd_pass="p")
+    got = r(REAL_32, "0.0.0.0", False, "", "", **nd, public_url="ws://hub.example.org")
+    if not (got or "").startswith("HUB_PUBLIC_URL"):
+        failures.append(f"startup_config_refusal let ws:// through: {got!r}")
+    if r(REAL_32, "0.0.0.0", False, "", "", **nd, public_url="https://hub.example.org") is not None:
+        failures.append("startup_config_refusal refused a good HUB_PUBLIC_URL")
+    return failures
+
+
 def check_discovery_subprocess() -> list[str]:
-    """HUB_NAME's refusals, wired into start-up: non-zero exit, one line naming the
+    """The same refusals, wired into start-up: non-zero exit, one line naming the
     setting, no state file."""
     failures: list[str] = []
     common = dict(HUB_TOKEN=REAL_32, NAVIDROME_URL="http://127.0.0.1:9", HUB_ND_USER="owner",
@@ -302,18 +382,25 @@ def check_discovery_subprocess() -> list[str]:
               "HUB_NAME is longer than 40 characters; shorten it."),
              ("HUB_NAME blank", dict(HUB_NAME="  "),
               "HUB_NAME is set but blank; give it a name of 1 to 40 characters, or unset it "
-              "for the default ('Worbus Server')."))
+              "for the default ('Worbus Server')."),
+             ("HUB_PUBLIC_URL ws://", dict(HUB_PUBLIC_URL="ws://hub.example.org"),
+              "HUB_PUBLIC_URL must be wss:// (or https://): ws:// would send the device "
+              "secret across the internet in plain text."),
+             ("HUB_PUBLIC_URL placeholder", dict(HUB_PUBLIC_URL="wss://hub.example.com"),
+              "HUB_PUBLIC_URL is still the example value; set your own address, or leave "
+              "it unset."))
     for label, over, line in cases:
         with tempfile.TemporaryDirectory() as tmp:
             failures += _refused(tmp, label, line, **common, **over)
     with tempfile.TemporaryDirectory() as tmp:
-        failures += _starts(tmp, "HUB_NAME good", **common, HUB_NAME="Home")
+        failures += _starts(tmp, "HUB_NAME and HUB_PUBLIC_URL good", **common,
+                            HUB_NAME="Home", HUB_PUBLIC_URL="https://hub.example.org")
     return failures
 
 
 def main() -> int:
     failures = check_pure() + check_env_example() + check_device_ttl() + check_subprocess()\
-        + check_hub_name() + check_discovery_subprocess()
+        + check_hub_name() + check_public_url() + check_discovery_subprocess()
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -328,7 +415,8 @@ def main() -> int:
           "env-example-service-account-placeholders-refused/"
           "device-ttl-example-7-blank-is-default/"
           "hub-name-too-long-and-blank-refused-default-and-trim/"
-          "discovery-refusals-wired-into-start")
+          "public-url-https-becomes-wss-slash-and-connect-dropped-path-kept/"
+          "public-url-ws-http-no-host-placeholder-refused/discovery-refusals-wired-into-start")
     return 0
 
 

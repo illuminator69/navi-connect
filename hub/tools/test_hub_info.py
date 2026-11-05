@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Worbus P3, lane H (H1): the server's identity and an open `GET /hub/info`.
+Worbus P3, lane H (H1, H2): the server's identity, an open `GET /hub/info`, and
+`welcome.server`.
 
 Real hub subprocesses against the fake Navidrome (tools/fake_navidrome.py), on the
-pattern of test_signin.py. The configuration rules (HUB_NAME) are tested pure in
-test_startup_config.py; this file proves what a running hub says.
+pattern of test_signin.py. The configuration rules (HUB_NAME, HUB_PUBLIC_URL) are
+tested pure in test_startup_config.py; this file proves what a running hub says.
 
 H1 (identity and /hub/info):
   info_shape_without_auth            200 JSON, the four keys and nothing else
@@ -15,6 +16,12 @@ H1 (identity and /hub/info):
   server_id_survives_project2_rewrite
   bad_server_id_file_refuses_start   named file, never replaced, nothing else written
   info_never_touches_navidrome       20 requests, zero Navidrome calls; HUB_DEBUG log line
+H2 (welcome.server):
+  welcome_carries_server_id_and_name
+  welcome_public_url_when_set        + https_public_url_becomes_wss, trailing_connect_and_slash_dropped,
+                                       path_kept (at the welcome; the normaliser is pure-tested too)
+  welcome_no_public_url_key_when_unset
+  server_field_same_for_every_user
 
 Exits non-zero on failure.
 """
@@ -211,9 +218,11 @@ async def t_info_same_bytes_with_bearer(h: HubProc, nd: FakeNavidrome) -> list[s
 
 
 async def t_info_has_no_address(h: HubProc, nd: FakeNavidrome) -> list[str]:
-    """`h` runs with HUB_PUBLIC_URL set (a P3 setting the hub may or may not read yet:
-    the body must be free of any address either way)."""
+    """`h` runs with HUB_PUBLIC_URL set."""
     f: list[str] = []
+    w = await h.welcome(token=TOKEN)
+    _fail_if((w.get("server") or {}).get("publicUrl") != "wss://hub.test.example",
+             f"precondition: HUB_PUBLIC_URL is not active ({w.get('server')})", f)
     _status, _h, raw = h.info()
     text = raw.decode()
     for needle in ("url", "Url", "URL", "publicUrl", "ws://", "wss://", "http", "hub.test.example",
@@ -263,6 +272,9 @@ async def t_server_id_survives_restart(nd: FakeNavidrome) -> list[str]:
             await h2.up()
             id2 = json.loads(h2.info()[2])["serverId"]
             _fail_if(id2 != id1, f"id changed over a restart: {id1} -> {id2}", f)
+            w = await h2.welcome(token=TOKEN)
+            _fail_if((w.get("server") or {}).get("id") != id1,
+                     f"welcome.server.id {w.get('server')} differs", f)
         finally:
             h2.stop()
         # The id is not in state.json: that is the file a rollback rewrites.
@@ -395,6 +407,63 @@ async def t_info_never_touches_navidrome(h: HubProc, nd: FakeNavidrome) -> list[
 
 
 # --------------------------------------------------------------------------- #
+# H2
+# --------------------------------------------------------------------------- #
+async def t_welcome_carries_server_id_and_name(h: HubProc, nd: FakeNavidrome) -> list[str]:
+    """`h` runs with HUB_NAME=" Home Hub " (trimmed on the way out)."""
+    f: list[str] = []
+    info = json.loads(h.info()[2])
+    for label, w in (("legacy token", await h.welcome(token=TOKEN)),
+                     ("device secret", await h.welcome(secret=h.signin("bob"),
+                                                       device_id="dev-bob"))):
+        server = w.get("server")
+        _fail_if(not isinstance(server, dict), f"{label}: no server object ({server!r})", f)
+        if isinstance(server, dict):
+            _fail_if(server.get("id") != info["serverId"],
+                     f"{label}: server.id {server.get('id')!r} != info {info['serverId']!r}", f)
+            _fail_if(server.get("name") != "Home Hub",
+                     f"{label}: server.name {server.get('name')!r}", f)
+    _fail_if(info["name"] != "Home Hub", f"info.name {info['name']!r}", f)
+    return f
+
+
+async def t_welcome_public_url(h: HubProc, nd: FakeNavidrome) -> list[str]:
+    """`h` runs with HUB_PUBLIC_URL=https://Hub.Test.Example:8443/worbus/connect/ : https
+    stored as wss, a trailing / and /connect dropped, the path kept."""
+    f: list[str] = []
+    w = await h.welcome(token=TOKEN)
+    server = w.get("server") or {}
+    _fail_if(server.get("publicUrl") != "wss://hub.test.example:8443/worbus",
+             f"publicUrl {server.get('publicUrl')!r}", f)
+    _fail_if(set(server) != {"id", "name", "publicUrl"}, f"server keys {sorted(server)}", f)
+    return f
+
+
+async def t_welcome_no_public_url_key_when_unset(h: HubProc, nd: FakeNavidrome) -> list[str]:
+    f: list[str] = []
+    w = await h.welcome(token=TOKEN)
+    server = w.get("server")
+    _fail_if(not isinstance(server, dict), f"no server object ({server!r})", f)
+    if isinstance(server, dict):
+        _fail_if("publicUrl" in server, f"publicUrl present: {server}", f)
+        _fail_if(set(server) != {"id", "name"}, f"server keys {sorted(server)}", f)
+    return f
+
+
+async def t_server_field_same_for_every_user(h: HubProc, nd: FakeNavidrome) -> list[str]:
+    f: list[str] = []
+    servers = {}
+    servers["bob"] = (await h.welcome(secret=h.signin("bob"), device_id="dev-bob")).get("server")
+    servers["alice"] = (await h.welcome(secret=h.signin("alice"),
+                                        device_id="dev-alice")).get("server")
+    servers["owner (legacy token)"] = (await h.welcome(token=TOKEN)).get("server")
+    _fail_if(any(s is None for s in servers.values()), f"a welcome without server: {servers}", f)
+    _fail_if(len({json.dumps(s, sort_keys=True) for s in servers.values()}) != 1,
+             f"the server field differs per user: {servers}", f)
+    return f
+
+
+# --------------------------------------------------------------------------- #
 async def _with_hub(nd: FakeNavidrome, fn, **env) -> list[str]:
     h = HubProc(nd.url, **env)
     try:
@@ -429,7 +498,11 @@ async def main_async() -> tuple[list[str], list[str]]:
             for name, fn in (("info_shape_without_auth", t_info_shape_without_auth),
                              ("info_same_bytes_with_bearer", t_info_same_bytes_with_bearer),
                              ("info_other_methods_405", t_info_other_methods_405),
-                             ("info_never_touches_navidrome", t_info_never_touches_navidrome)):
+                             ("info_never_touches_navidrome", t_info_never_touches_navidrome),
+                             ("welcome_no_public_url_key_when_unset",
+                              t_welcome_no_public_url_key_when_unset),
+                             ("server_field_same_for_every_user",
+                              t_server_field_same_for_every_user)):
                 try:
                     got = await fn(plain, nd)
                 except Exception:  # noqa: BLE001
@@ -440,6 +513,12 @@ async def main_async() -> tuple[list[str], list[str]]:
 
         record("info_has_no_address", await _with_hub(
             nd, t_info_has_no_address, HUB_PUBLIC_URL="https://hub.test.example"))
+        record("welcome_carries_server_id_and_name", await _with_hub(
+            nd, t_welcome_carries_server_id_and_name, HUB_NAME=" Home Hub "))
+        record("welcome_public_url_when_set/https_public_url_becomes_wss/"
+               "trailing_connect_and_slash_dropped/path_kept", await _with_hub(
+                   nd, t_welcome_public_url,
+                   HUB_PUBLIC_URL="https://Hub.Test.Example:8443/worbus/connect/"))
         record("server_id_survives_restart", await _bare(nd, t_server_id_survives_restart))
         record("server_id_survives_project2_rewrite",
                await _bare(nd, t_server_id_survives_project2_rewrite))

@@ -98,12 +98,14 @@ SIGNED_OUT_FRAME = {"t": "error", "code": "signed_out",
 USER_REFRESH_SECS = float(os.environ.get("HUB_USER_REFRESH_SECS", "600") or "600")
 USER_REFRESH_TIMEOUT = 8.0    # each native-API call of a refresh
 
-# --- discovery (Worbus P3, design §6.1; PROTOCOL §3 and "Addresses") ---
-# What a client may learn about this server before it holds a credential. Read raw
-# here and decided by `startup_config_refusal` (a bad value stops the hub at start),
-# so the code below sees only values that passed.
+# --- discovery (Worbus P3, design §6.1, §6.2; PROTOCOL §3 and "Addresses") ---
+# What a client may learn about this server before it holds a credential, and the
+# one address the hub hands to a signed-in device. Both are read raw here and
+# decided by `startup_config_refusal` (a bad value stops the hub at start), so
+# the code below sees only values that passed.
 INFO_PATH = "/hub/info"
 HUB_NAME_RAW = os.environ.get("HUB_NAME")                # None = unset
+HUB_PUBLIC_URL_RAW = os.environ.get("HUB_PUBLIC_URL")    # None or blank = unset
 HUB_NAME_DEFAULT = "Worbus Server"
 HUB_NAME_MAX = 40
 # The side file holding the server's identity, beside HUB_STATE: not inside
@@ -111,6 +113,9 @@ HUB_NAME_MAX = 40
 # drop it (design §6.1).
 SERVER_ID_SUFFIX = ".server-id"
 _SERVER_ID_RE = re.compile(r"[0-9a-f]{32}")
+# `.env.example`'s commented placeholder for HUB_PUBLIC_URL: a copy uncommented
+# as it is would hand every client an address that is not this server.
+_PUBLIC_URL_EXAMPLE = "wss://hub.example.com"
 
 # AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
 # the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
@@ -8979,12 +8984,13 @@ class Hub:
     _sanitize_mix = staticmethod(UserSpace._sanitize_mix)
 
     def __init__(self, server_id: Optional[str] = None) -> None:
-        # The server's identity (Worbus P3, design §6.1). `main` passes the id
+        # The server's identity (Worbus P3, design §6.1, §6.2). `main` passes the id
         # from `<HUB_STATE>.server-id`; a Hub built without one (the suites) gets a
-        # fresh one that is never written anywhere. The name was checked at start; a
-        # bad value here is only a Hub built in-process.
+        # fresh one that is never written anywhere. The name and the public address
+        # were checked at start; a bad value here is only a Hub built in-process.
         self.server_id = server_id or secrets.token_hex(16)
         self.server_name = resolve_hub_name(HUB_NAME_RAW)
+        self.public_url = normalise_public_url(HUB_PUBLIC_URL_RAW)
         self.primary_user = _space_key(ND_USER)
         # key (lower-cased Navidrome username) -> that user's space. Created lazily
         # by `space_for`; the primary user's exists from the start.
@@ -9778,6 +9784,15 @@ class Hub:
         except Exception as e:  # noqa: BLE001
             log("device credential sweep error:", e)
 
+    def server_info(self) -> dict:
+        """`welcome.server` (PROTOCOL §3.1): `{id, name, publicUrl?}`. `publicUrl` is
+        left out when HUB_PUBLIC_URL is unset, so a client never reads a null as an
+        address. The same for every user."""
+        info = {"id": self.server_id, "name": self.server_name}
+        if self.public_url:
+            info["publicUrl"] = self.public_url
+        return info
+
     def info_body(self) -> dict:
         """`GET /hub/info` (PROTOCOL §3): a constant of the process. No address, no
         state, nothing read from Navidrome or lb-bot."""
@@ -10054,6 +10069,9 @@ class Hub:
                 "features": list(HUB_FEATURES),
                 # Who this socket acts for (R2): an older client ignores it.
                 "user": caller.wire(),
+                # Which server this is, and the address it may be reached at away
+                # from home (P3): the same for every user. An older client ignores it.
+                "server": self.server_info(),
                 "session": space._session_snapshot(),  # noqa: SLF001
                 "savedQueues": space._saved_queues_list(),  # noqa: SLF001
                 "mixes": space._mixes_list(),  # noqa: SLF001
@@ -10261,6 +10279,57 @@ def resolve_hub_name(raw: Optional[str]) -> str:
     return name
 
 
+def normalise_public_url(raw: Optional[str]) -> Optional[str]:
+    """HUB_PUBLIC_URL (Worbus P3, design §6.2) as `wss://host[:port][/path]`, or None
+    when unset (unset or blank). `https://` is stored as `wss://`; a trailing `/` and
+    a trailing `/connect` are dropped, a path is kept. Raises ConfigRefusal, naming
+    the setting, for any other scheme (a device secret would cross the internet in
+    plain text over `ws://` or `http://`), a value with no host, one that does not
+    parse, and the `.env.example` placeholder."""
+    if raw is None:
+        return None
+    value = _unquote(raw)
+    if not value:
+        return None
+    bad = "HUB_PUBLIC_URL must look like wss://hub.example.org[:port][/path] "
+    m = re.match(r"([A-Za-z][A-Za-z0-9+.\-]*)://(.*)$", value, re.S)
+    if m is None:
+        raise ConfigRefusal(bad + f"(or https://…); {_redact(value)!r} has no scheme.")
+    scheme = m.group(1).lower()
+    if scheme not in ("wss", "https"):
+        raise ConfigRefusal(
+            f"HUB_PUBLIC_URL must be wss:// (or https://): {scheme}:// would send the "
+            "device secret across the internet in plain text.")
+    rest = m.group(2)
+    if re.search(r"\s", rest):
+        raise ConfigRefusal(bad + "and may not contain spaces.")
+    try:
+        parts = urllib.parse.urlsplit("wss://" + rest)
+        host = parts.hostname
+        parts.port  # noqa: B018 — raises ValueError for a port that is not a number
+    except ValueError:
+        raise ConfigRefusal(bad + "and the address does not parse.") from None
+    if not host:
+        raise ConfigRefusal(bad + "and needs a host.")
+    if "@" in parts.netloc or parts.query or parts.fragment or "?" in rest or "#" in rest:
+        raise ConfigRefusal(bad + "with no user, query or fragment.")
+    path = parts.path.rstrip("/")
+    if path.endswith("/connect"):
+        path = path[:-len("/connect")]
+    path = path.rstrip("/")
+    out = "wss://" + parts.netloc.lower() + path
+    if out == _PUBLIC_URL_EXAMPLE:
+        raise ConfigRefusal("HUB_PUBLIC_URL is still the example value; set your own "
+                            "address, or leave it unset.")
+    return out
+
+
+def _redact(value: str) -> str:
+    # A refusal names the setting, never its value; the only thing echoed back is
+    # the leading characters, enough to recognise a typo.
+    return value[:12] + ("…" if len(value) > 12 else "")
+
+
 def load_or_mint_server_id(state_path: str) -> str:
     """The server's identity (Worbus P3, design §6.1): 32 lower-case hex characters
     in `<state_path>.server-id`, minted on the first start and never changed. A file
@@ -10316,7 +10385,8 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
                            navidrome_url: Optional[str] = None,
                            nd_user: Optional[str] = None,
                            nd_pass: Optional[str] = None,
-                           hub_name: Optional[str] = None) -> Optional[str]:
+                           hub_name: Optional[str] = None,
+                           public_url: Optional[str] = None) -> Optional[str]:
     """Why the hub must not start with this configuration, or None. Pure: the
     values are passed in, so the decision is testable without starting a hub.
 
@@ -10363,10 +10433,11 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if value is not None and _is_nd_example(name, value):
             # R13: `.env.example`'s commented placeholder, uncommented as it is.
             return f"{name} is still the example value; set your own."
-    # Worbus P3 (discovery): optional, checked when passed. None = unset.
+    # Worbus P3 (discovery): both optional, checked when passed. None = unset.
     try:
         if hub_name is not None:
             resolve_hub_name(hub_name)
+        normalise_public_url(public_url)
     except ConfigRefusal as e:
         return str(e)
     return None
@@ -10378,7 +10449,8 @@ def _check_auth_config() -> None:
     refusal = startup_config_refusal(TOKEN, HOST, ALLOW_INSECURE_NO_AUTH,
                                      PREVIEW_URL, PREVIEW_SECRET,
                                      navidrome_url=NAVIDROME_URL, nd_user=ND_USER,
-                                     nd_pass=ND_PASS, hub_name=HUB_NAME_RAW)
+                                     nd_pass=ND_PASS, hub_name=HUB_NAME_RAW,
+                                     public_url=HUB_PUBLIC_URL_RAW)
     if refusal:
         raise SystemExit(refusal)
     if not TOKEN:
