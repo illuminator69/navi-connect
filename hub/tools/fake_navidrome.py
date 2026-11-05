@@ -65,6 +65,7 @@ class FakeNavidrome:
         self.get_user_calls = 0
         self.login_calls = 0
         self.user_list_calls = 0
+        self.requests = 0                     # every request that arrived, any route
         self.login_limit: int | None = None   # logins answered before 429s start
         self.list_limit: int | None = None    # /api/user rows returned (R21), None = all
         self.unlisted: set[str] = set()       # users left out of /api/user (and its count)
@@ -107,6 +108,8 @@ class FakeNavidrome:
                 return True
 
             def do_GET(self):  # noqa: N802
+                with fake.lock:
+                    fake.requests += 1
                 path, _, query = self.path.partition("?")
                 multi = urllib.parse.parse_qs(query)
                 q = {k: v[0] for k, v in multi.items()}
@@ -129,6 +132,8 @@ class FakeNavidrome:
                 self._send(404, b'{"error":"not found"}')
 
             def do_POST(self):  # noqa: N802
+                with fake.lock:
+                    fake.requests += 1
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""
                 if self.path == "/auth/login":

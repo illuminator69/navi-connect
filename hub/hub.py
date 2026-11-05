@@ -98,6 +98,20 @@ SIGNED_OUT_FRAME = {"t": "error", "code": "signed_out",
 USER_REFRESH_SECS = float(os.environ.get("HUB_USER_REFRESH_SECS", "600") or "600")
 USER_REFRESH_TIMEOUT = 8.0    # each native-API call of a refresh
 
+# --- discovery (Worbus P3, design §6.1; PROTOCOL §3 and "Addresses") ---
+# What a client may learn about this server before it holds a credential. Read raw
+# here and decided by `startup_config_refusal` (a bad value stops the hub at start),
+# so the code below sees only values that passed.
+INFO_PATH = "/hub/info"
+HUB_NAME_RAW = os.environ.get("HUB_NAME")                # None = unset
+HUB_NAME_DEFAULT = "Worbus Server"
+HUB_NAME_MAX = 40
+# The side file holding the server's identity, beside HUB_STATE: not inside
+# state.json, so a rollback to the project 2 hub, which rewrites that file, cannot
+# drop it (design §6.1).
+SERVER_ID_SUFFIX = ".server-id"
+_SERVER_ID_RE = re.compile(r"[0-9a-f]{32}")
+
 # AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
 # the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
 AUDIOMUSE_URL = os.environ.get("AUDIOMUSE_URL", "").rstrip("/")
@@ -6383,13 +6397,25 @@ async def _handle_lb_fill(protocol: Any, raw_path: str, headers: Any,
 
 async def _handle_hub_auth(protocol: Any, raw_path: str, headers: Any,
                            method: str) -> Optional[tuple]:
-    """POST /hub/signin and POST /hub/signout (PROTOCOL §3, design §6.2)."""
+    """GET /hub/info, POST /hub/signin and POST /hub/signout (PROTOCOL §3, design
+    §6.1, §6.2)."""
     path = (raw_path.partition("?")[0].rstrip("/") or "/")
-    if path not in (SIGNIN_PATH, SIGNOUT_PATH):
+    if path not in (SIGNIN_PATH, SIGNOUT_PATH, INFO_PATH):
         return None
+    hub = HUB_INSTANCE
+    if path == INFO_PATH:
+        # Open on purpose: a client that holds no credential asks which server this
+        # is before it sends one. Whatever Authorization header came with it is not
+        # read, so the bytes are the same for every caller. It reads no state.
+        if method != "GET":
+            return _http_json(405, {"error": "method not allowed"})
+        if hub is None:
+            return _http_json(503, {"error": "hub starting"})
+        peer = getattr(protocol, "remote_address", None)
+        dlog(f"hub/info from {str(peer[0]) if isinstance(peer, (tuple, list)) and peer else '?'}")
+        return _http_json(200, hub.info_body())
     if method != "POST":
         return _http_json(405, {"error": "method not allowed"})
-    hub = HUB_INSTANCE
     if hub is None:
         return _http_json(503, {"code": "navidrome_unreachable", "error": "hub starting"})
     if path == SIGNOUT_PATH:
@@ -8952,7 +8978,13 @@ class Hub:
     SQ_TRACK_FIELDS = UserSpace.SQ_TRACK_FIELDS
     _sanitize_mix = staticmethod(UserSpace._sanitize_mix)
 
-    def __init__(self) -> None:
+    def __init__(self, server_id: Optional[str] = None) -> None:
+        # The server's identity (Worbus P3, design §6.1). `main` passes the id
+        # from `<HUB_STATE>.server-id`; a Hub built without one (the suites) gets a
+        # fresh one that is never written anywhere. The name was checked at start; a
+        # bad value here is only a Hub built in-process.
+        self.server_id = server_id or secrets.token_hex(16)
+        self.server_name = resolve_hub_name(HUB_NAME_RAW)
         self.primary_user = _space_key(ND_USER)
         # key (lower-cased Navidrome username) -> that user's space. Created lazily
         # by `space_for`; the primary user's exists from the start.
@@ -9746,6 +9778,12 @@ class Hub:
         except Exception as e:  # noqa: BLE001
             log("device credential sweep error:", e)
 
+    def info_body(self) -> dict:
+        """`GET /hub/info` (PROTOCOL §3): a constant of the process. No address, no
+        state, nothing read from Navidrome or lb-bot."""
+        return {"service": "worbus", "serverId": self.server_id,
+                "name": self.server_name, "signin": True}
+
     def health(self) -> dict:
         """Liveness snapshot for the HTTP health endpoint.
 
@@ -10202,11 +10240,83 @@ def _is_example_secret(value: str) -> bool:
     return v.lower().startswith(_EXAMPLE_SECRET_PREFIX)
 
 
+class ConfigRefusal(ValueError):
+    """A setting, or a file the hub keeps, that the hub must not start with. The
+    message names it (never a secret's value) and is what the operator reads."""
+
+
+def resolve_hub_name(raw: Optional[str]) -> str:
+    """HUB_NAME (Worbus P3, design §6.1): unset is the default; set, it is trimmed
+    and must be 1 to HUB_NAME_MAX characters. Raises ConfigRefusal otherwise."""
+    if raw is None:
+        return HUB_NAME_DEFAULT
+    name = _unquote(raw)
+    if not name:
+        raise ConfigRefusal("HUB_NAME is set but blank; give it a name of 1 to "
+                            f"{HUB_NAME_MAX} characters, or unset it for the default "
+                            f"({HUB_NAME_DEFAULT!r}).")
+    if len(name) > HUB_NAME_MAX:
+        raise ConfigRefusal(f"HUB_NAME is longer than {HUB_NAME_MAX} characters; "
+                            "shorten it.")
+    return name
+
+
+def load_or_mint_server_id(state_path: str) -> str:
+    """The server's identity (Worbus P3, design §6.1): 32 lower-case hex characters
+    in `<state_path>.server-id`, minted on the first start and never changed. A file
+    that exists but holds anything else raises ConfigRefusal naming it, and is never
+    replaced: a new id makes every client see a new server. The first write is
+    atomic and durable (temp file, fsync, rename, fsync of the directory)."""
+    path = state_path + SERVER_ID_SUFFIX
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(4096)
+    except FileNotFoundError:
+        raw = None
+    except OSError as e:
+        raise ConfigRefusal(f"The server identity file {path} cannot be read ({e}); "
+                            "it is never replaced, because a new id makes every "
+                            "client see a new server.") from None
+    if raw is not None:
+        text = raw.decode("utf-8", "replace")
+        if text.endswith("\n"):
+            text = text[:-1]
+        if not _SERVER_ID_RE.fullmatch(text):
+            raise ConfigRefusal(
+                f"The server identity file {path} does not hold 32 lower-case hex "
+                "characters on one line. It is never replaced, because a new id makes "
+                "every client see a new server: repair it, or delete it to start a "
+                "new server on purpose.")
+        return text
+    server_id = secrets.token_hex(16)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(server_id + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        raise ConfigRefusal(f"The server identity file {path} cannot be written "
+                            f"({e}); the hub would show a new id at every start.") from None
+    try:  # the rename is durable once the directory is; best-effort on a FUSE share
+        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    return server_id
+
+
 def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
                            preview_url: str, preview_secret: str, *,
                            navidrome_url: Optional[str] = None,
                            nd_user: Optional[str] = None,
-                           nd_pass: Optional[str] = None) -> Optional[str]:
+                           nd_pass: Optional[str] = None,
+                           hub_name: Optional[str] = None) -> Optional[str]:
     """Why the hub must not start with this configuration, or None. Pure: the
     values are passed in, so the decision is testable without starting a hub.
 
@@ -10253,6 +10363,12 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if value is not None and _is_nd_example(name, value):
             # R13: `.env.example`'s commented placeholder, uncommented as it is.
             return f"{name} is still the example value; set your own."
+    # Worbus P3 (discovery): optional, checked when passed. None = unset.
+    try:
+        if hub_name is not None:
+            resolve_hub_name(hub_name)
+    except ConfigRefusal as e:
+        return str(e)
     return None
 
 
@@ -10262,7 +10378,7 @@ def _check_auth_config() -> None:
     refusal = startup_config_refusal(TOKEN, HOST, ALLOW_INSECURE_NO_AUTH,
                                      PREVIEW_URL, PREVIEW_SECRET,
                                      navidrome_url=NAVIDROME_URL, nd_user=ND_USER,
-                                     nd_pass=ND_PASS)
+                                     nd_pass=ND_PASS, hub_name=HUB_NAME_RAW)
     if refusal:
         raise SystemExit(refusal)
     if not TOKEN:
@@ -10272,6 +10388,12 @@ def _check_auth_config() -> None:
 
 async def main() -> None:
     _check_auth_config()
+    # Before the Hub exists, so a damaged identity file stops the start before
+    # anything is read or written (design §6.1: never silently replaced).
+    try:
+        server_id = load_or_mint_server_id(STATE_PATH)
+    except ConfigRefusal as e:
+        raise SystemExit(str(e)) from None
     if MIRROR_PLAYQUEUE and not NAVIDROME_URL:
         log("WARNING: HUB_MIRROR_PLAYQUEUE is on but NAVIDROME_URL is unset — "
             "the savePlayQueue mirror is disabled. Set it in .env.")
@@ -10289,7 +10411,7 @@ async def main() -> None:
             "previewCastable=false and both clients refuse a cast transfer while an "
             "ext: track is queued.")
     global HUB_INSTANCE
-    hub = Hub()
+    hub = Hub(server_id=server_id)
     HUB_INSTANCE = hub
     log(f"navi-connect hub on ws://{HOST}:{PORT}  "
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "

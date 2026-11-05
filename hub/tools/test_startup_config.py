@@ -255,8 +255,65 @@ def check_device_ttl() -> list[str]:
     return failures
 
 
+def check_hub_name() -> list[str]:
+    """Worbus P3, H1: HUB_NAME is optional, trimmed, 1 to 40 characters, default
+    `Worbus Server`; longer, or blank while set, is refused naming the setting."""
+    failures: list[str] = []
+    r = hub.startup_config_refusal
+    base = (REAL_32, "0.0.0.0", False, "", "")
+    nd = dict(navidrome_url="http://127.0.0.1:9", nd_user="owner", nd_pass="p")
+
+    def check(label, ok, got):
+        if not ok:
+            failures.append(f"{label}: {got!r}")
+
+    # hub_name_too_long_refused
+    for label, value in (("41 characters", "x" * 41), ("41 after trimming", "  " + "y" * 41 + " ")):
+        got = r(*base, **nd, hub_name=value)
+        check(f"hub_name_too_long_refused ({label})",
+              got is not None and got.startswith("HUB_NAME") and "40" in got, got)
+    check("hub_name_too_long_refused (exactly 40 is fine)",
+          r(*base, **nd, hub_name="z" * 40) is None, r(*base, **nd, hub_name="z" * 40))
+    check("hub_name_too_long_refused (40 plus padding is fine)",
+          r(*base, **nd, hub_name="  " + "z" * 40 + "  ") is None, "refused")
+    # hub_name_blank_refused
+    for label, value in (("empty", ""), ("spaces", "   "), ("tab", "\t"), ("empty quotes", '""')):
+        got = r(*base, **nd, hub_name=value)
+        check(f"hub_name_blank_refused ({label})",
+              got is not None and got.startswith("HUB_NAME"), got)
+    # hub_name_default
+    check("hub_name_default (unset is fine)", r(*base, **nd) is None, r(*base, **nd))
+    check("hub_name_default (resolves to Worbus Server)",
+          hub.resolve_hub_name(None) == "Worbus Server", hub.resolve_hub_name(None))
+    check("hub_name_default (a set name is trimmed)",
+          hub.resolve_hub_name("  Home  ") == "Home", hub.resolve_hub_name("  Home  "))
+    check("hub_name_default (40 characters kept whole)",
+          hub.resolve_hub_name("é" * 40) == "é" * 40, "length")
+    return failures
+
+
+def check_discovery_subprocess() -> list[str]:
+    """HUB_NAME's refusals, wired into start-up: non-zero exit, one line naming the
+    setting, no state file."""
+    failures: list[str] = []
+    common = dict(HUB_TOKEN=REAL_32, NAVIDROME_URL="http://127.0.0.1:9", HUB_ND_USER="owner",
+                  HUB_ND_PASS="test-pass")
+    cases = (("HUB_NAME too long", dict(HUB_NAME="n" * 41),
+              "HUB_NAME is longer than 40 characters; shorten it."),
+             ("HUB_NAME blank", dict(HUB_NAME="  "),
+              "HUB_NAME is set but blank; give it a name of 1 to 40 characters, or unset it "
+              "for the default ('Worbus Server')."))
+    for label, over, line in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            failures += _refused(tmp, label, line, **common, **over)
+    with tempfile.TemporaryDirectory() as tmp:
+        failures += _starts(tmp, "HUB_NAME good", **common, HUB_NAME="Home")
+    return failures
+
+
 def main() -> int:
-    failures = check_pure() + check_env_example() + check_device_ttl() + check_subprocess()
+    failures = check_pure() + check_env_example() + check_device_ttl() + check_subprocess()\
+        + check_hub_name() + check_discovery_subprocess()
     for f in failures:
         print(f"FAIL - {f}")
     if failures:
@@ -269,7 +326,9 @@ def main() -> int:
           "subprocess-exit-and-line-no-state-file/"
           "subprocess-32-char-binds/env-example-enables-no-service-or-nd-creds/"
           "env-example-service-account-placeholders-refused/"
-          "device-ttl-example-7-blank-is-default")
+          "device-ttl-example-7-blank-is-default/"
+          "hub-name-too-long-and-blank-refused-default-and-trim/"
+          "discovery-refusals-wired-into-start")
     return 0
 
 
