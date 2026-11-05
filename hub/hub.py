@@ -9976,15 +9976,13 @@ class Hub:
         dev: Optional[Device] = None
         space: Optional[UserSpace] = None
         close = UserSpace._close  # noqa: SLF001 — same module
-        # PROTOCOL §2: clients connect to /connect. `/` is still accepted (older
-        # builds of both clients used it) but logged so it can be retired.
+        # PROTOCOL §3: clients connect to /connect or to `/` (an address's base,
+        # §3.4, may be either); both are accepted and equal.
         path = (getattr(ws, "request", None) and ws.request.path) or getattr(ws, "path", "/")
         path = (path or "/").split("?")[0].rstrip("/") or "/"
         if path not in ("/connect", "/"):
             await close(ws, 4004, "bad path")
             return
-        if path == "/":
-            dlog("client connected on deprecated path '/'; use /connect")
         try:
             # First frame MUST be hello + valid token.
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
@@ -10335,7 +10333,9 @@ def load_or_mint_server_id(state_path: str) -> str:
     in `<state_path>.server-id`, minted on the first start and never changed. A file
     that exists but holds anything else raises ConfigRefusal naming it, and is never
     replaced: a new id makes every client see a new server. The first write is
-    atomic and durable (temp file, fsync, rename, fsync of the directory)."""
+    atomic and durable (temp file, fsync, hard link into place, fsync of the
+    directory), and never replaces a file another start published meanwhile: that
+    one is read and validated instead."""
     path = state_path + SERVER_ID_SUFFIX
     try:
         with open(path, "rb") as f:
@@ -10358,14 +10358,35 @@ def load_or_mint_server_id(state_path: str) -> str:
                 "new server on purpose.")
         return text
     server_id = secrets.token_hex(16)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(server_id + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        try:
+            # Publish without replacing: a link fails if a file appeared since the
+            # read above (another start on the same state), and that file wins.
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                return load_or_mint_server_id(state_path)
+            except OSError:
+                # A share without hard links: create the file exclusively instead.
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    return load_or_mint_server_id(state_path)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(server_id + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     except OSError as e:
         raise ConfigRefusal(f"The server identity file {path} cannot be written "
                             f"({e}); the hub would show a new id at every start.") from None

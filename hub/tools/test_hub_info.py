@@ -15,6 +15,7 @@ H1 (identity and /hub/info):
   server_id_survives_restart
   server_id_survives_project2_rewrite
   bad_server_id_file_refuses_start   named file, never replaced, nothing else written
+  server_id_never_replaces_a_racing_file   a file that appears mid-mint wins (os.link)
   info_never_touches_navidrome       20 requests, zero Navidrome calls; HUB_DEBUG log line
 H2 (welcome.server):
   welcome_carries_server_id_and_name
@@ -58,16 +59,24 @@ USERS = {"owner": (PASSWORDS["owner"], True), "alice": (PASSWORDS["alice"], True
 HEX32 = re.compile(r"[0-9a-f]{32}")
 
 
+_HANDED_OUT: set[int] = set()  # every port this run has chosen, so none is chosen twice
+
+
 def _free_port() -> int:
     """A free loopback port from 4600-4789: clear of the services and of the round's
-    reserved ranges (4790, 4797-4799, 48xx-49xx)."""
+    reserved ranges (4790, 4797-4799, 48xx-49xx). A port is never returned twice in
+    one run: a probe socket is closed before the hub binds, so a second probe could
+    otherwise land on a port a hub (or its health server) is about to take."""
     for _ in range(400):
         port = random.randint(4600, 4789)
+        if port in _HANDED_OUT:
+            continue
         with socket.socket() as s:
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:
                 continue
+            _HANDED_OUT.add(port)
             return port
     raise RuntimeError("no free port in 4600-4789")
 
@@ -385,6 +394,40 @@ async def t_bad_server_id_file_refuses_start(nd: FakeNavidrome) -> list[str]:
     return f
 
 
+async def t_server_id_never_replaces_a_racing_file(nd: FakeNavidrome) -> list[str]:
+    """Two starts on one state that both found no file: the one that publishes second
+    must serve the first one's id and leave the file alone (os.link, not os.replace)."""
+    f: list[str] = []
+    if HUB_DIR not in sys.path:
+        sys.path.insert(0, HUB_DIR)
+    import hub as hubmod  # noqa: PLC0415
+    tmp = tempfile.mkdtemp(prefix="hubinfo-race-")
+    try:
+        state = os.path.join(tmp, "state.json")
+        path = state + ".server-id"
+        other = "fedcba9876543210fedcba9876543210"
+        real_link = os.link
+
+        def racing_link(src, dst, *a, **kw):
+            with open(dst, "w", encoding="utf-8") as fh:  # the other start wins the race
+                fh.write(other + "\n")
+            return real_link(src, dst, *a, **kw)  # now raises FileExistsError
+
+        hubmod.os.link = racing_link
+        try:
+            got = hubmod.load_or_mint_server_id(state)
+        finally:
+            hubmod.os.link = real_link
+        _fail_if(got != other, f"served {got}, not the id already on disk", f)
+        with open(path, encoding="utf-8") as fh:
+            _fail_if(fh.read() != other + "\n", "the winner's file was replaced", f)
+        _fail_if(sorted(os.listdir(tmp)) != ["state.json.server-id"],
+                 f"stray files: {sorted(os.listdir(tmp))}", f)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return f
+
+
 async def t_info_never_touches_navidrome(h: HubProc, nd: FakeNavidrome) -> list[str]:
     f: list[str] = []
     await asyncio.sleep(0.5)          # whatever the hub does at start is over
@@ -524,6 +567,8 @@ async def main_async() -> tuple[list[str], list[str]]:
                await _bare(nd, t_server_id_survives_project2_rewrite))
         record("bad_server_id_file_refuses_start",
                await _bare(nd, t_bad_server_id_file_refuses_start))
+        record("server_id_never_replaces_a_racing_file",
+               await _bare(nd, t_server_id_never_replaces_a_racing_file))
     finally:
         nd.stop()
     return failures, names
