@@ -58,7 +58,7 @@ it is purely a controller. Every device is always a potential controller.
 - **WebSocket**, JSON **text** frames, one JSON object per frame.
 - Every frame has a string field **`t`** (the message type). All other fields are
   type-specific (flat, no `{event,data}` nesting).
-- Hub listens on a single port (proposed **`4790`**). Path `/connect`. The same
+- Hub listens on a single port (proposed **`4790`**). Path `/connect` or `/` (both accepted, §3.4). The same
   port also answers plain HTTP on `/sonic/*` — the AudioMuse Tier-2 proxy (§14) —
   and `/lb/*`, the lb-bot proxy (§15), and `/hub/signin`, `/hub/signout` (§3.3) and
   `/hub/info` (§3.4): the last is open, and is how a client that holds no credential
@@ -321,8 +321,9 @@ GET /hub/info     (no authentication; a bearer, if sent, is ignored)
 Every address is stored normalised, and the record says where it came from.
 
 - **Normalising** (one function per client): trim; no scheme becomes `ws://`;
-  `http://` becomes `ws://` and `https://` becomes `wss://`; a trailing `/connect`,
-  then a trailing `/`, is dropped; **the path is kept**, so a hub behind a reverse
+  `http://` becomes `ws://` and `https://` becomes `wss://`; a trailing `/` is dropped, then a trailing
+  `/connect`, then a trailing `/` again (so `…/connect/` and `…/connect` both give the
+  base, and `…/connect/` is never left as `…/connect`); **the path is kept**, so a hub behind a reverse
   proxy at a subpath works. Every derived URL appends to that base: `<base>/hub/info`,
   `<base>/hub/signin`, `<base>/lb/…`, and the socket at `<base>` (the hub accepts `/`
   and `/connect`).
@@ -336,8 +337,8 @@ Every address is stored normalised, and the record says where it came from.
   `fc00::/7`, `fe80::/10`; the names `localhost` and `*.local`. Tailscale also counts as
   private: `100.64.0.0/10` and `*.ts.net`. Everything else, any other DNS name
   included, is public.
-- **Plain text only where it is safe.** A `ws://` address is used, offered as found or
-  kept as learned only when it is private. A found `http://` answer on any other host
+- **Plain text only where it is safe.** A `ws://` address is used, or offered as found,
+  only when it is private (a `learned` address is never `ws://`, above). A found `http://` answer on any other host
   is not offered. A **typed** public `ws://` address is the person's own choice and
   still works, marked "not encrypted".
 
@@ -350,8 +351,8 @@ Every address is stored normalised, and the record says where it came from.
    `service: "worbus"` and, once the record holds a `serverId`, that same id. Only then
    is the WebSocket opened there and the device secret sent. The first address that
    passes is the **active address** and is stamped `lastOkAt`. **Nothing secret goes
-   to an address that has not passed:** no device secret, Navidrome password, salt or
-   token, in a probe or after one.
+   to an address that has not passed** (the one exception is the rollback fallback of
+   step 4): no device secret, Navidrome password, salt or token, in a probe or after one.
 3. **Another server's id is skipped,** never removed: it is a different network where
    the same LAN address belongs to someone else. The client logs it once.
 4. **An older server** (`/hub/info` answers 426 or 404) while the record has no
@@ -370,13 +371,15 @@ network change, and on wake. A changed `welcome.server`, a newly found home addr
 coming home does not move a live socket.
 
 **HTTP calls follow the socket.** Every proxied call (lb-bot, AudioMuse, stations,
-moods, previews) and sign-in use the socket's active address, never a choice of their
+moods, previews), sign-in and sign-out use the socket's active address, never a choice of their
 own, so one device never splits across two routes; the cast bridges' sockets use it
 too.
 
 **Per-server data is keyed by `serverId`,** not by address: a client re-keys what it
 held under an address on the first `welcome` that carries `server.id`, and wipes only
-when the id is a different one.
+when the id is a different one. (This `serverId` is the hub's identity. It is unrelated
+to the `serverId` on tracks and saved queues, §4.1 and §8.3, which names a Navidrome
+server inside a client.)
 
 **What this protects.** The `serverId` check stops a device secret going to the wrong
 server by accident, such as a friend's network that reuses the same LAN address. It
@@ -384,10 +387,17 @@ does not stop a deliberate impostor on the person's own LAN, who can copy the id
 `/hub/info`; plain `ws://` on a LAN never could be protected. A `wss://` address is
 protected by its certificate.
 
-**Looking for a server** is the clients' side (design `DESIGN-worbus-p3-discovery`
-§6.4): only `GET /hub/info` is sent, to the Navidrome host on port 4790 and, on a tap,
-to the device's own /24 on port 4790 (at most 32 probes at a time, 700 ms each, 10 s in
-all, only on Wi-Fi or Ethernet).
+**Looking for a server** is the clients' side. Only `GET /hub/info` is sent, and only to
+these candidates, in this order:
+
+1. **The Navidrome host, port 4790,** over `http://`.
+2. **Sibling names,** when Navidrome's host is a DNS name of at least three labels
+   (`music.example.com`): `https://hub.<parent>` and `https://worbus.<parent>`
+   (`https://hub.example.com`, `https://worbus.example.com`), that is two requests to
+   the person's own domain.
+3. **The device's own /24, port 4790, only on a tap** (**Look on this network**, or
+   **Find home address** for a set server that has no private address): at most 32
+   probes at a time, 700 ms each, 10 s in all, only on Wi-Fi or Ethernet.
 
 #### Configuration
 
