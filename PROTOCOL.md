@@ -60,7 +60,9 @@ it is purely a controller. Every device is always a potential controller.
   type-specific (flat, no `{event,data}` nesting).
 - Hub listens on a single port (proposed **`4790`**). Path `/connect`. The same
   port also answers plain HTTP on `/sonic/*` — the AudioMuse Tier-2 proxy (§14) —
-  and `/lb/*`, the lb-bot proxy (§15).
+  and `/lb/*`, the lb-bot proxy (§15), and `/hub/signin`, `/hub/signout` (§3.3) and
+  `/hub/info` (§3.4): the last is open, and is how a client that holds no credential
+  asks which server an address is.
 - **Heartbeat:** WS ping/pong every 10 s (mirrors Feishin's existing
   `PING_TIMEOUT_MS`). A receiver missing 2 pongs is marked `online:false` and, if
   it was active, the session is auto-paused (queue/index/position retained).
@@ -92,6 +94,8 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                  "features": ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station",
                               "stationEdits"],
                  "user": { "name":"bob", "admin":false, "primary":false },  // §3.3
+                 "server": { "id":"<32 hex>", "name":"Worbus Server",
+                             "publicUrl":"wss://hub.example.org" },          // §3.4; publicUrl optional
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899",
@@ -123,6 +127,12 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
   hub sends `{"t":"user","user":{name, admin, primary}}` to that user's sockets;
   clients apply it like `welcome.user`, so admin actions appear or vanish in
   place. An older hub sends neither: a client then behaves as today.
+- `welcome.server` (Worbus P3) is which server this is and where it may be reached
+  from away: `id` is the `serverId` of §3.4 (the same as `GET /hub/info` answers),
+  `name` is `HUB_NAME`, and `publicUrl`, present only when `HUB_PUBLIC_URL` is set, is
+  that address as `wss://…` (§3.4). It is the same for every user. It is the only
+  place the hub gives out an address, so only a signed-in device learns it. An older
+  hub sends no `server`: a client then behaves as before.
 - If `device.id` is null the hub mints a UUID; the client persists it and reuses
   it on every future `hello` (so reconnects don't create duplicate devices).
 - `kind` says what the device is, for the icon a picker draws: `computer`, `phone`,
@@ -267,6 +277,128 @@ on; off, it is `401` on client routes (lb-bot's inbound pushes, §15.1, keep usi
 - **A partial list signs nobody out.** When `GET /api/user` answers with an
   `X-Total-Count` larger than the rows it holds (one page of a paginated list),
   the users it holds are updated and nobody missing from it is signed out.
+
+### 3.4 Finding a server and choosing an address — Worbus P3
+
+A client keeps one record per server and has to decide, on every (re)connect, which
+of the addresses it knows to dial. The hub's part is small: a stable identity, an
+open question that answers it, and one optional public address. Everything else in
+this section is the clients' contract, identical in both.
+
+#### `GET /hub/info`
+
+```
+GET /hub/info     (no authentication; a bearer, if sent, is ignored)
+  -> 200 Content-Type: application/json
+     {"service":"worbus","serverId":"<32 lower-case hex>","name":"<HUB_NAME>","signin":true}
+```
+
+- On the hub's main port, next to `/hub/signin` and `/hub/signout`. **Any other
+  method** is `405 {"error":"method not allowed"}`. No CORS headers.
+- **A constant of the process.** It reads no state, calls neither Navidrome nor
+  lb-bot, and is the same bytes for every caller: with no bearer, a device secret, the
+  legacy token or garbage. It is cheap enough for a sweep of a /24.
+- **It carries no address**, neither `HUB_PUBLIC_URL` nor the one it was asked at: a
+  server the person has not chosen must not be able to point a client anywhere
+  (`welcome.server.publicUrl`, §3.1, reaches signed-in devices only).
+- `service` is a wire constant that is never shown and never renamed. `signin: true`
+  says `POST /hub/signin` (§3.3) exists. `name` is for display.
+- **`serverId`** is 16 random bytes as 32 lower-case hex characters, minted on the
+  hub's first start and never changed. It lives in its own file beside the state,
+  `<HUB_STATE>.server-id` (one line), not inside `state.json`, so a hub rolled back to
+  project 2, which rewrites `state.json`, cannot drop it: the next upgrade keeps the
+  same id. A file that exists but does not hold exactly that stops the hub at start,
+  with a message naming it; it is never silently replaced, because a new id makes every
+  client see a new server. Deleting the state directory makes a new server, which is
+  true.
+- With `HUB_DEBUG=true` the hub logs `hub/info from <remote address>` for each request.
+- **A project 2 hub** knows no such route and answers it `426 Upgrade Required` (the
+  WebSocket handshake refusing a plain GET); a reverse proxy that passes only
+  WebSocket upgrades may answer `404`. A client treats both as **older** (below).
+
+#### Addresses
+
+Every address is stored normalised, and the record says where it came from.
+
+- **Normalising** (one function per client): trim; no scheme becomes `ws://`;
+  `http://` becomes `ws://` and `https://` becomes `wss://`; a trailing `/connect`,
+  then a trailing `/`, is dropped; **the path is kept**, so a hub behind a reverse
+  proxy at a subpath works. Every derived URL appends to that base: `<base>/hub/info`,
+  `<base>/hub/signin`, `<base>/lb/…`, and the socket at `<base>` (the hub accepts `/`
+  and `/connect`).
+- **Where an address came from** (`source`): `typed` and `found` are the person's
+  (typed by them, or tapped after the client found it); `learned` came from an
+  authenticated `welcome.server.publicUrl`. A `learned` address is added, replaced or
+  removed to match each `welcome.server.publicUrl`, is only ever `wss://`, and is not
+  added back once the person removed it.
+- **Private** is a test on the normalised address's host: IPv4 `127.0.0.0/8`,
+  `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`; IPv6 `::1`,
+  `fc00::/7`, `fe80::/10`; the names `localhost` and `*.local`. Tailscale also counts as
+  private: `100.64.0.0/10` and `*.ts.net`. Everything else, any other DNS name
+  included, is public.
+- **Plain text only where it is safe.** A `ws://` address is used, offered as found or
+  kept as learned only when it is private. A found `http://` answer on any other host
+  is not offered. A **typed** public `ws://` address is the person's own choice and
+  still works, marked "not encrypted".
+
+**Choosing an address, on every (re)connect:**
+
+1. **Order:** private addresses first, then the rest; within each group, the one that
+   worked last first.
+2. **Check, then connect.** For each address in turn, `GET <base>/hub/info` (timeout
+   1500 ms for a private address, 5000 ms for any other). It must answer
+   `service: "worbus"` and, once the record holds a `serverId`, that same id. Only then
+   is the WebSocket opened there and the device secret sent. The first address that
+   passes is the **active address** and is stamped `lastOkAt`. **Nothing secret goes
+   to an address that has not passed:** no device secret, Navidrome password, salt or
+   token, in a probe or after one.
+3. **Another server's id is skipped,** never removed: it is a different network where
+   the same LAN address belongs to someone else. The client logs it once.
+4. **An older server** (`/hub/info` answers 426 or 404) while the record has no
+   `serverId`: the typed address is used exactly as before, alone; failover starts once
+   the server has said who it is. **The same answer once the record has a `serverId`**
+   means the hub was rolled back to project 2, or a proxy passes only WebSocket
+   upgrades: a `typed` or `found` address that last passed with this id is then used
+   without the check, and a `learned` one never is. (The accepted residual risk: a
+   project 2 hub at the same private address on someone else's network.)
+5. **None passes:** "Can't reach the Worbus Server", and the backoff of §3 retries the
+   whole list each time.
+
+**A working socket is never moved.** An active receiver pauses when its socket drops
+(§7), so the order is re-evaluated only when a socket has dropped: on reconnect, on a
+network change, and on wake. A changed `welcome.server`, a newly found home address or
+coming home does not move a live socket.
+
+**HTTP calls follow the socket.** Every proxied call (lb-bot, AudioMuse, stations,
+moods, previews) and sign-in use the socket's active address, never a choice of their
+own, so one device never splits across two routes; the cast bridges' sockets use it
+too.
+
+**Per-server data is keyed by `serverId`,** not by address: a client re-keys what it
+held under an address on the first `welcome` that carries `server.id`, and wipes only
+when the id is a different one.
+
+**What this protects.** The `serverId` check stops a device secret going to the wrong
+server by accident, such as a friend's network that reuses the same LAN address. It
+does not stop a deliberate impostor on the person's own LAN, who can copy the id from
+`/hub/info`; plain `ws://` on a LAN never could be protected. A `wss://` address is
+protected by its certificate.
+
+**Looking for a server** is the clients' side (design `DESIGN-worbus-p3-discovery`
+§6.4): only `GET /hub/info` is sent, to the Navidrome host on port 4790 and, on a tap,
+to the device's own /24 on port 4790 (at most 32 probes at a time, 700 ms each, 10 s in
+all, only on Wi-Fi or Ethernet).
+
+#### Configuration
+
+| Env (on the hub) | Meaning |
+|---|---|
+| `HUB_NAME` | optional; the name clients show, trimmed, 1 to 40 characters, default `Worbus Server`. Longer, or blank while set, stops the hub at start |
+| `HUB_PUBLIC_URL` | optional; the address clients may use away from home, given to signed-in devices as `welcome.server.publicUrl`. `wss://host[:port][/path]`, or `https://…`, which is stored as `wss://…`; a trailing `/` and a trailing `/connect` are dropped, a path is kept. **Must be `wss://`:** `ws://` or `http://` (a device secret would cross the internet in plain text), a value with no host, one that does not parse and `.env.example`'s placeholder `wss://hub.example.com` all stop the hub at start, naming the setting |
+
+The hub never learns its own LAN address (in a Docker bridge container it cannot see
+the host's), so there is no setting for it: the home address is what the person typed
+or the client found.
 
 ---
 

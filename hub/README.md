@@ -39,6 +39,8 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `HUB_PORT` | `4790` | listen port |
 | `HUB_HEALTH_PORT` | `HUB_PORT`+1 | plain-HTTP health endpoint, for Docker healthchecks |
 | `HUB_STATE` | `/data/state.json` | persisted session + device registry |
+| `HUB_NAME` | `Worbus Server` | the name clients show for this server (`GET /hub/info`, `welcome.server`). Trimmed, 1 to 40 characters; longer, or blank while set, stops the hub at start |
+| `HUB_PUBLIC_URL` | *(empty)* | the address clients may use away from home, given to signed-in devices in `welcome.server.publicUrl`. `wss://host[:port][/path]` (or `https://…`, stored as `wss://…`). `ws://`, `http://`, a value with no host and `.env.example`'s placeholder stop the hub at start. Unset: clients keep only the address they were given at home |
 | `HUB_DEVICE_TTL_DAYS` | `7` | drop devices unseen for this many days (at start and hourly), and with each its sign-in; a sign-in whose device never said hello lasts this long too. `0` keeps devices **and their sign-ins** forever; unset or blank is `7` |
 | `HUB_DEBUG` | `false` | per-frame logging at ~1 Hz; very noisy |
 | `NAVIDROME_URL` | *(empty)* | your Navidrome base URL. **Required**: devices sign in against it |
@@ -64,6 +66,29 @@ Clients then connect to `ws://<unraid-host>:4790`.
 
 The hub refuses to start without `NAVIDROME_URL`, `HUB_ND_USER` and `HUB_ND_PASS`,
 naming the missing setting (never a value), and with `.env.example`'s placeholder values.
+
+### Finding the server, and its public address (Worbus project 3)
+
+- **`GET /hub/info`** is open and answers who this server is, with no address and
+  nothing read from Navidrome: `{"service":"worbus","serverId":…,"name":…,"signin":true}`.
+  Clients use it to look for a server, and to check an address is the server they know
+  before they send it a secret (`../PROTOCOL.md` §3.4).
+- **`serverId`** is minted at the first start and kept in `<HUB_STATE>.server-id`, one
+  line beside `state.json`. Keep that file with the state: a hub that starts without it
+  is a new server to every client, and a file that does not hold 32 lower-case hex
+  characters stops the hub at start (it is never replaced). A rollback to the previous
+  hub keeps it.
+- **Setting the public address.** `HUB_PUBLIC_URL` is the address your devices reach the
+  hub at from outside, for example the hostname a reverse proxy or a Cloudflare tunnel
+  routes to port 4790: `HUB_PUBLIC_URL=wss://hub.example.org`. Each signed-in device
+  learns it from `welcome.server.publicUrl` and uses it when the home address does not
+  answer, with no typing. **It must be `wss://`** (an `https://` value is stored as
+  `wss://`): the device secret travels over it, so a plain `ws://` address would send it
+  across the internet unencrypted, and the hub refuses to start with one. Behind a
+  proxy, the hub needs no TLS itself: the proxy terminates it and passes the WebSocket
+  upgrade through. The hub does not learn its home address, so there is no setting for
+  it; clients take that from what the person typed or the network look finds. A path is
+  kept (`wss://example.org/worbus`), and a trailing `/connect` or `/` is dropped.
 
 ### Users and devices (Worbus project 2)
 
