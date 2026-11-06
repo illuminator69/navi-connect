@@ -51,7 +51,8 @@ Clients then connect to `ws://<unraid-host>:4790`.
 | `AUDIOMUSE_URL` | *(empty)* | AudioMuse-AI core API; unset disables the Tier-2 proxy |
 | `AUDIOMUSE_TOKEN` | *(empty)* | AudioMuse API token — server-side only, never sent to clients |
 | `LBBOT_URL` | *(empty)* | lb-bot base URL; unset disables the `/lb/*` proxy and hides the surface in every client. The hub calls it with `Authorization: Bearer <HUB_TOKEN>`, so lb-bot's `LB_BOT_HUB_TOKEN` must be this `HUB_TOKEN` (and its `LB_BOT_HUB_URL` this hub's http:// address; both required on lb-bot since Worbus P1) |
-| `LBBOT_WEB_URL` | `LBBOT_URL` | where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links. Set it when `LBBOT_URL` is a Docker-internal name |
+| `LBBOT_WEB_URL` | `LBBOT_URL`, unless that is loopback | where a person opens lb-bot's web UI, for the clients' "Open in lb-bot" links. Set it when `LBBOT_URL` is a Docker-internal name. A loopback `LBBOT_URL` (the Worbus Server's `127.0.0.1:8899`) is never offered: the hub sends `""` and each client builds the link from its own server address, at home only |
+| `WORBUS_VERSION`, `WORBUS_COMMIT` | unset | set by the Worbus Server image's build args; the hub sends `welcome.server.version` (`0.4.0 (678af87)`) and logs `Worbus Server <version>` first. Unset, no `version` key |
 | `PREVIEW_URL` | *(empty)* | the preview sidecar as the hub reaches it; unset disables `/preview/*` (`../preview/README.md`) |
 | `PREVIEW_PUBLIC_URL` | *(empty)* | the sidecar as a client or a Chromecast reaches it; in practice required with `PREVIEW_URL` |
 | `PREVIEW_SECRET` | *(empty)* | signs preview stream URLs; must match the sidecar's and must not be `HUB_TOKEN`. With `PREVIEW_URL` set, the hub refuses to start when it is empty or `.env.example`'s `change-me…` value |

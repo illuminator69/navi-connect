@@ -18,6 +18,7 @@ import dataclasses
 import hashlib
 import hmac
 import http
+import ipaddress
 import json
 import math
 import os
@@ -117,6 +118,27 @@ _SERVER_ID_RE = re.compile(r"[0-9a-f]{32}")
 # as it is would hand every client an address that is not this server.
 _PUBLIC_URL_EXAMPLE = "wss://hub.example.com"
 
+# Worbus P4 (design §6.7): the release this hub belongs to, set by the server image's
+# build args. `welcome.server.version` carries the display form, `0.4.0 (678af87)`;
+# unset (a plain hub, a suite) means no `version` key at all. `/hub/info` never
+# carries it: it says nothing a stranger's scan could use.
+WORBUS_VERSION_RAW = os.environ.get("WORBUS_VERSION")
+WORBUS_COMMIT_RAW = os.environ.get("WORBUS_COMMIT")
+
+
+def server_version(version: Optional[str], commit: Optional[str]) -> Optional[str]:
+    """`0.4.0 (678af87)` from WORBUS_VERSION and WORBUS_COMMIT, or None when the
+    version is unset or blank. The commit is cut to its 7-character short form; with
+    no commit the version stands alone."""
+    v = (version or "").strip()
+    if not v:
+        return None
+    c = (commit or "").strip()[:7]
+    return f"{v} ({c})" if c else v
+
+
+SERVER_VERSION = server_version(WORBUS_VERSION_RAW, WORBUS_COMMIT_RAW)
+
 # AudioMuse-AI core (Tier 2) — proxied over this same port so clients never hold
 # the AudioMuse token or the Navidrome password. Unset URL = proxy disabled.
 AUDIOMUSE_URL = os.environ.get("AUDIOMUSE_URL", "").rstrip("/")
@@ -132,7 +154,11 @@ LBBOT_URL = os.environ.get("LBBOT_URL", "").rstrip("/")
 # LBBOT_URL, which on a LAN setup is the same address; set it when people reach
 # lb-bot through something else (a reverse proxy, a hostname). It is only a
 # link: nothing is proxied through it and it grants nothing the hub token does
-# not already reach on the same network.
+# not already reach on the same network. A LOOPBACK LBBOT_URL is never offered
+# (Worbus P4, design §6.4): inside the Worbus Server container lb-bot is
+# http://127.0.0.1:8899, which opens nothing on a phone, so with LBBOT_WEB_URL
+# unset the hub sends "" and each client builds the link from its own server
+# address (home network only).
 LBBOT_WEB_URL = os.environ.get("LBBOT_WEB_URL", "").rstrip("/")
 
 # yt-dlp preview sidecar — turns "what does this album I don't own sound like"
@@ -2681,6 +2707,20 @@ def _lb_missing_config_of(data: bytes) -> Optional[tuple]:
                          if isinstance(v, str) and _LB_CONFIG_NAME_RE.match(v)}))
 
 
+def _is_loopback_url(url: str) -> bool:
+    """True when `url`'s host is loopback: `localhost`, 127.0.0.0/8 or ::1."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class LbProxy(HttpProxy):
     """lb-bot library-gap intelligence (design: ../DESIGN-lbbot-client-integration.md)."""
 
@@ -2879,11 +2919,20 @@ class LbProxy(HttpProxy):
         """lb-bot's web UI for a person to open, or "" while the proxy is off.
 
         LBBOT_WEB_URL when set, else the upstream the hub itself reaches — the
-        same address on a LAN install. Only ever an http(s) URL: a client opens
-        it in a browser, so anything else is not passed on."""
+        same address on a LAN install — unless that upstream is loopback (the
+        Worbus Server container's 127.0.0.1:8899), which is never offered: ""
+        then, and the client builds the link (PROTOCOL §15, design §6.4). Only
+        ever an http(s) URL: a client opens it in a browser, so anything else is
+        not passed on."""
         if not self.enabled:
             return ""
-        url = LBBOT_WEB_URL or self.upstream
+        if LBBOT_WEB_URL:
+            url = LBBOT_WEB_URL
+        elif _is_loopback_url(self.upstream):
+            # Worbus P4: the container's internal address; a client builds its own.
+            return ""
+        else:
+            url = self.upstream
         return url if url.startswith(("http://", "https://")) else ""
 
     def _set_available(self, value: bool, downloads: Any = _LB_KEEP,
@@ -9785,12 +9834,16 @@ class Hub:
             log("device credential sweep error:", e)
 
     def server_info(self) -> dict:
-        """`welcome.server` (PROTOCOL §3.1): `{id, name, publicUrl?}`. `publicUrl` is
+        """`welcome.server` (PROTOCOL §3.1): `{id, name, publicUrl?, version?}`. `publicUrl` is
         left out when HUB_PUBLIC_URL is unset, so a client never reads a null as an
         address. The same for every user."""
         info = {"id": self.server_id, "name": self.server_name}
         if self.public_url:
             info["publicUrl"] = self.public_url
+        # Worbus P4 (design §6.7): `0.4.0 (678af87)`, left out when WORBUS_VERSION
+        # is unset.
+        if SERVER_VERSION:
+            info["version"] = SERVER_VERSION
         return info
 
     def info_body(self) -> dict:
@@ -10480,6 +10533,9 @@ def _check_auth_config() -> None:
 
 
 async def main() -> None:
+    if SERVER_VERSION:
+        # The first line of the log (design §6.7): which release this is.
+        log(f"Worbus Server {SERVER_VERSION}")
     _check_auth_config()
     # Before the Hub exists, so a damaged identity file stops the start before
     # anything is read or written (design §6.1: never silently replaced).

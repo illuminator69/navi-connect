@@ -259,10 +259,13 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
             failures.append("the sync route is not advertised in welcome.lb.routes")
         # Where a client sends the user for lb-bot's own workspace: LBBOT_WEB_URL
         # when set, else the address the hub itself proxies to — and the same
-        # value from /lb/status as from the welcome.
+        # value from /lb/status as from the welcome. This stub is on loopback,
+        # which since Worbus P4 is never offered (the container's own
+        # 127.0.0.1:8899): "" from both. The non-loopback fallback and
+        # LBBOT_WEB_URL are proven in test_lb_web_url.py.
         status_web = json.loads(b).get("webUrl") if s == 200 else None
-        if lb.get("webUrl") != lb_url or status_web != lb_url:
-            failures.append(f"webUrl should fall back to LBBOT_URL {lb_url!r}: "
+        if lb.get("webUrl") != "" or status_web != "":
+            failures.append(f"a loopback LBBOT_URL {lb_url!r} must not be offered as webUrl: "
                             f"welcome {lb.get('webUrl')!r}, /lb/status {status_web!r}")
         if s == 200 and json.loads(b).get("upstreamReachable") is not True:
             failures.append(f"/lb/status reports lb-bot unreachable: {b[:120]!r}")
