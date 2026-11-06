@@ -11,7 +11,9 @@ Runs under tini as PID 1 in the `worbus-server` image, or by hand outside one
      `<root>/hub/service-secret`;
   2. starts the hub and lb-bot as two child processes and prefixes every line they
      print with `[hub] ` or `[lb-bot] `, so `docker logs worbus-server` reads as one log;
-     its own lines start `[worbus] `;
+     its own lines start `[worbus] `. Every child line first goes through the shared
+     redaction rule (`worbus_redact.py`, ruling R17), so no password, token or Subsonic
+     login a child prints reaches `docker logs`;
   3. restarts a child that exits, after 1, 2, 4 ... 60 s, without touching the other
      (playback lives in the hub, and an lb-bot crash must not drop a client socket);
      five exits of one child within 600 s stop the whole server, with a last line
@@ -23,6 +25,7 @@ It never prints a setting's value: only names, paths and exit statuses.
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -33,6 +36,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+# worbus_redact.py sits beside this file (/app/server in the image). Put that folder on
+# the path explicitly, so the import holds under `python -I` or PYTHONSAFEPATH too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from worbus_redact import redact  # noqa: E402
 
 REQUIRED = ("NAVIDROME_URL", "NAVIDROME_USER", "NAVIDROME_PASSWORD")
 # server/.env.example's placeholders, copied as they are: refused by name.
@@ -203,21 +211,36 @@ class Supervisor:
         self.clock = clock or RealClock()
         self._out = out or _stdout_line
         self._out_lock = threading.Lock()
-        self._stop = threading.Event()
+        # A plain flag, not an Event: SIGTERM's handler runs on the main thread, maybe
+        # while that thread is setting the flag itself (the fifth crash), and an
+        # Event's non-reentrant lock would then deadlock it. The loop polls on TICK.
+        self._stop_requested = False
         self.events: list[tuple[float, str, str, float]] = []
         self.failed: Optional[str] = None
 
     # -- output -------------------------------------------------------------- #
-    def say(self, line: str) -> None:
+    def _write(self, line: str) -> None:
+        """One line out. A write that fails (a closed stdout, a locale that cannot
+        encode it) drops that line and nothing else: a reader that died here would
+        leave its child blocked on a full pipe."""
         with self._out_lock:
-            self._out(f"[worbus] {line}")
+            try:
+                self._out(line)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def say(self, line: str) -> None:
+        self._write(f"[worbus] {line}")
 
     def _pump(self, child: Child, stream) -> None:
         prefix = f"[{child.name}] "
         for raw in iter(stream.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            with self._out_lock:
-                self._out(prefix + line)
+            try:
+                line = redact(line)
+            except Exception:  # noqa: BLE001
+                line = "(a line the redaction rule could not read was dropped)"
+            self._write(prefix + line)
         stream.close()
 
     def _event(self, kind: str, child: Child, detail: float = 0.0) -> None:
@@ -225,7 +248,11 @@ class Supervisor:
 
     # -- lifecycle ----------------------------------------------------------- #
     def request_stop(self) -> None:
-        self._stop.set()
+        """Safe from a signal handler: one attribute store, no lock."""
+        self._stop_requested = True
+
+    def _stopping(self) -> bool:
+        return self._stop_requested
 
     def _start(self, child: Child) -> None:
         try:
@@ -262,7 +289,7 @@ class Supervisor:
             self.failed = child.name
             self.say(f"{child.name} {how}: {CRASH_LIMIT} exits within "
                      f"{int(CRASH_WINDOW // 60)} minutes; stopping the Worbus Server")
-            self._stop.set()
+            self._stop_requested = True
             return
         child.quick_exits = 1 if ran >= STABLE_RUN else child.quick_exits + 1
         delay = min(BACKOFF_CAP, BACKOFF_FIRST * 2 ** (child.quick_exits - 1))
@@ -276,11 +303,11 @@ class Supervisor:
     def run(self) -> int:
         for child in self.children:
             self._start(child)
-            if self._stop.is_set():
+            if self._stopping():
                 break
-        while not self._stop.is_set():
+        while not self._stopping():
             for child in self.children:
-                if self._stop.is_set():
+                if self._stopping():
                     break
                 if child.proc is not None:
                     status = child.proc.poll()
@@ -288,7 +315,7 @@ class Supervisor:
                         self._exited(child, status)
                 elif child.restart_at is not None and self.clock.monotonic() >= child.restart_at:
                     self._start(child)
-            if not self._stop.is_set():
+            if not self._stopping():
                 self.clock.sleep(TICK)
         self._shutdown()
         if self.failed:
@@ -356,17 +383,25 @@ def main(argv: list[str], *, environ: Optional[dict] = None, clock=None,
     say(first or "Worbus Server (no WORBUS_VERSION: a build from source)")
     root = Path(str(env.get("WORBUS_DATA") or "").strip() or "/data")
     secret_file = root / "hub" / SECRET_NAME
-    had_secret_file = secret_file.exists()
     try:
         for sub in ("hub", "lb-bot"):
-            (root / sub).mkdir(parents=True, exist_ok=True)
+            folder = root / sub
+            folder.mkdir(parents=True, exist_ok=True)
+            # Both halves write here; a folder this uid cannot search and write is
+            # refused now, by name, not later as a child's crash loop.
+            if not os.access(folder, os.R_OK | os.W_OK | os.X_OK):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(folder))
+        # Inside the try: Path.exists() raises PermissionError on EACCES (3.12).
+        had_secret_file = secret_file.exists()
         envs = fill_env(env, root)
     except ConfigRefusal as e:
         say(f"refusing to start: {e}")
         return 1
     except OSError as e:
-        say(f"refusing to start: the data folder {root} is not writable "
-            f"({type(e).__name__}: {e.strerror}). Check the volume and the compose `user:`.")
+        where = e.filename if e.filename else root
+        say(f"refusing to start: the data folder {where} cannot be read or written by this "
+            f"user ({type(e).__name__}: {e.strerror or e}). Check the volume's owner and the "
+            "compose `user:`.")
         return 1
     for half in ("hub", "lb-bot"):
         names = filled_names(env, envs[half])

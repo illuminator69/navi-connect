@@ -28,7 +28,7 @@ RUN apt-get update \
 COPY hub/requirements.txt /app/hub/requirements.txt
 RUN pip install --no-cache-dir -r /app/hub/requirements.txt
 COPY hub/hub.py /app/hub/hub.py
-COPY server/worbus_launch.py server/healthcheck.py /app/server/
+COPY server/worbus_launch.py server/worbus_redact.py server/healthcheck.py /app/server/
 
 ARG WORBUS_VERSION=""
 ARG WORBUS_COMMIT=""
@@ -48,8 +48,9 @@ LABEL org.opencontainers.image.title="Worbus Server" \
 EXPOSE 4790 8899
 VOLUME /data
 
-# Four misses 30 s apart (about two minutes) before an lb-bot the launcher is
-# restarting reads as unhealthy.
+# Four misses in a row, 30 s apart, before an lb-bot the launcher is restarting reads
+# as unhealthy: 90 to 120 s after it stops answering, depending on where the first
+# miss falls between two probes.
 HEALTHCHECK --start-period=120s --interval=30s --timeout=5s --retries=4 \
     CMD ["python", "/app/server/healthcheck.py"]
 

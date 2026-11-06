@@ -43,8 +43,10 @@ One tracker for every piece.
 
    **Healthy** looks like `Up 1 minute (healthy)`; give it up to two minutes on the first start.
    `docker logs worbus-server` starts with `[worbus] Worbus Server 0.4.0 (abc1234)`, and every line after it
-   says which half wrote it, `[hub]` or `[lb-bot]`. If a required setting is missing or wrong, the server stops
-   and its last line names the setting.
+   says which half wrote it, `[hub]` or `[lb-bot]`. If a required setting is missing, blank or still the example
+   value, or the `data` folder is not writable by that `user:`, the server stops and its last line names the
+   setting or the folder. A value that is set but wrong (a mistyped address, a wrong password) is not caught at
+   the start: the `[hub]` and `[lb-bot]` lines say what failed.
 
 The server listens on port **4790** for the apps, and on **8899** for lb-bot's own page (settings, placement and
 review; it asks for your Navidrome login). Remove the 8899 line in `compose.yaml` to keep that page off your
@@ -90,8 +92,8 @@ proxy; without it, the apps' **Open in lb-bot** works only at home.
 
 ## 6. Sending logs
 
-Attach these to your issue. None of them holds a password, token or other secret: each is cleaned before it
-leaves.
+Attach these to your issue. Each is cleaned before it leaves, line by line: passwords, tokens, keys and
+Navidrome logins in a line are replaced with `[removed]`. Still read the file once before you send it.
 
 - **The server:**
 

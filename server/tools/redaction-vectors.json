@@ -1,0 +1,141 @@
+{
+ "mark": "[removed]",
+ "rule": "See RULE.md beside this file. Apply in order: (a) quoted JSON fields, (b) unquoted name=value / name: value fields, (c) bare 'bearer <cred>', (d) Subsonic u/t/s/p query parameters, (e) userinfo in a URL. Sensitive field name = contains (case-insensitive) password, secret, token, apikey, key or authorization.",
+ "cases": [
+  {
+   "name": "subsonic_params",
+   "input": "GET https://nd.example.org/rest/stream?u=bob&t=abc123&s=def456&v=1.16.1&c=navic&id=tr-1",
+   "output": "GET https://nd.example.org/rest/stream?u=[removed]&t=[removed]&s=[removed]&v=1.16.1&c=navic&id=tr-1"
+  },
+  {
+   "name": "subsonic_p_enc",
+   "input": "cover https://nd.example.org/rest/getCoverArt?id=al-9&p=enc:7365637265743132&u=alice&size=300",
+   "output": "cover https://nd.example.org/rest/getCoverArt?id=al-9&p=[removed]&u=[removed]&size=300"
+  },
+  {
+   "name": "bearer_header",
+   "input": "Authorization: Bearer eyJhbGciOi.payload.sig",
+   "output": "Authorization: [removed]"
+  },
+  {
+   "name": "bearer_header_lower",
+   "input": "authorization: bearer eyJhbGciOi.payload.sig",
+   "output": "authorization: [removed]"
+  },
+  {
+   "name": "bearer_bare_upper",
+   "input": "-> request with BEARER zzz999 attached",
+   "output": "-> request with BEARER [removed] attached"
+  },
+  {
+   "name": "bearer_json_header",
+   "input": "{\"headers\":{\"Authorization\":\"Bearer abc.def\"}}",
+   "output": "{\"headers\":{\"Authorization\":\"[removed]\"}}"
+  },
+  {
+   "name": "json_password",
+   "input": "{\"username\":\"bob\",\"password\":\"hunter2\"}",
+   "output": "{\"username\":\"bob\",\"password\":\"[removed]\"}"
+  },
+  {
+   "name": "json_password_escaped_quote",
+   "input": "{\"password\":\"a\\\"b\",\"x\":1}",
+   "output": "{\"password\":\"[removed]\",\"x\":1}"
+  },
+  {
+   "name": "json_device_secret",
+   "input": "{\"deviceId\":\"d-1\",\"deviceSecret\":\"ds-1234\",\"name\":\"Pixel\"}",
+   "output": "{\"deviceId\":\"d-1\",\"deviceSecret\":\"[removed]\",\"name\":\"Pixel\"}"
+  },
+  {
+   "name": "json_token",
+   "input": "hello {\"t\":\"hello\",\"token\":\"tok-abc\",\"device\":\"d-1\"}",
+   "output": "hello {\"t\":\"hello\",\"token\":\"[removed]\",\"device\":\"d-1\"}"
+  },
+  {
+   "name": "json_nested_secret",
+   "input": "{\"hubAuth\":{\"deviceId\":\"d1\",\"secret\":\"s3cr3t\"}}",
+   "output": "{\"hubAuth\":{\"deviceId\":\"d1\",\"secret\":\"[removed]\"}}"
+  },
+  {
+   "name": "json_spaced",
+   "input": "{ \"apiKey\" : \"k-123\" }",
+   "output": "{ \"apiKey\" : \"[removed]\" }"
+  },
+  {
+   "name": "kv_apikey",
+   "input": "audiomuse apiKey=sk-123 ok",
+   "output": "audiomuse apiKey=[removed] ok"
+  },
+  {
+   "name": "kv_env_style",
+   "input": "SLSKD_API_KEY=abc HUB_TOKEN=tok2 HUB_NAME=home",
+   "output": "SLSKD_API_KEY=[removed] HUB_TOKEN=[removed] HUB_NAME=home"
+  },
+  {
+   "name": "kv_colon",
+   "input": "HubManager: token: abc123",
+   "output": "HubManager: token: [removed]"
+  },
+  {
+   "name": "kv_quoted",
+   "input": "password=\"hunter 2\" next",
+   "output": "password=\"[removed]\" next"
+  },
+  {
+   "name": "query_apikey",
+   "input": "GET http://am.local:8000/api/x?apiKey=abc&q=1",
+   "output": "GET http://am.local:8000/api/x?apiKey=[removed]&q=1"
+  },
+  {
+   "name": "url_inside_json",
+   "input": "{\"url\":\"https://nd.example.org/rest/stream?u=bob&t=abc&s=def&id=1\"}",
+   "output": "{\"url\":\"https://nd.example.org/rest/stream?u=[removed]&t=[removed]&s=[removed]&id=1\"}"
+  },
+  {
+   "name": "url_inside_escaped_json",
+   "input": "payload={\\\"src\\\":\\\"https://nd/rest/stream?id=1&t=abc&s=def\\\"}",
+   "output": "payload={\\\"src\\\":\\\"https://nd/rest/stream?id=1&t=[removed]&s=[removed]\\\"}"
+  },
+  {
+   "name": "json_escaped_password",
+   "input": "body=\"{\\\"user\\\":\\\"bob\\\",\\\"password\\\":\\\"hunter2\\\"}\"",
+   "output": "body=\"{\\\"user\\\":\\\"bob\\\",\\\"password\\\":\\\"[removed]\\\"}\""
+  },
+  {
+   "name": "json_escaped_token_spaced",
+   "input": "frame {\\\"t\\\":\\\"hello\\\", \\\"token\\\" : \\\"tok-9\\\"}",
+   "output": "frame {\\\"t\\\":\\\"hello\\\", \\\"token\\\" : \\\"[removed]\\\"}"
+  },
+  {
+   "name": "url_userinfo",
+   "input": "fetch https://bob:hunter2@nd.example.org/rest/ping",
+   "output": "fetch https://[removed]@nd.example.org/rest/ping"
+  },
+  {
+   "name": "plain_ping",
+   "input": "GET /rest/ping?v=1.16.1&c=navic ok",
+   "output": "GET /rest/ping?v=1.16.1&c=navic ok"
+  },
+  {
+   "name": "plain_player",
+   "input": "Player: track changed to 3 of 12 (id=tr-1)",
+   "output": "Player: track changed to 3 of 12 (id=tr-1)"
+  },
+  {
+   "name": "plain_words",
+   "input": "Pressed the key 5 times; token refresh scheduled",
+   "output": "Pressed the key 5 times; token refresh scheduled"
+  },
+  {
+   "name": "plain_json",
+   "input": "{\"t\":\"progress\",\"positionMs\":1200,\"index\":3}",
+   "output": "{\"t\":\"progress\",\"positionMs\":1200,\"index\":3}"
+  },
+  {
+   "name": "plain_url",
+   "input": "https://hub.example.org:4790/hub/info?format=json",
+   "output": "https://hub.example.org:4790/hub/info?format=json"
+  }
+ ]
+}

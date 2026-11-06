@@ -646,8 +646,9 @@ navi-connect/
   CLAUDE.md                      working notes for coding agents
   docs/ARCHITECTURE.md           ← this file
   docs/screenshots/              images used by the README
-  server/                        the Worbus Server image — Dockerfile, worbus_launch.py, healthcheck.py,
-                                 compose.yaml, .env.example, tools/
+  server/                        the Worbus Server image — Dockerfile, worbus_launch.py,
+                                 worbus_redact.py, healthcheck.py, compose.yaml,
+                                 .env.example, tools/
   hub/                           Python relay hub — hub.py, Dockerfile, docker-compose.yml, tools/
   preview/                       yt-dlp preview sidecar — preview.py, Dockerfile, docker-compose.yml,
                                  tools/. The MEDIA origin; the hub proxies its control plane only

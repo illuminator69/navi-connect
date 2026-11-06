@@ -32,6 +32,18 @@ clock (its `sleep` advances fake time and yields a few real milliseconds).
                                    file): none of the launcher's own lines carries them,
                                    in a normal start, a refusal and a crash loop; the
                                    children's own lines do (the plant reached them)
+  children_lines_redacted          (fix round, R17) a child prints a Subsonic URL with
+                                   planted u/t/s/p, a Bearer, a password= and URL userinfo:
+                                   none of them reaches the launcher's stdout, the lines do
+  data_folder_refused              (fix round, M1) a data root, `hub/` or `lb-bot/` the user
+                                   cannot search or write: the launcher's own refusal line
+                                   naming the folder, rc 1, no traceback, no child started
+  write_error_keeps_draining       (fix round, M2) the output raises on a child's line: that
+                                   line is dropped, the reader keeps draining, the child
+                                   never blocks on a full pipe
+  stop_request_takes_no_lock       (fix round, M3) request_stop (the signal handler's call)
+                                   returns while every lock the supervisor holds is held by
+                                   the same thread: no deadlock if SIGTERM lands mid-stop
 
 Exits non-zero on failure.
 """
@@ -120,6 +132,11 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "ignore-term" else term)
 print("hub says hello", flush=True)
 print("hub saw password " + os.environ.get("HUB_ND_PASS", ""), flush=True)
 print("hub saw token " + os.environ.get("HUB_TOKEN", ""), flush=True)
+if os.environ.get("T_LEAK"):
+    L = os.environ
+    print("upstream GET http://nd:4533/rest/getCoverArt?id=al-1&u=" + L["T_U"] + "&p=enc:"
+          + L["T_P"] + "&size=300", flush=True)
+    print('frame {"t":"hello","token":"' + L["T_T"] + '","device":"d-1"}', flush=True)
 while True:
     time.sleep(0.05)
 """
@@ -132,9 +149,21 @@ with open(d / "lb-starts", "a") as f:
 mode = os.environ.get("T_LB", "normal")
 print("lb-bot says hello", flush=True)
 print("lb-bot saw token " + os.environ.get("LB_BOT_HUB_TOKEN", ""), flush=True)
+if os.environ.get("T_LEAK"):
+    L = os.environ
+    print("  Navidrome error: HTTPConnectionPool(host='127.0.0.1', port=9): Max retries "
+          "exceeded with url: /rest/search3?u=" + L["T_U"] + "&t=" + L["T_T"] + "&s=" + L["T_S"]
+          + "&v=1.16.1&c=lbbot (Caused by NewConnectionError('refused'))", flush=True)
+    print("request headers {'Authorization': 'Bearer " + L["T_B"] + "'}", flush=True)
+    print("login password=" + L["T_P"] + " retry", flush=True)
+    print("fetch https://" + L["T_U"] + ":" + L["T_P"] + "@nd.example/rest/ping", flush=True)
 if mode == "crash":
     print("lb-bot boom", flush=True)
     sys.exit(1)
+if mode == "flood":
+    for i in range(3000):          # about 330 kB: five times a pipe's 64 KiB
+        print(f"lb-bot flood {i:05d} " + "x" * 90, flush=True)
+    (d / "flood-done").write_text("")
 def term(*_):
     with open(d / "lb-term", "a") as f:
         f.write(f"{time.time_ns()}\\n")
@@ -676,6 +705,162 @@ def t_launcher_never_prints_secrets() -> list[str]:
     return f
 
 
+LEAK = {"T_U": "leakuser7q", "T_T": "t0k3nv4lu3q", "T_S": "s4ltv4lu3q",
+        "T_B": "b34r3rv4lu3.q.z", "T_P": "pl4ntedpwq"}
+
+
+def t_children_lines_redacted() -> list[str]:
+    f: list[str] = []
+    output, rc = _launcher_output({"T_LEAK": "1", "HUB_TOKEN": "a" * 64, **LEAK}, None, 3.0)
+    for name, value in LEAK.items():
+        for ln in output.splitlines():
+            if value in ln:
+                f.append(f"{name}'s planted value reached stdout: "
+                         f"{ln.replace(value, '<PLANTED>')!r}")
+    # Positive control: the lines themselves were relayed, with the mark in them.
+    want = ("[lb-bot]   Navidrome error: HTTPConnectionPool", "[lb-bot] request headers",
+            "[lb-bot] login password=[removed]", "[lb-bot] fetch https://[removed]@nd.example",
+            "[hub] upstream GET http://nd:4533/rest/getCoverArt", '[hub] frame {"t":"hello"')
+    for w in want:
+        if not any(ln.startswith(w) for ln in output.splitlines()):
+            f.append(f"no relayed line starts {w!r}: the check above proves nothing")
+    if output.count("[removed]") < 9:
+        f.append(f"{output.count('[removed]')} marks, expected at least 9")
+    if rc != 0:
+        f.append(f"launcher exited {rc}")
+    return f
+
+
+def t_data_folder_refused() -> list[str]:
+    f: list[str] = []
+    cases = (("the data root unsearchable", "", 0o000, {}),
+             ("hub/ unsearchable", "hub", 0o000, {}),
+             ("hub/ read-only", "hub", 0o500, {}),
+             ("lb-bot/ read-only, secret from the env", "lb-bot", 0o500,
+              {"HUB_TOKEN": "a" * 64}))
+    for label, sub, mode, extra in cases:
+        sc = Scratch(**extra)
+        target = sc.root / sub if sub else sc.root
+        target.mkdir(parents=True)
+        target.chmod(mode)
+        out = Capture()
+        try:
+            th, result = run_main_in_thread(sc, FakeClock(), out)
+            th.join(10)
+            if th.is_alive():
+                f.append(f"{label}: main kept running (no refusal)")
+                wait_for(lambda: wl.LAST_SUPERVISOR is not None, what="the supervisor")
+                wl.LAST_SUPERVISOR.request_stop()
+                th.join(60)
+                continue
+            if "error" in result:
+                f.append(f"{label}: main raised (a traceback, not a refusal): "
+                         f"{result['error'].strip().splitlines()[-1]}")
+                continue
+            rc = result.get("rc")
+            lines = out.snapshot()
+            last = lines[-1] if lines else ""
+            if rc != 1:
+                f.append(f"{label}: main returned {rc!r}, expected 1")
+            if not last.startswith("[worbus] refusing to start:") or str(target) not in last:
+                f.append(f"{label}: the last line does not refuse naming {target}: {last!r}")
+            if sc.lines("hub-starts") or sc.lines("lb-starts"):
+                f.append(f"{label}: a child was started")
+        finally:
+            target.chmod(0o700)
+            if wl.LAST_SUPERVISOR is not None:
+                for c in wl.LAST_SUPERVISOR.children:
+                    if c.proc is not None and c.proc.poll() is None:
+                        c.proc.kill()
+            sc.cleanup()
+    return f
+
+
+class FlakyCapture(Capture):
+    """Raises (as a closed stdout would) on lb-bot's first flood line."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raised = 0
+
+    def __call__(self, line: str) -> None:
+        if line.startswith("[lb-bot] lb-bot flood 00000"):
+            self.raised += 1
+            raise BrokenPipeError(32, "Broken pipe")
+        super().__call__(line)
+
+
+def t_write_error_keeps_draining() -> list[str]:
+    f: list[str] = []
+    sc = Scratch(T_LB="flood")
+    out = FlakyCapture()
+    th, result = run_main_in_thread(sc, FakeClock(), out)
+    try:
+        wait_for(lambda: wl.LAST_SUPERVISOR is not None, what="the supervisor")
+        try:
+            wait_for(lambda: (sc.t_dir / "flood-done").exists(), timeout=20,
+                     what="lb-bot to finish its 3000 lines")
+        except AssertionError as e:
+            f.append(f"{e}: the child blocked on a full pipe after the write error")
+        try:
+            wait_for(lambda: any(ln.startswith("[lb-bot] lb-bot flood 02999")
+                                 for ln in out.snapshot()), timeout=10,
+                     what="lb-bot's last flood line")
+        except AssertionError as e:
+            f.append(f"{e}: the reader stopped relaying after the write error")
+        if out.raised != 1:
+            f.append(f"the output raised {out.raised} times, expected once")
+        if any(ln.startswith("[lb-bot] lb-bot flood 00000") for ln in out.snapshot()):
+            f.append("the line whose write failed was recorded anyway (the plant is wrong)")
+    finally:
+        if wl.LAST_SUPERVISOR is not None:
+            wl.LAST_SUPERVISOR.request_stop()
+        th.join(60)
+        sc.cleanup()
+    if th.is_alive():
+        f.append("main did not return after the stop")
+    elif result.get("rc") != 0:
+        f.append(f"main returned {result.get('rc')!r}: {result.get('error', '')}")
+    return f
+
+
+def t_stop_request_takes_no_lock() -> list[str]:
+    """SIGTERM's handler runs on the main thread, maybe while that thread is inside the
+    supervisor's own stop (the fifth crash). Simulated: one thread holds every lock the
+    supervisor owns, then calls request_stop; a non-reentrant lock would hang it."""
+    f: list[str] = []
+    sup = wl.Supervisor([], clock=FakeClock(), out=Capture())
+    lock_type = type(threading.Lock())
+    held = []
+    for v in vars(sup).values():
+        if isinstance(v, (lock_type, type(threading.RLock()), threading.Condition)):
+            held.append(v)
+        elif isinstance(v, threading.Event):
+            held.append(v._cond)            # what Event.set() holds while it runs
+    done = threading.Event()
+
+    def handler_mid_stop() -> None:
+        for lk in held:
+            lk.acquire()
+        sup.request_stop()
+        done.set()
+        for lk in held:
+            lk.release()
+    th = threading.Thread(target=handler_mid_stop, daemon=True)
+    th.start()
+    th.join(3)
+    if not done.is_set():
+        return [f"request_stop hung with the supervisor's own {len(held)} lock(s) held "
+                "by its thread (the SIGTERM-on-fifth-crash deadlock)"]
+    result: dict = {}
+    runner = threading.Thread(target=lambda: result.setdefault("rc", sup.run()), daemon=True)
+    runner.start()
+    runner.join(5)
+    if runner.is_alive() or result.get("rc") != 0:
+        f.append(f"a stop requested before run(): run() gave {result.get('rc')!r}")
+    return f
+
+
 # --------------------------------------------------------------------------- #
 TESTS = (
     ("fills_both_halves_from_three", t_fills_both_halves_from_three),
@@ -689,6 +874,10 @@ TESTS = (
     ("sigterm_order", t_sigterm_order),
     ("output_prefixed", t_output_prefixed),
     ("launcher_never_prints_secrets", t_launcher_never_prints_secrets),
+    ("children_lines_redacted", t_children_lines_redacted),
+    ("data_folder_refused", t_data_folder_refused),
+    ("write_error_keeps_draining", t_write_error_keeps_draining),
+    ("stop_request_takes_no_lock", t_stop_request_takes_no_lock),
 )
 
 

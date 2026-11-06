@@ -6,4 +6,5 @@
 !hub/hub.py
 !hub/requirements.txt
 !server/worbus_launch.py
+!server/worbus_redact.py
 !server/healthcheck.py
