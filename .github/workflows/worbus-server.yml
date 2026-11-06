@@ -1,0 +1,83 @@
+# Builds the Worbus Server image (server/Dockerfile: the hub on a pinned lb-bot image)
+# and publishes it to GHCR, on a release tag or by hand (Worbus P4, design §6.1, §6.9).
+#
+# LBBOT_IMAGE is read from the Dockerfile's own default, so the lb-bot a release holds
+# is whatever digest the tagged commit pins there. hub-docker.yml and
+# preview-docker.yml are separate and unchanged (the hub image is the rollback).
+name: worbus-server
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/worbus-server
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version, commit and the pinned lb-bot image
+        id: args
+        shell: bash
+        run: |
+          set -euo pipefail
+          short="$(git rev-parse --short=7 HEAD)"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # A dispatch from a branch is a dev build: tagged by its commit only, never
+            # `latest`. Bump with the release number.
+            version="0.4.0-dev"
+          fi
+          lbbot="$(sed -n 's/^ARG LBBOT_IMAGE=//p' server/Dockerfile | head -n 1)"
+          if [[ -z "${lbbot}" || "${lbbot}" == *"@sha256:0000000000000000"* ]]; then
+            echo "::error file=server/Dockerfile::LBBOT_IMAGE is still the placeholder; pin lb-bot's digest first"
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "commit=${short}"
+            echo "lbbot=${lbbot}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern={{version}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=Worbus Server
+            org.opencontainers.image.version=${{ steps.args.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.args.outputs.commit }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          build-args: |
+            LBBOT_IMAGE=${{ steps.args.outputs.lbbot }}
+            WORBUS_VERSION=${{ steps.args.outputs.version }}
+            WORBUS_COMMIT=${{ steps.args.outputs.commit }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=worbus-server
+          cache-to: type=gha,mode=max,scope=worbus-server

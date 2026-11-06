@@ -1,0 +1,32 @@
+# The Worbus Server: one container, the hub and lb-bot together (INSTALL.md).
+#
+#   1. Put this file and .env.example in one folder; copy .env.example to .env and set
+#      its three required values.
+#   2. Change the music folder below to yours.
+#   3. docker compose up -d     then     docker compose ps   (wait for "healthy")
+services:
+  worbus-server:
+    image: ghcr.io/illuminator69/worbus-server:latest
+    container_name: worbus-server
+    # The uid:gid the server runs as; it must be able to write ./data and the music
+    # folder. Unraid uses "99:100".
+    user: "1000:1000"
+    restart: unless-stopped
+    # The launcher stops lb-bot, then the hub, up to 25 s each.
+    stop_grace_period: 60s
+    env_file: .env
+    ports:
+      # The apps connect here (required).
+      - "4790:4790"
+      # lb-bot's own page: settings, placement and review. Remove this line to keep it
+      # off your network.
+      - "8899:8899"
+    volumes:
+      # Everything the server keeps: ./data/hub and ./data/lb-bot.
+      - ./data:/data
+      # Your music folder, the one Navidrome reads. Writable: lb-bot fixes covers and
+      # places albums in it.
+      - /path/to/your/music:/music
+      # Downloading (optional): the folder slskd saves into, with SLSKD_URL and
+      # SLSKD_API_KEY set in .env.
+      # - /path/to/slskd/downloads:/downloads

@@ -1,0 +1,9 @@
+# The Worbus Server image's context is the umbrella root (BuildKit reads this file
+# because it sits beside server/Dockerfile; the root keeps no .dockerignore, so
+# hub-docker.yml's ./hub context is unchanged). An allowlist: only what the image
+# copies is sent. hub/tools/, preview/, docs/ and every *.md stay out.
+*
+!hub/hub.py
+!hub/requirements.txt
+!server/worbus_launch.py
+!server/healthcheck.py

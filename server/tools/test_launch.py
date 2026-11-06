@@ -330,6 +330,10 @@ def t_missing_required_refused() -> list[str]:
             msg = _refusal({**THREE, name: value}, tmp)
             if msg is None or name not in msg or "example" not in msg:
                 f.append(f"{name} left at .env.example's value: refusal {msg!r}")
+        env_example = (SERVER_DIR / ".env.example").read_text()
+        for name, value in examples.items():
+            if f"\n{name}={value.strip(chr(34)).rstrip('/')}\n" not in env_example:
+                f.append(f".env.example does not carry {name}'s placeholder the launcher refuses")
         if (tmp / "hub" / "service-secret").exists():
             f.append("a refused start minted a secret")
     finally:
