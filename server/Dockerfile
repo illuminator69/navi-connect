@@ -9,8 +9,8 @@
 # hub's tests, preview/ and the docs never enter the image).
 #
 # LBBOT_IMAGE is the lb-bot release this server release holds, by digest, set per
-# release (close-out replaces the placeholder below with the pushed digest). On the
-# sandbox VM: --build-arg LBBOT_IMAGE=lb-bot:p4 (lane S's local image).
+# release (close-out replaces the placeholder below with the pushed digest). A local
+# build of both halves passes its own: --build-arg LBBOT_IMAGE=lb-bot:local.
 ARG LBBOT_IMAGE=ghcr.io/illuminator69/lb-bot@sha256:0000000000000000000000000000000000000000000000000000000000000000
 FROM ${LBBOT_IMAGE}
 

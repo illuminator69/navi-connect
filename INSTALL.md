@@ -23,13 +23,17 @@ One tracker for every piece.
    mkdir -p worbus-server/data && cd worbus-server
    curl -fLO https://raw.githubusercontent.com/illuminator69/navi-connect/main/server/compose.yaml
    curl -fL -o .env https://raw.githubusercontent.com/illuminator69/navi-connect/main/server/.env.example
+   chmod 600 .env
    ```
 
    Make `data` yourself: a folder Docker creates belongs to root, and the server cannot write to it.
 
 2. In `.env`, set the three required values: `NAVIDROME_URL` (as the server reaches it, for example
    `http://192.168.1.10:4533`), `NAVIDROME_USER` (the admin account) and `NAVIDROME_PASSWORD`. Everything else
-   is optional and explained in the file. Keep `.env` to yourself: it holds the password.
+   is optional and explained in the file. Keep `.env` to yourself: it holds the password (the `chmod` above makes
+   it readable by you alone). If Navidrome runs on the same machine, do not write `localhost` or `127.0.0.1`: inside
+   the container that is the container itself. Use the machine's LAN address, or Navidrome's container name when
+   both share a Docker network.
 
 3. In `compose.yaml`, change `/path/to/your/music` to your music folder. `user: "1000:1000"` must be a user that
    can write to `data` and the music folder (`id -u` and `id -g` print yours; Unraid uses `"99:100"`).
