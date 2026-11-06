@@ -58,6 +58,10 @@ CRASH_WINDOW = 600.0        # ... within this many seconds stop the server
 STABLE_RUN = 600.0          # a run this long starts the backoff again at 1 s
 STOP_WAIT = 25.0            # per child, on SIGTERM
 TICK = 0.2
+# One child line kept at most (bytes), before it is redacted (fix round 2, ruling R18):
+# the rest of a longer line is read and dropped, and the kept part ends with a marker.
+LINE_CAP = 64 * 1024
+_CUT_KEEPS = frozenset("\"',;&")     # a cut line is trimmed back to one of these or a space
 
 # The newest Supervisor, for the suite (tools/test_launch.py).
 LAST_SUPERVISOR: Optional["Supervisor"] = None
@@ -234,13 +238,33 @@ class Supervisor:
 
     def _pump(self, child: Child, stream) -> None:
         prefix = f"[{child.name}] "
-        for raw in iter(stream.readline, b""):
+        while True:
+            raw = stream.readline(LINE_CAP)
+            if not raw:
+                break
+            dropped = -1
+            if len(raw) >= LINE_CAP and not raw.endswith(b"\n"):
+                dropped = 0                # longer than the cap: drain the rest of it
+                while True:
+                    more = stream.readline(LINE_CAP)
+                    if not more:
+                        break
+                    dropped += len(more)
+                    if more.endswith(b"\n"):
+                        dropped -= 1
+                        break
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            marker = ""
+            if dropped >= 0:
+                line, tail = _trim_cut(line)
+                marker = ("" if not line or line[-1].isspace() else " ") + (
+                          f"[... line cut by the Worbus launcher at {LINE_CAP // 1024} KB: "
+                          f"{dropped + len(tail.encode('utf-8', 'replace'))} more bytes not shown]")
             try:
                 line = redact(line)
             except Exception:  # noqa: BLE001
                 line = "(a line the redaction rule could not read was dropped)"
-            self._write(prefix + line)
+            self._write(prefix + line + marker)
         stream.close()
 
     def _event(self, kind: str, child: Child, detail: float = 0.0) -> None:
@@ -351,6 +375,16 @@ class Supervisor:
                 self._event("exit", child, float(proc.returncode))
             if child.reader is not None:
                 child.reader.join(2)
+
+
+def _trim_cut(text: str) -> tuple[str, str]:
+    """A line cut at the cap may end inside a credential (`https://bob:hun`,
+    `"password":"hun`), which no rule then recognises: drop that last unfinished
+    piece, back to a space or one of `"',;&`. Returns (kept, dropped)."""
+    k = len(text)
+    while k > 0 and not (text[k - 1].isspace() or text[k - 1] in _CUT_KEEPS):
+        k -= 1
+    return text[:k], text[k:]
 
 
 def _stdout_line(line: str) -> None:

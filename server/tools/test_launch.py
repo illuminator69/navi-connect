@@ -41,6 +41,11 @@ clock (its `sleep` advances fake time and yields a few real milliseconds).
   write_error_keeps_draining       (fix round, M2) the output raises on a child's line: that
                                    line is dropped, the reader keeps draining, the child
                                    never blocks on a full pipe
+  long_line_relayed                (fix round 2, R18) lb-bot prints a 1 MB adversarial line
+                                   (secrets at its start, past the cap, and one the cap cuts
+                                   through), then a short one: the short one arrives within
+                                   5 s, the long one is cut to the cap with a visible marker,
+                                   and no planted value comes out
   stop_request_takes_no_lock       (fix round, M3) request_stop (the signal handler's call)
                                    returns while every lock the supervisor holds is held by
                                    the same thread: no deadlock if SIGTERM lands mid-stop
@@ -160,6 +165,13 @@ if os.environ.get("T_LEAK"):
 if mode == "crash":
     print("lb-bot boom", flush=True)
     sys.exit(1)
+if mode == "longline":
+    cap = int(os.environ["T_CAP"])
+    body = "key-a.b.c-" * (1_100_000 // 10)
+    print("?t=PLANTcap1 " + body + " ?t=PLANTcap2", flush=True)
+    head = "a " * ((cap - 20) // 2)
+    print(head + "https://bob:PLANTcut3hunter2hunter2@nd.example/x", flush=True)
+    print("lb-bot after the long lines", flush=True)
 if mode == "flood":
     for i in range(3000):          # about 330 kB: five times a pipe's 64 KiB
         print(f"lb-bot flood {i:05d} " + "x" * 90, flush=True)
@@ -824,6 +836,54 @@ def t_write_error_keeps_draining() -> list[str]:
     return f
 
 
+def t_long_line_relayed() -> list[str]:
+    f: list[str] = []
+    cap = getattr(wl, "LINE_CAP", 64 * 1024)
+    sc = Scratch(T_LB="longline", T_CAP=str(cap))
+    out = Capture()
+    started = time.monotonic()
+    th, result = run_main_in_thread(sc, FakeClock(), out)
+    try:
+        wait_for(lambda: wl.LAST_SUPERVISOR is not None, what="the supervisor")
+        try:
+            wait_for(lambda: "[lb-bot] lb-bot after the long lines" in out.snapshot(),
+                     timeout=5, what="the line after the long ones")
+        except AssertionError as e:
+            f.append(f"{e}: the reader stalled on the long line")
+        took = time.monotonic() - started
+        lines = out.snapshot()
+        cut = [ln for ln in lines if "line cut by the Worbus launcher" in ln]
+        if len(cut) != 2:
+            f.append(f"{len(cut)} cut lines, expected 2")
+        for ln in cut:
+            if len(ln.encode()) > cap + 200:
+                f.append(f"a cut line is {len(ln.encode())} bytes, over the cap {cap}")
+        # The first is one 1 MB run after `?t=…`: its unfinished run is trimmed away
+        # whole. The second is cut inside a URL's password: the words before it stay.
+        if cut and not cut[0].startswith("[lb-bot] ?t=[removed] [... line cut"):
+            f.append(f"the first cut line: {cut[0][:80]!r}")
+        if len(cut) == 2 and (not cut[1].startswith("[lb-bot] a a a")
+                              or len(cut[1].encode()) < cap // 2):
+            f.append(f"the second cut line lost its words: {len(cut[1].encode())} bytes")
+        for v in ("PLANTcap1", "PLANTcap2", "PLANTcut3", "hunter2"):
+            if any(v in ln for ln in lines):
+                f.append(f"{v} came out")
+        LONG_LINE_TOOK.append(took)
+    finally:
+        if wl.LAST_SUPERVISOR is not None:
+            wl.LAST_SUPERVISOR.request_stop()
+        th.join(60)
+        sc.cleanup()
+    if th.is_alive():
+        f.append("main did not return after the stop")
+    elif result.get("rc") != 0:
+        f.append(f"main returned {result.get('rc')!r}: {result.get('error', '')}")
+    return f
+
+
+LONG_LINE_TOOK: list[float] = []
+
+
 def t_stop_request_takes_no_lock() -> list[str]:
     """SIGTERM's handler runs on the main thread, maybe while that thread is inside the
     supervisor's own stop (the fifth crash). Simulated: one thread holds every lock the
@@ -878,6 +938,7 @@ TESTS = (
     ("data_folder_refused", t_data_folder_refused),
     ("write_error_keeps_draining", t_write_error_keeps_draining),
     ("stop_request_takes_no_lock", t_stop_request_takes_no_lock),
+    ("long_line_relayed", t_long_line_relayed),
 )
 
 
