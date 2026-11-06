@@ -1,0 +1,61 @@
+name: Bug
+description: Something in the Worbus Server, Navic or Feishin does not work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. One tracker for every piece: if you are not sure which one is at fault, pick your
+        best guess. Before attaching logs, see [Sending logs](https://github.com/illuminator69/navi-connect/blob/main/INSTALL.md#6-sending-logs):
+        each logs file is cleaned of passwords and tokens, but read it once before you send it.
+  - type: dropdown
+    id: piece
+    attributes:
+      label: Which piece?
+      options:
+        - Worbus Server
+        - Navic (Android)
+        - Feishin (desktop)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: server-version
+    attributes:
+      label: Worbus Server version
+      description: On the app's Server screen, or the first line of `docker logs worbus-server`.
+      placeholder: 0.4.0 (abc1234)
+    validations:
+      required: true
+  - type: input
+    id: navic-version
+    attributes:
+      label: Navic version
+      description: Navic › About. Leave blank if you don't use it.
+      placeholder: 0.4.0 (abc1234)
+  - type: input
+    id: feishin-version
+    attributes:
+      label: Feishin version
+      description: Feishin's menu › Version. Leave blank if you don't use it.
+      placeholder: 0.4.0 (abc1234)
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, step by step, and what you saw.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Drag the logs file here: `worbus-server.log` for the server, Navic's **Share logs** file, or Feishin's
+        **Export diagnostics** zip.

@@ -1,0 +1,28 @@
+name: Idea
+description: Something Worbus could do, or do better.
+labels: ["idea"]
+body:
+  - type: dropdown
+    id: piece
+    attributes:
+      label: Which piece?
+      options:
+        - Worbus Server
+        - Navic (Android)
+        - Feishin (desktop)
+        - All of them
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What you would like to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Screenshots, other apps that do it well, how often you would use it.

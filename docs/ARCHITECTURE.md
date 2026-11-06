@@ -2,7 +2,7 @@
 
 How the pieces fit together, what talks to what, and where the code lives. The
 [README](../README.md) is the project description; [`PROTOCOL.md`](../PROTOCOL.md) is the full wire
-spec; [`TESTING-SETUP.md`](../TESTING-SETUP.md) is how to actually run it.
+spec; [`INSTALL.md`](../INSTALL.md) is how to actually run it.
 
 The hub is the only component in this repository. Both clients and lb-bot are separate repos, linked
 below — this file covers the parts of them that face the hub.
@@ -470,7 +470,7 @@ settle (`LBBOT_WEB_URL`, else `LBBOT_URL`). An artist the mirror does not hold f
 - **Song Journey** (Navidrome's `findSonicPath`) and **CLAP text→mood search** (both); a
   **generator chip** on the queue naming what built it.
 
-### Known open items (see `TESTING-SETUP.md` §8)
+### Known open items (the [issue tracker](https://github.com/illuminator69/navi-connect/issues) has the rest; the retired `TESTING-SETUP.md` §8, in git history, listed them before Worbus 0.4)
 - Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow and its presets were retired by the
   stations of 2026-10-16.)*
 - Navic **native cast lifecycle re-adoption** after a process restart (crash is fixed; lifecycle isn't).
@@ -641,11 +641,13 @@ assuming an install failure is anything else.
 ```
 navi-connect/
   README.md                      the project description (start there)
-  TESTING-SETUP.md               prerequisites, step-by-step setup, smoke test, known bugs/caveats
+  INSTALL.md                     installing the Worbus Server and the apps, sending logs
   PROTOCOL.md                    wire protocol spec
   CLAUDE.md                      working notes for coding agents
   docs/ARCHITECTURE.md           ← this file
   docs/screenshots/              images used by the README
+  server/                        the Worbus Server image — Dockerfile, worbus_launch.py, healthcheck.py,
+                                 compose.yaml, .env.example, tools/
   hub/                           Python relay hub — hub.py, Dockerfile, docker-compose.yml, tools/
   preview/                       yt-dlp preview sidecar — preview.py, Dockerfile, docker-compose.yml,
                                  tools/. The MEDIA origin; the hub proxies its control plane only

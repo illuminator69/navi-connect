@@ -95,7 +95,8 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
                               "stationEdits"],
                  "user": { "name":"bob", "admin":false, "primary":false },  // §3.3
                  "server": { "id":"<32 hex>", "name":"Worbus Server",
-                             "publicUrl":"wss://hub.example.org" },          // §3.4; publicUrl optional
+                             "publicUrl":"wss://hub.example.org",           // §3.4; optional
+                             "version":"0.4.0 (678af87)" },                 // Worbus P4; optional
                  "session": <Session>, "devices": [<DeviceInfo>...],
                  "savedQueues": [<SavedQueue>...],    // §8.3
                  "lb": { "available":true, "routes":["GET /lb/…"], "webUrl":"http://…:8899",
@@ -133,6 +134,15 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
   that address as `wss://…` (§3.4). It is the same for every user. It is the only
   place the hub gives out an address, so only a signed-in device learns it. An older
   hub sends no `server`: a client then behaves as before.
+- `welcome.server.version` (Worbus P4) is the Worbus release the server belongs to, as
+  the clients show it: `<version> (<7-character commit>)`, for example
+  `"0.4.0 (678af87)"`, or `"0.4.0-dev (abc1234)"` for a build that is not a release. The
+  hub joins the env `WORBUS_VERSION` and `WORBUS_COMMIT`, which the Worbus Server image's
+  build args set (with no commit, the version alone). **Absent when `WORBUS_VERSION` is
+  unset** (a hub run from source, an older hub): a client then shows no server version
+  and writes "server version unknown" in its logs file. It is a display string, never
+  parsed or compared, and the same for every user. `GET /hub/info` does not carry it
+  (§3.4).
 - If `device.id` is null the hub mints a UUID; the client persists it and reuses
   it on every future `hello` (so reconnects don't create duplicate devices).
 - `kind` says what the device is, for the icon a picker draws: `computer`, `phone`,
@@ -300,7 +310,9 @@ GET /hub/info     (no authentication; a bearer, if sent, is ignored)
   legacy token or garbage. It is cheap enough for a sweep of a /24.
 - **It carries no address**, neither `HUB_PUBLIC_URL` nor the one it was asked at: a
   server the person has not chosen must not be able to point a client anywhere
-  (`welcome.server.publicUrl`, §3.1, reaches signed-in devices only).
+  (`welcome.server.publicUrl`, §3.1, reaches signed-in devices only). **Nor a version**
+  (Worbus P4): `welcome.server.version` reaches signed-in devices only, so a stranger's
+  sweep learns nothing about which release a server runs.
 - `service` is a wire constant that is never shown and never renamed. `signin: true`
   says `POST /hub/signin` (§3.3) exists. `name` is for display.
 - **`serverId`** is 16 random bytes as 32 lower-case hex characters, minted on the
@@ -404,6 +416,7 @@ these candidates, in this order:
 | Env (on the hub) | Meaning |
 |---|---|
 | `HUB_NAME` | optional; the name clients show, trimmed, 1 to 40 characters, default `Worbus Server`. Longer, or blank while set, stops the hub at start |
+| `WORBUS_VERSION`, `WORBUS_COMMIT` | Worbus P4; set by the Worbus Server image's build args. `welcome.server.version` is their display form; the hub's first log line is `Worbus Server <that>`. Unset `WORBUS_VERSION`: no `version` key and no such line |
 | `HUB_PUBLIC_URL` | optional; the address clients may use away from home, given to signed-in devices as `welcome.server.publicUrl`. `wss://host[:port][/path]`, or `https://…`, which is stored as `wss://…`; a trailing `/` and a trailing `/connect` are dropped, a path is kept. **Must be `wss://`:** `ws://` or `http://` (a device secret would cross the internet in plain text), a value with no host, one that does not parse and `.env.example`'s placeholder `wss://hub.example.com` all stop the hub at start, naming the setting |
 
 The hub never learns its own LAN address (in a Docker bridge container it cannot see
@@ -1471,8 +1484,14 @@ Enabled when `LBBOT_URL` is set **and** `HUB_TOKEN` is non-empty. Otherwise
 *person* opens lb-bot's own web UI, so a client screen that has to hand the user
 over to lb-bot's workspace (Fill gaps with nothing left to pick) can link straight
 to it, e.g. `webUrl + "/#/gaps/" + groupId`. It is `LBBOT_WEB_URL` when set, else
-`LBBOT_URL` (the same address on a LAN install); `""` while the proxy is disabled,
-and never anything but an `http(s)` URL. It is only a link. Nothing is proxied
+`LBBOT_URL` (the same address on a LAN install) **unless `LBBOT_URL` is loopback**
+(`localhost`, `127.0.0.0/8`, `::1`; Worbus P4), which is never offered; `""` then,
+and while the proxy is disabled; never anything but an `http(s)` URL. In the Worbus
+Server, where the hub reaches lb-bot at `http://127.0.0.1:8899`, `webUrl` is therefore
+`""` unless `LBBOT_WEB_URL` is set, and **a client builds the link itself:** from the
+host of its active address (§3.4), `http://<host>:8899`, but only while that address
+is private (§3.4's test); otherwise there is no link, and a screen that would offer
+one says to open lb-bot's page on the home network instead. It is only a link. Nothing is proxied
 through it, and it grants nothing: an lb-bot from Worbus P1 on asks the person for
 their Navidrome login there (an older one has no auth, so whoever can reach that
 address can already use it). With the default, the link works only on the LAN;
@@ -2748,11 +2767,19 @@ clients gate on `GET /lb/attention` and `GET /lb/activity`.
 
 **`GET /lb/attention`** → `{version: 1, serverTime, counts, albums, folders, truncated}`.
 
-- `counts`: `{failedGaps, failedRequests, folders, foldersUnidentified, picks}`, the same numbers as lb-bot's
+- `counts`: `{failedGaps, failedRequests, folders, foldersUnidentified, picks, imports}`, the same numbers as lb-bot's
   `/api/summary` (`gaps.failed`, `requests.failed`, `transfers.needsPlacement`, `transfers.unidentified`) plus
-  `picks`, the groups waiting at `picking`. **The to-fix number is `failedGaps + failedRequests + folders`**, lb-bot's
-  web UI's own (`needs.js`); it is not sent, every client adds the three. `picks`, `foldersUnidentified` and the
+  `picks`, the groups waiting at `picking`. **The to-fix number is `failedGaps + failedRequests + folders + imports`**, lb-bot's
+  web UI's own (`needs.js`); it is not sent, every client adds them. `picks`, `foldersUnidentified` and the
   artists to check are listed, never counted into it.
+- `counts.imports` (Worbus P4, an integer; absent means 0, an older lb-bot): the import records whose `status` is
+  `needs_review` or `failed`, the albums lb-bot could not finish filing; lb-bot's own page lists them under
+  Needs you, with their actions. No rows come with it and no import action is on the wire: a client shows one row,
+  "**N imports need you**" (singular "**1 import needs you**"), the line "lb-bot couldn't finish filing these
+  albums." and **Open in lb-bot**, which opens `<base>/#/needs/imports`, `<base>` being `webUrl` when non-empty,
+  else, only while the active address is private, `http://<its host>:8899` (§15); with no link the line becomes
+  "Open lb-bot's page on your home network to fix them." and there is no button. The hub passes the key
+  through like the others.
 - `albums` (≤ 50; failed first, then picking, newest `updatedAt` first): `{kind: "gap"|"request", key, groupId,
   releaseMbid, rgid, albumId, artist, album, coverUrl, state: "failed"|"picking", missingCount, total, updatedAt}`.
   A request lb-bot cannot name (no ledger name, no review group covering its release) is left out.
@@ -2788,8 +2815,8 @@ object with a string `error` or a string `code` becomes `{"error": "lb-bot answe
 a `code` and no `error` (Worbus P1: lb-bot behind its login answers `401 {"code": "signin_required"}` and
 `403 {"code": "admin_only"}`) reaches the client as that `code`. A `404` that already is
 `{error}` with no `code` is passed byte for byte, so "an lb-bot older than the routes" still reads as a 404
-with no `code`. `/api/downloads` (its review rows carry Telegram credentials) and every placement or
-transfer write stay off the wire.
+with no `code`. `/api/downloads` (its review rows carry an owner's credentials on older lb-bots) and every
+placement or transfer write stay off the wire.
 
 **When a client reads them.** On `welcome`, on a `fill` or `lb` frame, when the avatar menu or either page
 opens, never more than once in 30 s unless a frame forces it (a failed state does), one read in flight at a
@@ -2798,7 +2825,7 @@ time; nobody watching, no read.
 ### 15.7 Worbus P1: the downloads mode, index progress, Scan now for any artist, Find it
 
 Added 2026-10-28 ("the server works for strangers"): lb-bot runs with only Navidrome configured (no
-Telegram, no slskd), downloading is an opt-in mode, and a first index build is visible and steerable. Every
+slskd), downloading is an opt-in mode, and a first index build is visible and steerable. Every
 field below is **additive**; its absence is an older lb-bot or hub and means exactly what it meant before.
 
 **The downloads mode.** lb-bot's `GET /api/health` (the hub's probe) and `GET /api/summary` carry
@@ -2863,8 +2890,10 @@ meta answer; no link carries a credential.
 
 **Required configuration** (a stranger's server). On lb-bot: `NAVIDROME_URL`, `NAVIDROME_USER`,
 `NAVIDROME_PASSWORD`, `LB_BOT_HUB_URL` and `LB_BOT_HUB_TOKEN` (= the hub's `HUB_TOKEN`); `SLSKD_API_KEY`
-turns downloading on and `TELEGRAM_TOKEN` the Telegram surface, both optional. On the hub: `HUB_TOKEN` and
-`LBBOT_URL`. **Deploy order for this change: the hub first**, then lb-bot: a hub that sends its token to an
+turns downloading on, optional. On the hub: `HUB_TOKEN` and `LBBOT_URL`. **In the Worbus Server (Worbus P4)**
+the person sets only `NAVIDROME_URL`, `NAVIDROME_USER` and `NAVIDROME_PASSWORD`: the launcher fills every other
+name here (one service secret, minted into `/data/hub/service-secret`, for both `HUB_TOKEN` and
+`LB_BOT_HUB_TOKEN`; the two loopback addresses) wherever the env does not set it. **Deploy order for this change: the hub first**, then lb-bot: a hub that sends its token to an
 older lb-bot is harmless, while an lb-bot that requires it from an older hub refuses every `/lb/*` call.
 
 ---

@@ -7,14 +7,14 @@ you're already looking at.
 
 It sits on top of [Navidrome](https://navidrome.org) and needs nothing hosted by anyone else.
 
-### ▶ [**Setup & testing guide →**](TESTING-SETUP.md)
+### ▶ [**Install Worbus →**](INSTALL.md)
 
-**If you want to run this, start there, not here.** It covers prerequisites, step-by-step setup, a
-smoke test that isolates failures, and every known bug and caveat. Prebuilt clients need no
+**If you want to run this, start there, not here.** One page: the Worbus Server (one container beside your
+Navidrome, three settings), the apps, the first run, and how to send logs. Prebuilt apps need no
 toolchain: **Navic** for Android is on
-[navic-gaps' Releases](https://github.com/illuminator69/navic-gaps/releases) (first alpha:
-[v.0.1.0](https://github.com/illuminator69/navic-gaps/releases/tag/v.0.1.0)), and **Feishin** for
-the desktop is on this repository's [Releases](../../releases).
+[navic-gaps' Releases](https://github.com/illuminator69/navic-gaps/releases), and **Feishin** for the
+desktop is on [feishin-gaps' Releases](https://github.com/illuminator69/feishin-gaps/releases).
+Bugs and ideas for any piece go to [this repository's issues](https://github.com/illuminator69/navi-connect/issues/new/choose).
 
 ---
 
@@ -118,7 +118,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 
 | Repo | What's in it |
 |---|---|
-| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the preview sidecar, the docs, and the [Feishin builds](../../releases). |
+| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the Worbus Server image (`server/`), the preview sidecar, the docs, and the one issue tracker. |
 | **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic), with its UI rebuilt around navi-connect. Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. Its APKs are on [its own Releases page](https://github.com/illuminator69/navic-gaps/releases). GPL-3.0. |
 | **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
@@ -126,12 +126,13 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 ## Contents of this repo
 
 ```
+INSTALL.md            how to install the server and the apps, and send logs
+server/               the Worbus Server image — Dockerfile, launcher, healthcheck, compose.yaml, .env.example
 hub/                  the relay — hub.py, Dockerfile, docker-compose.yml, tools/
 preview/              the preview sidecar — preview.py, Dockerfile, docker-compose.yml, tools/
 docs/ARCHITECTURE.md  what each piece is, how they talk, and where the code lives
 docs/screenshots/     images used by this file
 PROTOCOL.md           the wire protocol spec
-TESTING-SETUP.md      prerequisites, setup, smoke test, known bugs and caveats
 ```
 
 ## Licence

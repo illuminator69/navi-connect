@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installing Worbus
+    url: https://github.com/illuminator69/navi-connect/blob/main/INSTALL.md
+    about: How to install the server and the apps, and how to send logs.
