@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-navi-connect hub — a headless Spotify-Connect-style relay for Navidrome clients.
+Worbus hub — a headless Spotify-Connect-style relay for Navidrome clients.
 
 See ../PROTOCOL.md for the wire protocol. The hub owns the *session intent*
 (queue, order, repeat/shuffle, which device is active) and routes commands to
@@ -1011,7 +1011,7 @@ class SleepTimer:
 def _nd_auth_params() -> dict:
     salt = hashlib.md5(os.urandom(16)).hexdigest()[:12]
     token = hashlib.md5((ND_PASS + salt).encode()).hexdigest()
-    return {"u": ND_USER, "t": token, "s": salt, "v": "1.16.1", "c": "navi-connect", "f": "json"}
+    return {"u": ND_USER, "t": token, "s": salt, "v": "1.16.1", "c": "worbus-hub", "f": "json"}
 
 
 def _nd_save_play_queue_blocking(ids: list[str], current: Optional[str], position_ms: int) -> None:
@@ -10562,7 +10562,7 @@ async def main() -> None:
     global HUB_INSTANCE
     hub = Hub(server_id=server_id)
     HUB_INSTANCE = hub
-    log(f"navi-connect hub on ws://{HOST}:{PORT}  "
+    log(f"Worbus hub on ws://{HOST}:{PORT}  "
         f"(Navidrome: {NAVIDROME_URL or '<unset>'}, "
         f"mirror={'on' if MIRROR_PLAYQUEUE and NAVIDROME_URL else 'off'})")
 

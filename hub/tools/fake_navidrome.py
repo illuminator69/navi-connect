@@ -69,7 +69,7 @@ class FakeNavidrome:
         self.login_limit: int | None = None   # logins answered before 429s start
         self.list_limit: int | None = None    # /api/user rows returned (R21), None = all
         self.unlisted: set[str] = set()       # users left out of /api/user (and its count)
-        self.play_queues: list[dict] = []     # every savePlayQueue: {"u", "ids", ...}
+        self.play_queues: list[dict] = []     # every savePlayQueue: {"u", "c", "ids", ...}
         self._tokens: dict[str, str] = {}     # jwt -> user
         self.server: socketserver.TCPServer | None = None
         self.port = 0
@@ -190,7 +190,8 @@ class FakeNavidrome:
                 "settingsRole": True, "streamRole": True, "folder": [1]}})
         if name == "savePlayQueue":
             with self.lock:
-                self.play_queues.append({"u": who, "ids": list(multi.get("id", [])),
+                self.play_queues.append({"u": who, "c": q.get("c"),
+                                         "ids": list(multi.get("id", [])),
                                          "current": q.get("current"),
                                          "position": q.get("position")})
             return _subsonic({"status": "ok"})

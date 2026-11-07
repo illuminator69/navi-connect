@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A simulated navi-connect receiver — no audio, just protocol.
+A simulated Worbus receiver — no audio, just protocol.
 
 It connects to the hub, advertises itself as a receiver, obeys `do` commands,
 and ticks a fake playback position (1 Hz) that it reports back. Run two of

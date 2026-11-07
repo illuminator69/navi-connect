@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Interactive navi-connect controller — drives the hub from a terminal.
+Interactive Worbus controller — drives the hub from a terminal.
 
 Connects as a controller-only device, prints session/device updates, and reads
 commands from stdin. Use it to exercise transfer-with-resume against two

@@ -13,6 +13,8 @@ Users: owner (admin, HUB_ND_USER), alice (admin), bob (not admin).
   test_library_index_lb_frames_reach_everyone
   test_fill_frames_reach_admins_only    (R8: a legacy socket is the primary user's)
   test_mirror_runs_for_primary_only     (the fake records savePlayQueue)
+  test_mirror_client_name_is_worbus_hub (Worbus P5: the mirror's `c=` names Worbus)
+  test_start_line_says_worbus           (Worbus P5: the hub's first line)
   test_fingerprint_and_your_mix_primary_only
   test_cast_bridge_lands_in_bridger_space
 
@@ -27,6 +29,7 @@ import os
 import socketserver
 import sys
 import threading
+import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -238,11 +241,31 @@ async def t_mirror(nd: FakeNavidrome) -> list[str]:
             f.append("bob's queue was written into the service account's play queue")
         if users - {"owner"}:
             f.append(f"the mirror wrote as {users}")
+        names = {q.get("c") for q in nd.play_queues}
+        if names != {"worbus-hub"}:
+            f.append(f"mirror_client_name_is_worbus_hub: the mirror asked as c={names}")
         await o.close()
         await b.close()
     finally:
         h.stop()
     return f
+
+
+async def t_start_line(h: HubProc) -> list[str]:
+    end = time.time() + 5
+    text = ""
+    while time.time() < end:
+        with open(h.log_path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+        if " hub on ws://" in text:
+            break
+        await asyncio.sleep(0.1)
+    lines = [ln for ln in text.splitlines() if " hub on ws://" in ln]
+    if not lines:
+        return [f"start_line_says_worbus: no start line in the log ({text[-300:]!r})"]
+    if "Worbus hub on ws://" not in lines[0]:
+        return [f"start_line_says_worbus: the start line is {lines[0]!r}"]
+    return []
 
 
 async def t_fingerprint(nd: FakeNavidrome) -> list[str]:
@@ -298,7 +321,8 @@ async def main_async() -> list[str]:
                          ("test_transfer_cannot_target_other_space", t_transfer),
                          ("test_library_index_lb_frames_reach_everyone", t_library_frames),
                          ("test_fill_frames_reach_admins_only", t_fill_frames),
-                         ("test_cast_bridge_lands_in_bridger_space", t_cast_bridge)):
+                         ("test_cast_bridge_lands_in_bridger_space", t_cast_bridge),
+                         ("test_start_line_says_worbus", t_start_line)):
             try:
                 got = await fn(h)
             except Exception:  # noqa: BLE001
@@ -325,7 +349,7 @@ def main() -> int:
         return 1
     print("PASS - space frames: session-frames-stay-in-space/transfer-not-across-spaces/"
           "library-index-lb-reach-everyone/fill-admins-only/mirror-primary-only/"
-          "fingerprint-and-your-mix-primary-only/cast-bridge-in-bridger-space")
+          "fingerprint-and-your-mix-primary-only/cast-bridge-in-bridger-space/mirror-client-name/start-line")
     return 0
 
 
