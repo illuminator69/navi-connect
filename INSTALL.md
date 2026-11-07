@@ -3,6 +3,9 @@
 Worbus is two apps (**Worbus for Android** and **Worbus for desktop**) and one server, the **Worbus Server**,
 which runs beside your Navidrome. This page is all you need: nothing here asks for the source code.
 
+The [latest release](https://github.com/illuminator69/worbus/releases/latest) lists all three pieces with their
+checksums and links to the files; the files themselves live on each piece's Releases page, linked below.
+
 Found a bug, or have an idea? [Open an issue](https://github.com/illuminator69/worbus/issues/new/choose).
 One tracker for every piece.
 
@@ -46,7 +49,7 @@ One tracker for every piece.
    ```
 
    **Healthy** looks like `Up 1 minute (healthy)`; give it up to two minutes on the first start.
-   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.5.0 (abc1234)`, and every line after it
+   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.6.0 (abc1234)`, and every line after it
    says which half wrote it, `[hub]` or `[lb-bot]`. If a required setting is missing, blank or still the example
    value, or the `data` folder is not writable by that `user:`, the server stops and its last line names the
    setting or the folder. A value that is set but wrong (a mistyped address, a wrong password) is not caught at
@@ -61,6 +64,8 @@ network.
 - **Worbus for Android:** the APK is on [worbus-android's Releases](https://github.com/illuminator69/worbus-android/releases).
   If the original Navic (from Obtainium, F-Droid or its own releases) is installed, you can leave it: Worbus
   has its own app ID and installs beside it. Later Worbus builds install over this one.
+  To be told about updates, add `https://github.com/illuminator69/worbus-android` to Obtainium with the APK
+  filter `Worbus-v.*\.apk`.
 - **Worbus for desktop:** on [worbus-desktop's Releases](https://github.com/illuminator69/worbus-desktop/releases):
   Linux (AppImage, deb, tar.xz), Windows (a portable zip) and macOS (dmg). The builds are not signed:
   - **Windows** shows "Windows protected your PC" (SmartScreen) on the first start: **More info**, then
@@ -72,7 +77,7 @@ Feishin first; nothing is deleted). The Worbus Server sign-in is not copied: sig
 server passwords may not come across either; if the app asks for a password once after the move, enter it again.
 
 The version is in **Settings › About** in Worbus for Android and on the **Version** line of the app menu in Worbus
-for desktop, for example `0.5.0 (abc1234)`.
+for desktop, for example `0.6.0 (abc1234)`.
 
 ## 4. First run
 

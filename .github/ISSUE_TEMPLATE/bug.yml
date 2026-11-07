@@ -24,7 +24,7 @@ body:
     attributes:
       label: Worbus Server version
       description: On the app's Server screen, or the first line of `docker logs worbus-server`.
-      placeholder: 0.5.0 (abc1234)
+      placeholder: 0.6.0 (abc1234)
     validations:
       required: true
   - type: input
@@ -32,13 +32,13 @@ body:
     attributes:
       label: Worbus for Android version
       description: Worbus › About. Leave blank if you don't use it.
-      placeholder: 0.5.0 (abc1234)
+      placeholder: 0.6.0 (abc1234)
   - type: input
     id: desktop-version
     attributes:
       label: Worbus for desktop version
       description: Worbus's menu › Version. Leave blank if you don't use it.
-      placeholder: 0.5.0 (abc1234)
+      placeholder: 0.6.0 (abc1234)
   - type: textarea
     id: what-happened
     attributes:

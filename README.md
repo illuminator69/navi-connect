@@ -26,7 +26,8 @@ Navidrome, three settings), the apps, the first run, and how to send logs. Prebu
 toolchain: **Worbus for Android** is on
 [worbus-android's Releases](https://github.com/illuminator69/worbus-android/releases), and **Worbus for
 desktop** is on [worbus-desktop's Releases](https://github.com/illuminator69/worbus-desktop/releases).
-Bugs and ideas for any piece go to [this repository's issues](https://github.com/illuminator69/worbus/issues/new/choose).
+The [latest release](https://github.com/illuminator69/worbus/releases/latest) lists all three pieces with their
+checksums. Bugs and ideas for any piece go to [this repository's issues](https://github.com/illuminator69/worbus/issues/new/choose).
 
 ---
 
