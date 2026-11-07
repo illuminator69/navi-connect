@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/worbus-dark.svg">
+  <img src="docs/brand/worbus-light.svg" width="96" alt="The Worbus icon">
+</picture>
+
 # Worbus
 
 **Your music library, finished and shared.** Worbus joins two self-hosted projects into one:
@@ -29,51 +34,48 @@ Bugs and ideas for any piece go to [this repository's issues](https://github.com
 
 ### The missing half of your library, visible
 
-Open an artist and the albums you *don't* have sit right there among the ones you do — greyed out and
-marked, a partly-owned album carrying its missing count. Nothing is a separate "wanted" list; the gaps
-live where you'd notice them.
+Open an artist and the albums you *don't* have sit right there among the ones you do, marked as missing,
+a partly-owned album carrying its missing count. Nothing is a separate "wanted" list; the gaps live where
+you'd notice them. The same page on the phone and on the desktop:
 
 <p align="center">
-  <img src="docs/screenshots/feishin-artist-missing-albums.png" width="720"
-       alt="Worbus for desktop: artist page showing owned albums alongside greyed-out ones marked NOT IN LIBRARY, with a +38 MISSING badge" />
+  <img src="docs/screenshots/0.6/android-2.png" width="240"
+       alt="Worbus for Android: an artist page with the albums the library has and the albums it is missing" />
+  <img src="docs/screenshots/0.6/desktop-2.png" width="480"
+       alt="Worbus for desktop: an artist page with the albums the library has and the albums it is missing" />
 </p>
 
-**A download is reviewed, not fired blind.** Pick the edition, check it against the canonical
-MusicBrainz tracklist, choose a quality, and only then go looking for sources.
+**A missing album opens as a page of its own**, with its tracklist, before anything is fetched. Check it
+against the canonical MusicBrainz tracklist, choose a quality, and only then go looking for sources.
 
 <p align="center">
-  <img src="docs/screenshots/feishin-missing-album-review.png" width="720"
-       alt="Worbus for desktop: missing-album dialog showing edition tabs, media-format tabs, the full tracklist, a quality selector and a Find sources button" />
+  <img src="docs/screenshots/0.6/android-3.png" width="240"
+       alt="Worbus for Android: the page of a missing album, before sources are fetched" />
+  <img src="docs/screenshots/0.6/desktop-3.png" width="480"
+       alt="Worbus for desktop: the page of a missing album, before sources are fetched" />
 </p>
 
-The same surface on Android — note the mini-player reading **Playing on** the desktop's name: the phone is
-controlling a session running on the desktop. An artist's discography marks every release owned,
-partly owned or missing, and a partly owned album says which tracks it lacks and fills them in one
-tap.
+### One session, every device
+
+Home shows what to play next. The device picker lists every device, the phone, the desktop and the other
+app among them, and any of them can take over the session mid-song.
 
 <p align="center">
-  <img src="docs/screenshots/navic-discography.webp" width="240"
-       alt="Worbus for Android: artist discography, each album marked Owned, Partly owned with a progress bar, or Missing" />
-  <img src="docs/screenshots/navic-album.webp" width="240"
-       alt="Worbus for Android: a partly owned album, washed in its cover's colours, with an 8 tracks missing card and a Fill gaps button" />
-  <img src="docs/screenshots/navic-album-missing-tracks.webp" width="240"
-       alt="The missing-tracks card unfolded: the eight missing tracks, the release they were measured against, Re-check and Open in lb-bot" />
+  <img src="docs/screenshots/0.6/android-1.png" width="240"
+       alt="Worbus for Android: Home" />
+  <img src="docs/screenshots/0.6/android-4.png" width="240"
+       alt="Worbus for Android: the device picker, with the desktop app in it" />
 </p>
-
-Worbus for Android's Home: mood chips, a pill that resumes any saved queue, and the newest additions.
-
 <p align="center">
-  <img src="docs/screenshots/navic-home.webp" width="240"
-       alt="Worbus for Android Home: mood chips, a Continue listening pill over 20 saved queues, Recently added and Fresh rows" />
+  <img src="docs/screenshots/0.6/desktop-1.png" width="480"
+       alt="Worbus for desktop: Home" />
+  <img src="docs/screenshots/0.6/desktop-4.png" width="480"
+       alt="Worbus for desktop: the device picker, with the phone app in it" />
 </p>
 
-Behind it, lb-bot's own workspace handles the per-track gap filling — which tracks are absent, which
-sources are ready, and what it's working on.
-
-<p align="center">
-  <img src="docs/screenshots/lb-bot-fill-gaps.png" width="720"
-       alt="lb-bot's Needs you page: the queue of albums with gaps on the left, and one album open beside it with 14 of 16 tracks in the library, its 2 missing tracks listed and a Find sources button" />
-</p>
+Behind the gaps, lb-bot, the half that knows which albums are missing, handles the per-track gap filling:
+which tracks are absent, which sources are ready, and what it is working on. It has its own page, served
+by the Worbus Server.
 
 ### Everything else
 
@@ -138,7 +140,8 @@ server/               the Worbus Server image — Dockerfile, launcher, healthch
 hub/                  the relay — hub.py, Dockerfile, tools/ (it ships inside the Worbus Server image)
 preview/              the preview sidecar — preview.py, Dockerfile, docker-compose.yml, tools/
 docs/ARCHITECTURE.md  what each piece is, how they talk, and where the code lives
-docs/screenshots/     images used by this file
+docs/brand/           the Worbus icon (light and dark) shown at the top of this file
+docs/screenshots/0.6/ the screenshots shown in this file
 PROTOCOL.md           the wire protocol spec
 ```
 

@@ -652,7 +652,8 @@ worbus/
   PROTOCOL.md                    wire protocol spec
   CLAUDE.md                      working notes for coding agents
   docs/ARCHITECTURE.md           ← this file
-  docs/screenshots/              images used by the README
+  docs/brand/                    the Worbus icon (light and dark) for the README
+  docs/screenshots/0.6/          images used by the README
   server/                        the Worbus Server image — Dockerfile, worbus_launch.py,
                                  worbus_redact.py, healthcheck.py, compose.yaml,
                                  .env.example, tools/
