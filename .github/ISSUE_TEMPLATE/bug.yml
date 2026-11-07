@@ -1,12 +1,12 @@
 name: Bug
-description: Something in the Worbus Server, Navic or Feishin does not work as it should.
+description: Something in the Worbus Server, Worbus for Android or Worbus for desktop does not work as it should.
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for testing. One tracker for every piece: if you are not sure which one is at fault, pick your
-        best guess. Before attaching logs, see [Sending logs](https://github.com/illuminator69/navi-connect/blob/main/INSTALL.md#6-sending-logs):
+        best guess. Before attaching logs, see [Sending logs](https://github.com/illuminator69/worbus/blob/main/INSTALL.md#6-sending-logs):
         each logs file is cleaned of passwords and tokens, but read it once before you send it.
   - type: dropdown
     id: piece
@@ -14,8 +14,8 @@ body:
       label: Which piece?
       options:
         - Worbus Server
-        - Navic (Android)
-        - Feishin (desktop)
+        - Worbus for Android
+        - Worbus for desktop
         - Not sure
     validations:
       required: true
@@ -24,21 +24,21 @@ body:
     attributes:
       label: Worbus Server version
       description: On the app's Server screen, or the first line of `docker logs worbus-server`.
-      placeholder: 0.4.0 (abc1234)
+      placeholder: 0.5.0 (abc1234)
     validations:
       required: true
   - type: input
-    id: navic-version
+    id: android-version
     attributes:
-      label: Navic version
-      description: Navic › About. Leave blank if you don't use it.
-      placeholder: 0.4.0 (abc1234)
+      label: Worbus for Android version
+      description: Worbus › About. Leave blank if you don't use it.
+      placeholder: 0.5.0 (abc1234)
   - type: input
-    id: feishin-version
+    id: desktop-version
     attributes:
-      label: Feishin version
-      description: Feishin's menu › Version. Leave blank if you don't use it.
-      placeholder: 0.4.0 (abc1234)
+      label: Worbus for desktop version
+      description: Worbus's menu › Version. Leave blank if you don't use it.
+      placeholder: 0.5.0 (abc1234)
   - type: textarea
     id: what-happened
     attributes:
@@ -57,5 +57,5 @@ body:
     attributes:
       label: Logs
       description: |
-        Drag the logs file here: `worbus-server.log` for the server, Navic's **Share logs** file, or Feishin's
+        Drag the logs file here: `worbus-server.log` for the server, the Android app's **Share logs** file, or the desktop app's
         **Export diagnostics** zip.

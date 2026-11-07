@@ -2,8 +2,9 @@
 # and publishes it to GHCR, on a release tag or by hand (Worbus P4, design §6.1, §6.9).
 #
 # LBBOT_IMAGE is read from the Dockerfile's own default, so the lb-bot a release holds
-# is whatever digest the tagged commit pins there. hub-docker.yml and
-# preview-docker.yml are separate and unchanged (the hub image is the rollback).
+# is whatever digest the tagged commit pins there. This is the only image workflow:
+# the separate hub and preview image workflows were removed in Worbus P5 (the old hub image
+# stays on GHCR for the rollback).
 name: worbus-server
 
 on:

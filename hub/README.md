@@ -1,4 +1,4 @@
-# navi-connect hub
+# Worbus hub
 
 Headless relay that gives Navidrome clients Spotify-Connect-style behaviour:
 real-time queue control and transfer-with-resume between devices. The hub holds
@@ -7,26 +7,18 @@ receivers stream from Navidrome themselves. Protocol: [`../PROTOCOL.md`](../PROT
 
 ## Run
 
-```bash
-cp .env.example .env        # set HUB_TOKEN and the Navidrome service account; uncomment the services you run
-docker compose pull && docker compose up -d
-```
+To run Worbus, install the **Worbus Server** (this hub plus lb-bot in one image): see
+[`../INSTALL.md`](../INSTALL.md). The hub is not installed on its own any more.
 
-The compose file pulls the image CI publishes to GHCR on every push to `main`
-(`ghcr.io/illuminator69/navi-connect-hub`); the same two commands update it. To
-build locally instead, swap its `image:` line for `build: .`.
-
-Or, matching the bot's `docker run` style on Unraid:
+To run the hub from source while developing (Python 3.11+, `websockets`; the settings
+are the table below):
 
 ```bash
-docker build -t navi-connect-hub .
-docker run -d --name navi-connect-hub --restart unless-stopped \
-  --network media -p 4790:4790 --env-file .env \
-  -v /mnt/user/appdata/navi-connect:/data \
-  navi-connect-hub
+cd hub
+HUB_TOKEN=tok HUB_PORT=4899 HUB_HEALTH_PORT=4898 HUB_HOST=127.0.0.1 HUB_STATE=/tmp/hub.json python hub.py
 ```
 
-Clients then connect to `ws://<unraid-host>:4790`.
+Clients connect to `ws://<host>:4790`.
 
 ## Configuration (env)
 
@@ -181,7 +173,7 @@ You" recipe (`../PROTOCOL.md` §17.1).
 ### Moods (`/sonic/mood/*`)
 
 Thirteen moods, each a list of your own songs ranked by AudioMuse's CLAP text search
-(`../PROTOCOL.md` §18.5). Ten of them have four tiles each for Navic's Home. All
+(`../PROTOCOL.md` §18.5). Ten of them have four tiles each for Worbus for Android's Home. All
 thirteen feed the queue's mood chips, and eight are offered as the radio's mood filter. The catalogue lives
 in `hub.py` (`MOODS`), so a prompt can be reworded without a client release. Each list
 is rebuilt every six hours. Enabled with `HUB_TOKEN` and `AUDIOMUSE_URL`, and needs
@@ -289,7 +281,7 @@ previous hub's own code) and `test_user_spaces.py`.
 
 ## What clients must implement
 
-Each client (Feishin fork, Navic fork) is both controller and receiver:
+Each client (Worbus for desktop, Worbus for Android) is both controller and receiver:
 
 - sign in once with the app's Navidrome account (`POST /hub/signin`, PROTOCOL §3.3),
   keep the returned `deviceSecret` in the platform's secret store, adopt the returned

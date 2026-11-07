@@ -39,7 +39,7 @@ ENV WORBUS_VERSION=${WORBUS_VERSION} \
     WORBUS_LBBOT_DIR=/app \
     PYTHONUNBUFFERED=1
 LABEL org.opencontainers.image.title="Worbus Server" \
-      org.opencontainers.image.source="https://github.com/illuminator69/navi-connect" \
+      org.opencontainers.image.source="https://github.com/illuminator69/worbus" \
       org.opencontainers.image.version="${WORBUS_VERSION}" \
       org.opencontainers.image.revision="${WORBUS_COMMIT}"
 

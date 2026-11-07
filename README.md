@@ -1,20 +1,27 @@
-# navi-connect
+# Worbus
 
-**Your music library, finished and shared.** navi-connect joins two self-hosted projects into one:
+**Your music library, finished and shared.** Worbus joins two self-hosted projects into one:
 a Spotify-Connect–style **shared playback session** across every device, and **lb-bot**, which knows
 every album your library is missing and can fetch it — from inside the player, on the artist page
 you're already looking at.
 
 It sits on top of [Navidrome](https://navidrome.org) and needs nothing hosted by anyone else.
+Worbus is not affiliated with Navidrome.
+
+Worbus is three pieces that work together:
+
+- **Worbus for Android**, the phone app.
+- **Worbus for desktop**, the computer app (Linux, Windows, macOS).
+- **Worbus Server**, one container that runs beside your Navidrome and ties the apps together.
 
 ### ▶ [**Install Worbus →**](INSTALL.md)
 
 **If you want to run this, start there, not here.** One page: the Worbus Server (one container beside your
 Navidrome, three settings), the apps, the first run, and how to send logs. Prebuilt apps need no
-toolchain: **Navic** for Android is on
-[navic-gaps' Releases](https://github.com/illuminator69/navic-gaps/releases), and **Feishin** for the
-desktop is on [feishin-gaps' Releases](https://github.com/illuminator69/feishin-gaps/releases).
-Bugs and ideas for any piece go to [this repository's issues](https://github.com/illuminator69/navi-connect/issues/new/choose).
+toolchain: **Worbus for Android** is on
+[worbus-android's Releases](https://github.com/illuminator69/worbus-android/releases), and **Worbus for
+desktop** is on [worbus-desktop's Releases](https://github.com/illuminator69/worbus-desktop/releases).
+Bugs and ideas for any piece go to [this repository's issues](https://github.com/illuminator69/worbus/issues/new/choose).
 
 ---
 
@@ -28,7 +35,7 @@ live where you'd notice them.
 
 <p align="center">
   <img src="docs/screenshots/feishin-artist-missing-albums.png" width="720"
-       alt="Feishin artist page showing owned albums alongside greyed-out ones marked NOT IN LIBRARY, with a +38 MISSING badge" />
+       alt="Worbus for desktop: artist page showing owned albums alongside greyed-out ones marked NOT IN LIBRARY, with a +38 MISSING badge" />
 </p>
 
 **A download is reviewed, not fired blind.** Pick the edition, check it against the canonical
@@ -36,28 +43,28 @@ MusicBrainz tracklist, choose a quality, and only then go looking for sources.
 
 <p align="center">
   <img src="docs/screenshots/feishin-missing-album-review.png" width="720"
-       alt="Missing-album dialog in Feishin showing edition tabs, media-format tabs, the full tracklist, a quality selector and a Find sources button" />
+       alt="Worbus for desktop: missing-album dialog showing edition tabs, media-format tabs, the full tracklist, a quality selector and a Find sources button" />
 </p>
 
-The same surface on Android — note the mini-player reading **Playing on Feishin**: the phone is
+The same surface on Android — note the mini-player reading **Playing on** the desktop's name: the phone is
 controlling a session running on the desktop. An artist's discography marks every release owned,
 partly owned or missing, and a partly owned album says which tracks it lacks and fills them in one
 tap.
 
 <p align="center">
   <img src="docs/screenshots/navic-discography.webp" width="240"
-       alt="Navic artist discography: each album marked Owned, Partly owned with a progress bar, or Missing" />
+       alt="Worbus for Android: artist discography: each album marked Owned, Partly owned with a progress bar, or Missing" />
   <img src="docs/screenshots/navic-album.webp" width="240"
-       alt="A partly owned album in Navic, washed in its cover's colours, with an 8 tracks missing card and a Fill gaps button" />
+       alt="Worbus for Android: a partly owned album, washed in its cover's colours, with an 8 tracks missing card and a Fill gaps button" />
   <img src="docs/screenshots/navic-album-missing-tracks.webp" width="240"
        alt="The missing-tracks card unfolded: the eight missing tracks, the release they were measured against, Re-check and Open in lb-bot" />
 </p>
 
-Navic's Home: mood chips, a pill that resumes any saved queue, and the newest additions.
+Worbus for Android's Home: mood chips, a pill that resumes any saved queue, and the newest additions.
 
 <p align="center">
   <img src="docs/screenshots/navic-home.webp" width="240"
-       alt="Navic Home: mood chips, a Continue listening pill over 20 saved queues, Recently added and Fresh rows" />
+       alt="Worbus for Android Home: mood chips, a Continue listening pill over 20 saved queues, Recently added and Fresh rows" />
 </p>
 
 Behind it, lb-bot's own workspace handles the per-track gap filling — which tracks are absent, which
@@ -84,9 +91,9 @@ sources are ready, and what it's working on.
   play most), a genre run, or more like one artist; plus Song Journey and text-to-music search.
 - **Custom radio and moods.** A radio can start from up to eight artists, with a variety setting
   and a mood filter. Moods (Relax, Focus, Workout and others) are lists of your own songs that the
-  hub ranks with AudioMuse-AI's text search. Navic shows them on Home as chips, each with four mixes,
+  hub ranks with AudioMuse-AI's text search. Worbus for Android shows them on Home as chips, each with four mixes,
   and offers mood chips in the queue.
-- **lb-bot on the phone.** Navic has lb-bot's Needs attention, Source history, Listening stats and
+- **lb-bot on the phone.** Worbus for Android has lb-bot's Needs attention, Source history, Listening stats and
   library tools in its avatar menu.
 - **Discover and Listening.** Rows of fresh releases, ListenBrainz playlists, rediscoveries and
   similar artists, and a listening-history page mirrored from ListenBrainz.
@@ -106,7 +113,7 @@ Four pieces, three of them optional:
 | | |
 |---|---|
 | **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active, the sleep timer — and never touches audio. It also computes the stations, and proxies AudioMuse, lb-bot and the preview sidecar so no device carries their credentials. Python and `websockets`, one file. Lives in this repo under `hub/`. |
-| **Clients** | Every client is both a controller and a receiver. **Feishin** (desktop) and **Navic** (Android) each connect over WebSocket and can play, or hand playback to someone else. |
+| **Clients** | Every client is both a controller and a receiver. **Worbus for desktop** and **Worbus for Android** each connect over WebSocket and can play, or hand playback to someone else. |
 | **AudioMuse-AI** | Optional. The recommendation engine behind the stations, the mixes and Song Journey. Reached through the hub, so no device carries its credentials. |
 | **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, can acquire it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
 | **Preview sidecar** (currently not being developed) | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
@@ -118,9 +125,9 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 
 | Repo | What's in it |
 |---|---|
-| **[navi-connect](https://github.com/illuminator69/navi-connect)** (you are here) | The hub, the Worbus Server image (`server/`), the preview sidecar, the docs, and the one issue tracker. |
-| **[navic-gaps](https://github.com/illuminator69/navic-gaps)** | The Android client — a fork of [ssalggnikool/Navic](https://github.com/ssalggnikool/Navic), with its UI rebuilt around navi-connect. Kept separate so upstream Navic releases can still be merged with `git merge v1.0.0-alphaNN`. Its APKs are on [its own Releases page](https://github.com/illuminator69/navic-gaps/releases). GPL-3.0. |
-| **[feishin-gaps](https://github.com/illuminator69/feishin-gaps)** | The desktop client — a fork of [Feishin](https://github.com/jeffvli/feishin). Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. GPL-3.0; this is also where the binaries' source lives. |
+| **[worbus](https://github.com/illuminator69/worbus)** (you are here) | The front door: the install page, the hub, the Worbus Server image (`server/`), the preview sidecar, the docs, and the one issue tracker. |
+| **[worbus-android](https://github.com/illuminator69/worbus-android)** | Worbus for Android — a fork of [Navic](https://github.com/ssalggnikool/Navic) by paige, with its UI rebuilt around Worbus. Kept separate so upstream Navic releases can still be merged. Download and issues: see this repository. GPL-3.0. |
+| **[worbus-desktop](https://github.com/illuminator69/worbus-desktop)** | Worbus for desktop — a fork of [Feishin](https://github.com/jeffvli/feishin) by Jeff Li. Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. Download and issues: see this repository. GPL-3.0; this is also where the binaries' source lives. |
 | **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
 
 ## Contents of this repo
@@ -128,7 +135,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 ```
 INSTALL.md            how to install the server and the apps, and send logs
 server/               the Worbus Server image — Dockerfile, launcher, healthcheck, compose.yaml, .env.example
-hub/                  the relay — hub.py, Dockerfile, docker-compose.yml, tools/
+hub/                  the relay — hub.py, Dockerfile, tools/ (it ships inside the Worbus Server image)
 preview/              the preview sidecar — preview.py, Dockerfile, docker-compose.yml, tools/
 docs/ARCHITECTURE.md  what each piece is, how they talk, and where the code lives
 docs/screenshots/     images used by this file
@@ -141,3 +148,8 @@ The hub and the docs are this project's own work. Both clients are GPL-3.0 forks
 upstream projects' licences — all credit for Navic belongs to
 [paige](https://github.com/ssalggnikool), and for Feishin to
 [jeffvli](https://github.com/jeffvli) and their contributors.
+
+- Worbus for Android is a fork of [Navic](https://github.com/ssalggnikool/Navic) by paige.
+- Worbus for desktop is a fork of [Feishin](https://github.com/jeffvli/feishin) by Jeff Li.
+- Licensed GPL-3.0, like the original.
+- Worbus is not affiliated with Navidrome.

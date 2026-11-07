@@ -47,7 +47,7 @@ REQUIRED = ("NAVIDROME_URL", "NAVIDROME_USER", "NAVIDROME_PASSWORD")
 EXAMPLE_VALUES = {"NAVIDROME_URL": "https://navidrome.example.com",
                   "NAVIDROME_USER": "your-navidrome-username",
                   "NAVIDROME_PASSWORD": "your-navidrome-password"}
-MBZ_CONTACT_DEFAULT = "https://github.com/illuminator69/navi-connect"
+MBZ_CONTACT_DEFAULT = "https://github.com/illuminator69/worbus"
 SECRET_NAME = "service-secret"
 _SECRET_RE = re.compile(r"[0-9a-f]{64}")
 

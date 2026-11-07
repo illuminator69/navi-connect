@@ -1,9 +1,9 @@
 # Installing Worbus
 
-Worbus is two apps (Navic for Android, Feishin for the desktop) and one server, the **Worbus Server**,
+Worbus is two apps (**Worbus for Android** and **Worbus for desktop**) and one server, the **Worbus Server**,
 which runs beside your Navidrome. This page is all you need: nothing here asks for the source code.
 
-Found a bug, or have an idea? [Open an issue](https://github.com/illuminator69/navi-connect/issues/new/choose).
+Found a bug, or have an idea? [Open an issue](https://github.com/illuminator69/worbus/issues/new/choose).
 One tracker for every piece.
 
 ## 1. What you need
@@ -21,8 +21,8 @@ One tracker for every piece.
 
    ```sh
    mkdir -p worbus-server/data && cd worbus-server
-   curl -fLO https://raw.githubusercontent.com/illuminator69/navi-connect/main/server/compose.yaml
-   curl -fL -o .env https://raw.githubusercontent.com/illuminator69/navi-connect/main/server/.env.example
+   curl -fLO https://raw.githubusercontent.com/illuminator69/worbus/main/server/compose.yaml
+   curl -fL -o .env https://raw.githubusercontent.com/illuminator69/worbus/main/server/.env.example
    chmod 600 .env
    ```
 
@@ -46,7 +46,7 @@ One tracker for every piece.
    ```
 
    **Healthy** looks like `Up 1 minute (healthy)`; give it up to two minutes on the first start.
-   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.4.0 (abc1234)`, and every line after it
+   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.5.0 (abc1234)`, and every line after it
    says which half wrote it, `[hub]` or `[lb-bot]`. If a required setting is missing, blank or still the example
    value, or the `data` folder is not writable by that `user:`, the server stops and its last line names the
    setting or the folder. A value that is set but wrong (a mistyped address, a wrong password) is not caught at
@@ -58,17 +58,18 @@ network.
 
 ## 3. The apps
 
-- **Navic (Android):** the APK is on [navic-gaps' Releases](https://github.com/illuminator69/navic-gaps/releases).
-  If the original Navic (from Obtainium, F-Droid or its own releases) is installed, **uninstall it once** first:
-  this build has the same package name and a different signature, so Android refuses to install it over the
-  original. Later Worbus builds install over this one.
-- **Feishin (desktop):** on [feishin-gaps' Releases](https://github.com/illuminator69/feishin-gaps/releases):
+- **Worbus for Android:** the APK is on [worbus-android's Releases](https://github.com/illuminator69/worbus-android/releases).
+  If the original Navic (from Obtainium, F-Droid or its own releases) is installed, you can leave it: Worbus
+  has its own app ID and installs beside it. Later Worbus builds install over this one.
+- **Worbus for desktop:** on [worbus-desktop's Releases](https://github.com/illuminator69/worbus-desktop/releases):
   Linux (AppImage, deb, tar.xz), Windows (a portable zip) and macOS (dmg). The builds are not signed:
   - **Windows** shows "Windows protected your PC" (SmartScreen) on the first start: **More info**, then
     **Run anyway**.
   - **macOS** says the app cannot be checked: right-click it, **Open**, then **Open** again.
+  - If you used Feishin on this computer, Worbus copies its settings the first time it starts (close Feishin first;
+    nothing is deleted). The Worbus Server sign-in is not copied: sign in to it once.
 
-Each app's About shows its version, for example `0.4.0 (abc1234)`.
+Each app's About shows its version, for example `0.5.0 (abc1234)`.
 
 ## 4. First run
 
@@ -105,9 +106,9 @@ Navidrome logins in a line are replaced with `[removed]`. Still read the file on
   docker logs worbus-server --since 24h > worbus-server.log
   ```
 
-- **Navic:** About › **copy logs for report** opens the Logs screen; tap **Share logs** and send the file. After
+- **Worbus for Android:** About › **copy logs for report** opens the Logs screen; tap **Share logs** and send the file. After
   a crash, the crash screen has **Share** (and **Copy**) for its report.
-- **Feishin:** Settings › Advanced › Logger › **Export diagnostics** saves a zip.
+- **Worbus for desktop:** Settings › Advanced › Logger › **Export diagnostics** saves a zip.
 
 The bug form asks for three versions: each app's (in its About) and the server's (on the app's Server screen).
 

@@ -1,8 +1,8 @@
-# navi-connect — Protocol Specification (v0.1 draft)
+# Worbus protocol — Specification (v0.1 draft)
 
 A Spotify-Connect-style control layer for a personal Navidrome setup. A small
-**headless relay** ("the hub") runs on Unraid; each music client (Feishin on
-Windows, a Navic fork on Android) connects out to it and is simultaneously a
+**headless relay** ("the hub") runs on Unraid; each music client (Worbus for desktop,
+Worbus for Android) connects out to it and is simultaneously a
 **controller** and a **receiver**. The hub never touches audio — each receiver
 streams directly from Navidrome by track id. The hub only shuttles a small JSON
 session (`queue + index + positionMs + isPlaying + activeDevice`) between devices
@@ -10,7 +10,7 @@ and fans out state to controllers.
 
 > **Scope of this doc:** the wire protocol only. It defines the transport, the
 > message catalog, the session model, and the transfer-with-resume flow, plus how
-> each side maps onto the *existing* Feishin and Navic code. No client code is
+> each side maps onto the code the two apps were forked from (Feishin and Navic). No client code is
 > changed yet — this is the design to review first.
 
 ---
@@ -86,7 +86,7 @@ it is purely a controller. Every device is always a potential controller.
 ```
 Client → Hub : { "t":"hello", "auth": { "deviceSecret":"<from §3.3>" },   // or, legacy:
                  "token":"<HUB_TOKEN>",
-                 "device": { "id":"<persisted-uuid|null>", "name":"Feishin-PC",
+                 "device": { "id":"<persisted-uuid|null>", "name":"Desk-PC",
                              "platform":"desktop|android", "kind":"computer",
                              "caps":["receiver","controller"],
                              "bridgedBy":"<owning-device-id|absent>" } }
@@ -189,7 +189,7 @@ Hub → Client : { "t":"welcome", "deviceId":"<assigned-uuid>",
 { "id":"cast-abc", "name":"Living Room", "platform":"chromecast", "kind":"tv",
   "caps":["receiver","loadAck"], "online":true, "isActive":false,
   "lastSeen":1755500000000, "volume":40,
-  "reachable":true, "appRunning":true, "bridgedBy":"feishin-pc" }
+  "reachable":true, "appRunning":true, "bridgedBy":"desk-pc" }
 ```
 
 `kind` is what the device said it is in `hello` (§3.1), or `null` if it never said.
@@ -479,7 +479,7 @@ or the client found.
 ### 4.3 DeviceInfo (registry; mirrored to all)
 
 ```jsonc
-{ "id":"uuid", "name":"Feishin-PC", "platform":"desktop", "kind":"computer",
+{ "id":"uuid", "name":"Desk-PC", "platform":"desktop", "kind":"computer",
   "caps":["receiver","controller","loadAck"], "online":true,
   "isActive":false, "lastSeen": 1730000000000, "volume": 100,
   // presence (`online`) and reachability are different questions — see §3.2
@@ -824,7 +824,7 @@ own space. `library`, `index` and `lb` are library facts and go to every user;
         │  t:act action:next
         ▼
       [HUB]  index←index+1 (respecting repeat/shuffle), rev++
-        │  t:do cmd:jump index:7        ──────────────►  [ACTIVE RECEIVER = Feishin-PC]
+        │  t:do cmd:jump index:7        ──────────────►  [ACTIVE RECEIVER = Desk-PC]
         │                                                 loads/seeks, starts track 7
         │  t:session (rev 43) ──► all controllers          │ t:report index:7 positionMs:0
         ◄───────────────────────────────────────────────── ┘
@@ -1021,7 +1021,7 @@ No socket is ever blocked by a hold: a device can send `transfer`, further acts 
 
 ## 8. Mapping onto existing client code
 
-### 8.1 Feishin (Electron, `feishin-development`)
+### 8.1 Worbus for desktop (a fork of Feishin; Electron, upstream branch `feishin-development`)
 
 Feishin **already** runs a WS *server* for its web-remote
 (`src/main/features/core/remote/index.ts`, port 4333) with auth + heartbeat and a
@@ -1043,7 +1043,11 @@ backoff, hello/welcome); (b) extend the renderer→main bridge to publish the wh
 queue + index (today it publishes only the current song); (c) handle `do:load`
 by calling `setQueue`. ~Most of the protocol's transport half already exists.
 
-### 8.2 Navic (Kotlin Multiplatform, `composeApp`)
+### 8.2 Worbus for Android (a fork of Navic; Kotlin Multiplatform, `composeApp`)
+
+Kotlin sources live under `composeApp/src/commonMain/kotlin/app/worbus/` (the package was
+`paige.navic` before Worbus 0.5; upstream Navic keeps that name, so older notes and the
+upstream branch `Navic-master` use it).
 
 No remote layer yet, but the seams are clean and Ktor (WebSocket client) +
 media3 are already dependencies.
@@ -1175,7 +1179,7 @@ Navic `SavedQueueRepository`/`SavedQueueDao` + `HubManager`.
 
 Independently of the hub, the hub MAY mirror session changes to Navidrome's
 native `savePlayQueue` (queue ids + `current` + `position`). This is **not**
-required for navi-connect's own transfer (the hub already persists), but it lets
+required for Worbus's own transfer (the hub already persists), but it lets
 unmodified Subsonic clients (Symfonium, DSub) pick up "where you left off" via
 `getPlayQueue`. Pull-only, not real-time — purely a courtesy bridge. Toggle:
 `HUB_MIRROR_PLAYQUEUE=true`.
@@ -1272,7 +1276,7 @@ directly, which is why every published track carries `streamUrl` + `mime`.
 
 Neither client uses a Cast SDK; both speak castv2 (TLS to port 8009) directly.
 **Feishin** uses `bonjour-service` + `castv2-client`; **Navic** uses `NsdManager`
-+ its own castv2 implementation (`domain/manager/cast/`).
++ its own castv2 implementation (`composeApp/src/commonMain/kotlin/app/worbus/domain/manager/cast/`).
 
 **Reachability.** The bridge's hub socket lives in a client process on the LAN; the
 speaker does not. So `online` on a `cast-<id>` row means *the bridge is up*, which is

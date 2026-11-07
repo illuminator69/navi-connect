@@ -8,8 +8,8 @@ body:
       label: Which piece?
       options:
         - Worbus Server
-        - Navic (Android)
-        - Feishin (desktop)
+        - Worbus for Android
+        - Worbus for desktop
         - All of them
         - Not sure
     validations:

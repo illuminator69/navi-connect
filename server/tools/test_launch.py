@@ -262,7 +262,7 @@ def t_fills_both_halves_from_three() -> list[str]:
                    "LB_BOT_LIBRARY_INDEX": str(tmp / "lb-bot" / "library_index.db"),
                    "LB_BOT_WEB": "1", "LB_BOT_WEB_HOST": "0.0.0.0",
                    "LB_BOT_MUSIC_DIR": "/music",
-                   "MBZ_CONTACT": "https://github.com/illuminator69/navi-connect"}
+                   "MBZ_CONTACT": "https://github.com/illuminator69/worbus"}
         for half, got_env, want in (("hub", hub, want_hub), ("lb-bot", lb, want_lb)):
             for k, v in want.items():
                 if got_env.get(k) != v:

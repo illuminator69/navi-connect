@@ -1,4 +1,4 @@
-# navi-connect umbrella repo
+# Worbus umbrella repo
 #
 # The Feishin fork is NOT vendored here — it keeps its own repository so that
 # upstream releases can still be merged with `git merge upstream/<tag>`, and so

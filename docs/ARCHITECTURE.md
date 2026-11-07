@@ -1,8 +1,12 @@
-# navi-connect — architecture
+# Worbus — architecture
 
 How the pieces fit together, what talks to what, and where the code lives. The
 [README](../README.md) is the project description; [`PROTOCOL.md`](../PROTOCOL.md) is the full wire
 spec; [`INSTALL.md`](../INSTALL.md) is how to actually run it.
+
+**Names.** The apps are *Worbus for Android* and *Worbus for desktop*; they are forks of Navic and Feishin. Below, the
+code-level sections (file maps, hook names, the feature history) keep saying "Navic" and "Feishin" for the
+forked codebases, because that is what the files and upstream's history are called.
 
 The hub is the only component in this repository. Both clients and lb-bot are separate repos, linked
 below — this file covers the parts of them that face the hub.
@@ -12,7 +16,7 @@ below — this file covers the parts of them that face the hub.
 ## 1. What it is / the problem it solves
 
 Navidrome is a self-hosted music server (Subsonic-compatible). Its clients normally each play
-independently. navi-connect adds a **shared playback session** across devices — like Spotify
+independently. Worbus adds a **shared playback session** across devices — like Spotify
 Connect — so you can:
 
 - Control what's playing on one device from another (play/pause/next/seek/volume/queue edits).
@@ -31,8 +35,8 @@ important for Chromecast, which must fetch stream URLs directly).
 | Component | What it is | Tech | Location |
 |---|---|---|---|
 | **Hub** | Headless relay holding session intent; routes commands; AudioMuse Tier-2 + lb-bot proxies; optional Navidrome `savePlayQueue` mirror | Python 3.11+, asyncio, `websockets`, **port 4790** | `hub/` |
-| **Feishin** (fork) | Desktop client (controller + receiver) + the **Chromecast bridge** | Electron / TypeScript / React | [feishin-gaps](https://github.com/illuminator69/feishin-gaps) |
-| **Navic** (fork) | Mobile client (controller + receiver) + native Chromecast | Kotlin Multiplatform / Compose, **Android only** | [navic-gaps](https://github.com/illuminator69/navic-gaps) |
+| **Worbus for desktop** (a fork of Feishin) | Desktop client (controller + receiver) + the **Chromecast bridge** | Electron / TypeScript / React | [worbus-desktop](https://github.com/illuminator69/worbus-desktop) |
+| **Worbus for Android** (a fork of Navic) | Mobile client (controller + receiver) + native Chromecast | Kotlin Multiplatform / Compose, **Android only** | [worbus-android](https://github.com/illuminator69/worbus-android) |
 | **Preview sidecar** | yt-dlp preview of a track the library lacks. Its own process, and **the media origin** — the hub carries only the control plane (`PROTOCOL.md` §16) | Python 3.11+, asyncio, `yt-dlp`, **port 4792** | `preview/` |
 | **Navidrome** | The music server (not in this repo) | Go, Subsonic/OpenSubsonic API | `https://music.example.com` |
 | **AudioMuse-AI** | Recommendation engine (not in this repo) | Navidrome plugin (Tier 1) + core HTTP API (Tier 2) | server-side |
@@ -470,7 +474,7 @@ settle (`LBBOT_WEB_URL`, else `LBBOT_URL`). An artist the mirror does not hold f
 - **Song Journey** (Navidrome's `findSonicPath`) and **CLAP text→mood search** (both); a
   **generator chip** on the queue naming what built it.
 
-### Known open items (the [issue tracker](https://github.com/illuminator69/navi-connect/issues) has the rest; the retired `TESTING-SETUP.md` §8, in git history, listed them before Worbus 0.4)
+### Known open items (the [issue tracker](https://github.com/illuminator69/worbus/issues) has the rest; the retired `TESTING-SETUP.md` §8, in git history, listed them before Worbus 0.4)
 - Feishin mood-palette/Haze/energy-motion parity. *(Mood Flow and its presets were retired by the
   stations of 2026-10-16.)*
 - Navic **native cast lifecycle re-adoption** after a process restart (crash is fixed; lifecycle isn't).
@@ -502,7 +506,7 @@ routes (including the album-override and merge status polls) and a 1-slot sync p
 moves and the only one that broadcasts the `lb` frame.
 `hub/tools/` has manual test scripts (`fake_receiver.py`,
 `controller.py`, `test_transfer.py`) and the automated `test_*.py` suites, each of which exits 0
-when it passes. Docker via `hub/Dockerfile` + `docker-compose.yml`.
+when it passes. The hub ships in the Worbus Server image (`server/Dockerfile`).
 
 ### Preview sidecar — `preview/preview.py`
 Single file, stdlib + `yt-dlp`. `serve_client` is a hand-rolled HTTP/1.1 server on
@@ -536,7 +540,7 @@ called, and they must stay consistent — see §5.
 - **Visualizer:** `features/visualizer/components/blob/*` + `hooks/use-track-mood.ts`.
 
 ### Navic (commonMain unless noted)
-Navic lives in **[navic-gaps](https://github.com/illuminator69/navic-gaps)** and keeps its own
+Worbus for Android (a fork of Navic) lives in **[worbus-android](https://github.com/illuminator69/worbus-android)** and keeps its own
 `CLAUDE.md`, which is the current map of that tree — the hub client, the ExoPlayer↔`RemoteSessionPlayer`
 swap, the hand-rolled castv2 bridge, the lb-bot surface, the cover-colour engine, and the upstream
 merge playbook. The integration points from this side:
@@ -583,12 +587,12 @@ cd preview
 docker compose up -d          # or: python preview.py   (Python 3.11+, `yt-dlp`)
 ```
 
-### Feishin (Electron)
-In the [feishin-gaps](https://github.com/illuminator69/feishin-gaps) repo. Requires Node 20+ and
+### Worbus for desktop (Electron)
+In the [worbus-desktop](https://github.com/illuminator69/worbus-desktop) repo (a fork of Feishin). Requires Node 20+ and
 `corepack enable` (pnpm is version-pinned by the `packageManager` field), then `pnpm install`.
 ```
 pnpm dev                                          # dev
-pnpm run build && pnpm exec electron-builder --win --x64 --dir   # portable → dist/win-unpacked/Feishin.exe
+pnpm run build && pnpm exec electron-builder --win --x64 --dir   # portable → dist/win-unpacked/Worbus.exe
 ```
 - **Typecheck WITHOUT a deps re-check** (important — `pnpm run typecheck` re-checks deps and has broken
   the lockfile before):
@@ -596,15 +600,15 @@ pnpm run build && pnpm exec electron-builder --win --x64 --dir   # portable → 
   `... -p tsconfig.node.json ...` (main).
 - **Installer is not viable** (Defender quarantines the unsigned NSIS build) → ship the **portable
   `dist/win-unpacked/`** folder. Proper fix would be code-signing.
-- In Feishin settings, set hub **URL** (default `ws://localhost:4790`), **token**, device **name**, and
+- In the desktop app's settings, set hub **URL** (default `ws://localhost:4790`), **token**, device **name**, and
   **Public server URL** = `https://music.example.com` (rewrites stream/image origins for the cast bridge).
 
-### Navic (Android / KMP)
-In the [navic-gaps](https://github.com/illuminator69/navic-gaps) repo, branch `navi-connect`.
+### Worbus for Android (Android / KMP)
+In the [worbus-android](https://github.com/illuminator69/worbus-android) repo (a fork of Navic), branch `navi-connect`.
 **`:androidApp`** is the Android *application* module; **`:composeApp`** is the shared KMP library.
 Gradle provisions its own JDK 21 toolchain — don't set `JAVA_HOME`.
 ```
-./gradlew :androidApp:assembleRelease      # → androidApp/build/outputs/apk/release/Navic.apk
+./gradlew :androidApp:assembleRelease      # → androidApp/build/outputs/apk/release/Worbus.apk
 ```
 **Test a *release* build** (debug Compose is misleadingly choppy). commonMain changes must still
 compile for iOS (out of scope otherwise). With no `SIGNING_*` env vars set the APK is signed with
@@ -639,7 +643,7 @@ assuming an install failure is anything else.
 
 ## 10. Directory map
 ```
-navi-connect/
+worbus/
   README.md                      the project description (start there)
   INSTALL.md                     installing the Worbus Server and the apps, sending logs
   PROTOCOL.md                    wire protocol spec
@@ -649,7 +653,7 @@ navi-connect/
   server/                        the Worbus Server image — Dockerfile, worbus_launch.py,
                                  worbus_redact.py, healthcheck.py, compose.yaml,
                                  .env.example, tools/
-  hub/                           Python relay hub — hub.py, Dockerfile, docker-compose.yml, tools/
+  hub/                           Python relay hub — hub.py, Dockerfile, tools/
   preview/                       yt-dlp preview sidecar — preview.py, Dockerfile, docker-compose.yml,
                                  tools/. The MEDIA origin; the hub proxies its control plane only
 ```
