@@ -575,7 +575,7 @@ cd hub
 #                                if LBBOT_URL is not reachable from where they are),
 #                                PREVIEW_URL + PREVIEW_PUBLIC_URL + PREVIEW_SECRET (preview
 #                                sidecar; unset = disabled). PREVIEW_SECRET is NOT HUB_TOKEN.
-docker compose up -d          # or: python hub.py   (Python 3.11+, `websockets`)
+python hub.py                  # Python 3.11+, `websockets`; the packaged route is the Worbus Server image (INSTALL.md)
 ```
 
 ### Preview sidecar
@@ -592,12 +592,15 @@ In the [worbus-desktop](https://github.com/illuminator69/worbus-desktop) repo (a
 `corepack enable` (pnpm is version-pinned by the `packageManager` field), then `pnpm install`.
 ```
 pnpm dev                                          # dev
-pnpm run build && pnpm exec electron-builder --win --x64 --dir   # portable → dist/win-unpacked/Worbus.exe
+pnpm run build && pnpm exec electron-builder --win --x64 --dir   # portable → dist/win-unpacked/worbus.exe
 ```
 - **Typecheck WITHOUT a deps re-check** (important — `pnpm run typecheck` re-checks deps and has broken
   the lockfile before):
   `.\node_modules\.bin\tsc.cmd --noEmit -p tsconfig.web.json --composite false` (renderer) and
   `... -p tsconfig.node.json ...` (main).
+- **Release file names** (`electron-builder.yml`, `.github/workflows/release.yml`): Linux
+  `Worbus-linux-x64.AppImage`, `.deb` and `.tar.xz`; Windows the portable zip `Worbus-<version>-win-x64.zip` (the
+  executable inside is `worbus.exe`: `executableName` applies there too); macOS `Worbus-<version>-mac-<arch>.dmg`.
 - **Installer is not viable** (Defender quarantines the unsigned NSIS build) → ship the **portable
   `dist/win-unpacked/`** folder. Proper fix would be code-signing.
 - In the desktop app's settings, set hub **URL** (default `ws://localhost:4790`), **token**, device **name**, and
@@ -608,7 +611,7 @@ In the [worbus-android](https://github.com/illuminator69/worbus-android) repo (a
 **`:androidApp`** is the Android *application* module; **`:composeApp`** is the shared KMP library.
 Gradle provisions its own JDK 21 toolchain — don't set `JAVA_HOME`.
 ```
-./gradlew :androidApp:assembleRelease      # → androidApp/build/outputs/apk/release/Worbus.apk
+./gradlew :androidApp:assembleRelease      # → androidApp/build/outputs/apk/release/Worbus.apk (the release workflow publishes it as Worbus-<tag>.apk)
 ```
 **Test a *release* build** (debug Compose is misleadingly choppy). commonMain changes must still
 compile for iOS (out of scope otherwise). With no `SIGNING_*` env vars set the APK is signed with

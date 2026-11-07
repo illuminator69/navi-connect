@@ -66,10 +66,13 @@ network.
   - **Windows** shows "Windows protected your PC" (SmartScreen) on the first start: **More info**, then
     **Run anyway**.
   - **macOS** says the app cannot be checked: right-click it, **Open**, then **Open** again.
-  - If you used Feishin on this computer, Worbus copies its settings the first time it starts (close Feishin first;
-    nothing is deleted). The Worbus Server sign-in is not copied: sign in to it once.
 
-Each app's About shows its version, for example `0.5.0 (abc1234)`.
+If you used Feishin on this computer, Worbus for desktop copies its settings the first time it starts (close
+Feishin first; nothing is deleted). The Worbus Server sign-in is not copied: sign in to it once. On Linux, saved
+server passwords may not come across either; if the app asks for a password once after the move, enter it again.
+
+The version is in **Settings › About** in Worbus for Android and on the **Version** line of the app menu in Worbus
+for desktop, for example `0.5.0 (abc1234)`.
 
 ## 4. First run
 
@@ -106,11 +109,11 @@ Navidrome logins in a line are replaced with `[removed]`. Still read the file on
   docker logs worbus-server --since 24h > worbus-server.log
   ```
 
-- **Worbus for Android:** About › **copy logs for report** opens the Logs screen; tap **Share logs** and send the file. After
+- **Worbus for Android:** Settings › About › **Copy logs for a bug report** opens the Logs screen; tap **Share logs** and send the file. After
   a crash, the crash screen has **Share** (and **Copy**) for its report.
 - **Worbus for desktop:** Settings › Advanced › Logger › **Export diagnostics** saves a zip.
 
-The bug form asks for three versions: each app's (in its About) and the server's (on the app's Server screen).
+The bug form asks for three versions: each app's (see above) and the server's (on **Settings › Server** in the app).
 
 ## 7. Removing everything
 

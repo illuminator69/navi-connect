@@ -1276,7 +1276,7 @@ directly, which is why every published track carries `streamUrl` + `mime`.
 
 Neither client uses a Cast SDK; both speak castv2 (TLS to port 8009) directly.
 **Feishin** uses `bonjour-service` + `castv2-client`; **Navic** uses `NsdManager`
-+ its own castv2 implementation (`composeApp/src/commonMain/kotlin/app/worbus/domain/manager/cast/`).
++ its own castv2 implementation (`composeApp/src/androidMain/kotlin/app/worbus/domain/manager/cast/`).
 
 **Reachability.** The bridge's hub socket lives in a client process on the LAN; the
 speaker does not. So `online` on a `cast-<id>` row means *the bridge is up*, which is

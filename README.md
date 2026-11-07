@@ -53,7 +53,7 @@ tap.
 
 <p align="center">
   <img src="docs/screenshots/navic-discography.webp" width="240"
-       alt="Worbus for Android: artist discography: each album marked Owned, Partly owned with a progress bar, or Missing" />
+       alt="Worbus for Android: artist discography, each album marked Owned, Partly owned with a progress bar, or Missing" />
   <img src="docs/screenshots/navic-album.webp" width="240"
        alt="Worbus for Android: a partly owned album, washed in its cover's colours, with an 8 tracks missing card and a Fill gaps button" />
   <img src="docs/screenshots/navic-album-missing-tracks.webp" width="240"
@@ -108,7 +108,7 @@ client falls back to its own Auto DJ. The core remote-control layer needs neithe
 
 ## How it fits together
 
-Four pieces, three of them optional:
+Inside those three pieces there are five parts, three of them optional:
 
 | | |
 |---|---|
