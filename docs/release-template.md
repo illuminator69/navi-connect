@@ -14,10 +14,6 @@ Publish this page last, after the Android and desktop releases it links to.
 Worbus is your Navidrome music library, finished and shared: one playback session across every device, and the
 albums your library is missing shown right on each artist's page. Worbus is not affiliated with Navidrome.
 
-New to Worbus? Start with [INSTALL.md](https://github.com/illuminator69/worbus/blob/v{{version}}/INSTALL.md).
-Found a bug, or have an idea? [Open an issue](https://github.com/illuminator69/worbus/issues/new/choose); one tracker
-covers every piece.
-
 ## Worbus Server
 
 {{server_new}}
@@ -72,3 +68,7 @@ The `certificate SHA-256 digest` it prints must be the fingerprint above. If it 
 ```
 
 Each file lives only on its own piece's release; this page links to it and never holds a second copy.
+
+New to Worbus? Start with [INSTALL.md](https://github.com/illuminator69/worbus/blob/v{{version}}/INSTALL.md).
+Found a bug, or have an idea? [Open an issue](https://github.com/illuminator69/worbus/issues/new/choose); one tracker
+covers every piece.

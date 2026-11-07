@@ -80,6 +80,9 @@ def catalog_entry_shape() -> list[str]:
 
     for field in ("name", "url", "repoUrl", "platforms", "api", "description", "screenshots", "pricing"):
         need(field in e, f"missing field {field!r}")
+    for field in ("name", "url", "repoUrl", "api", "description", "pricing"):
+        if field in e and not isinstance(e[field], str):
+            problems.append(f"field {field!r} is empty or not a plain value")
     if problems:
         return problems
     need(e["name"] == "Worbus", f"name is {e['name']!r}, not 'Worbus'")
