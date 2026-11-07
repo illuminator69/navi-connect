@@ -1,0 +1,22 @@
+name: Worbus
+url: https://github.com/illuminator69/worbus
+repoUrl: https://github.com/illuminator69/worbus
+platforms:
+  android:
+    store: https://github.com/illuminator69/worbus-android/releases/latest
+  linux: true
+  windows: true
+api: OpenSubsonic
+pricing: free
+description: "Worbus is a fork of Navic and Feishin that shows each artist's missing albums right on the artist page and shares one playback session across your phone and computers. Worbus is not affiliated with Navidrome."
+keywords:
+  - missing-albums
+  - shared-session
+  - remote-control
+  - discography
+  - musicbrainz
+screenshots:
+  thumbnail: thumbnail.webp
+  gallery:
+    - screen1.webp
+    - screen2.webp
