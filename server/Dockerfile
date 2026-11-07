@@ -4,14 +4,14 @@
 #
 # Build from the umbrella's ROOT, so hub/ and server/ are both in the context:
 #   docker build -f server/Dockerfile \
-#     --build-arg WORBUS_VERSION=0.4.0 --build-arg WORBUS_COMMIT=$(git rev-parse --short HEAD) .
+#     --build-arg WORBUS_VERSION=0.5.0 --build-arg WORBUS_COMMIT=$(git rev-parse --short HEAD) .
 # BuildKit reads server/Dockerfile.dockerignore beside this file (an allowlist: the
 # hub's tests, preview/ and the docs never enter the image).
 #
 # LBBOT_IMAGE is the lb-bot release this server release holds, by digest, set per
 # release (close-out replaces the placeholder below with the pushed digest). A local
 # build of both halves passes its own: --build-arg LBBOT_IMAGE=lb-bot:local.
-ARG LBBOT_IMAGE=ghcr.io/illuminator69/lb-bot@sha256:ea46971f1b5b5acf4469300dab8a7c428b32bef8f2060f57de3176c62cfe91ce
+ARG LBBOT_IMAGE=ghcr.io/illuminator69/lb-bot@sha256:1c1a31edeb3442784c6e63a3861c64343f147c04761cda7603ae095e6924bde2
 FROM ${LBBOT_IMAGE}
 
 # lb-bot's image keeps its app in /app (listenbrainz_bot.py, web/dist, fpcalc from
