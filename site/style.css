@@ -28,7 +28,7 @@ body {
   font: 1rem/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-.wrap { width: 100%; max-width: 62rem; margin: 0 auto; padding: 0 1rem; }
+.wrap { width: 100%; max-width: 62rem; margin: 0 auto; padding-inline: 1rem; }
 
 a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
 a:hover { text-decoration-thickness: 2px; }
@@ -76,7 +76,7 @@ footer a { color: var(--fg); }
 
 @media (min-width: 48rem) {
   header { padding-top: 4.5rem; }
-  .wrap { padding: 0 1.5rem; }
+  .wrap { padding-inline: 1.5rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {
