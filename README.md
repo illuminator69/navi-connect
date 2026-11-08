@@ -45,6 +45,7 @@ you'd notice them. The same page on the phone and on the desktop:
   <img src="docs/screenshots/0.6/desktop-2.png" width="480"
        alt="Worbus for desktop: an artist page with the albums the library has and the albums it is missing" />
 </p>
+(The UI colors are dynamic and are based on the cover art of the currently playing song, it's not all dark yellow)
 
 **A missing album opens as a page of its own**, with its tracklist, before anything is fetched. Check it
 against the canonical MusicBrainz tracklist, choose a quality, and only then go looking for sources.
