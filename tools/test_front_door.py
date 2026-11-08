@@ -51,6 +51,12 @@ def front_door_check_fails_closed() -> list[str]:
         run = subprocess.run([str(Path(tmp) / "tools/check_front_door.sh")], capture_output=True, text=True)
         if run.returncode != 1:
             problems.append(f"exit {run.returncode} on a banned word, want 1")
+        # the wider forms (C1): the fixed regex misses "acquisition" and the fill family
+        for text in ("the acquisition step\n", "gap filling\n", "it filled the gaps\n"):
+            (Path(tmp) / "README.md").write_text(text)
+            run = subprocess.run([str(Path(tmp) / "tools/check_front_door.sh")], capture_output=True, text=True)
+            if run.returncode != 1:
+                problems.append(f"exit {run.returncode} on {text.strip()!r}, want 1")
     return problems
 
 

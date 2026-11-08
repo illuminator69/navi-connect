@@ -3,11 +3,13 @@
 # banned-word regex (design 9 #5), code blocks and image paths included. site/ may not exist yet.
 # Prints file:line and exits 1 on a match. It fails closed: a missing README.md or INSTALL.md, or a grep that
 # itself fails (exit above 1), exits 2, never "clean".
-# Also keep "acquisition" and "acquire" in any form off these pages: the regex's `acquir` does not match
-# "acquisition", so tools/test_front_door.py checks `acqui` as well.
+# WIDE adds what the fixed regex misses (P7 C1): "acquisition" (`acquir` does not match it) and the fill family
+# ("filled", "filling", "filler"), which read as piracy on a front door just as "fills" does. "fetch" is left out:
+# lb-bot's README keeps it in the plan's "Downloading (optional)" section (ruling R17).
 set -u
 cd "$(dirname "$0")/.."
 RE='soulseek|slskd|torrent|acquir|\bfills?\b|download(s|ed|ing)? (the |an? )?(album|music|song|track)'
+WIDE='acqui|\bfill(s|ed|ing|er)?\b'
 for f in README.md INSTALL.md; do
   if [ ! -s "$f" ]; then
     echo "FAIL check_front_door: $f is missing or empty, so it was not checked" >&2
@@ -21,7 +23,7 @@ targets=(README.md INSTALL.md)
 if [ -d site ]; then
   while IFS= read -r -d '' f; do targets+=("$f"); done < <(find site -type f ! -path site/favicon.svg -print0 | sort -z)
 fi
-grep -rniEI -- "$RE" "${targets[@]}"
+grep -rniEI -e "$RE" -e "$WIDE" -- "${targets[@]}"
 rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "FAIL check_front_door: banned word on the launch path (above)" >&2
