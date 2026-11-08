@@ -49,7 +49,7 @@ One tracker for every piece.
    ```
 
    **Healthy** looks like `Up 1 minute (healthy)`; give it up to two minutes on the first start.
-   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.6.0 (abc1234)`, and every line after it
+   `docker logs worbus-server` starts with `[worbus] Worbus Server 0.7.0 (abc1234)`, and every line after it
    says which half wrote it, `[hub]` or `[lb-bot]`. If a required setting is missing, blank or still the example
    value, or the `data` folder is not writable by that `user:`, the server stops and its last line names the
    setting or the folder. A value that is set but wrong (a mistyped address, a wrong password) is not caught at
@@ -77,7 +77,7 @@ Feishin first; nothing is deleted). The Worbus Server sign-in is not copied: sig
 server passwords may not come across either; if the app asks for a password once after the move, enter it again.
 
 The version is in **Settings › About** in Worbus for Android and on the **Version** line of the app menu in Worbus
-for desktop, for example `0.6.0 (abc1234)`.
+for desktop, for example `0.7.0 (abc1234)`.
 
 ## 4. First run
 

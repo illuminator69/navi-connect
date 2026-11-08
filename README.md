@@ -46,14 +46,14 @@ you'd notice them. The same page on the phone and on the desktop:
        alt="Worbus for desktop: an artist page with the albums the library has and the albums it is missing" />
 </p>
 
-**A missing album opens as a page of its own**, with its tracklist, before anything is fetched. Check it
-against the canonical MusicBrainz tracklist, choose a quality, and only then go looking for sources.
+**A missing album opens as a page of its own**, with its tracklist, before you go looking for it. Check it
+against the canonical MusicBrainz tracklist, choose a quality, and only then look for sources.
 
 <p align="center">
   <img src="docs/screenshots/0.6/android-3.png" width="240"
-       alt="Worbus for Android: the page of a missing album, before sources are fetched" />
+       alt="Worbus for Android: the page of a missing album, before any source is looked up" />
   <img src="docs/screenshots/0.6/desktop-3.png" width="480"
-       alt="Worbus for desktop: the page of a missing album, before sources are fetched" />
+       alt="Worbus for desktop: the page of a missing album, before any source is looked up" />
 </p>
 
 ### One session, every device
@@ -74,8 +74,8 @@ app among them, and any of them can take over the session mid-song.
        alt="Worbus for desktop: the device picker, with the phone app in it" />
 </p>
 
-Behind the gaps, lb-bot, the half that knows which albums are missing, handles the per-track gap filling:
-which tracks are absent, which sources are ready, and what it is working on. It has its own page, served
+Behind the gaps, lb-bot, the half that knows which albums are missing, handles the per-album gaps:
+which tracks are absent, where each can be found, and what it is working on. It has its own page, served
 by the Worbus Server.
 
 ### Everything else
@@ -118,7 +118,7 @@ Inside those three pieces there are five parts, three of them optional:
 | **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active, the sleep timer — and never touches audio. It also computes the stations, and proxies AudioMuse, lb-bot and the preview sidecar so no device carries their credentials. Python and `websockets`, one file. Lives in this repo under `hub/`. |
 | **Clients** | Every client is both a controller and a receiver. **Worbus for desktop** and **Worbus for Android** each connect over WebSocket and can play, or hand playback to someone else. |
 | **AudioMuse-AI** | Optional. The recommendation engine behind the stations, the mixes and Song Journey. Reached through the hub, so no device carries its credentials. |
-| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, shows every album your library is missing, and where to find it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
+| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography and shows every album your library is missing, and where to find it. It can also retag an album to a different release or merge two spellings of an artist, and is reached only through the hub. |
 | **Preview sidecar** (currently not being developed) | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
@@ -131,7 +131,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
 | **[worbus](https://github.com/illuminator69/worbus)** (you are here) | The front door: the install page, the hub, the Worbus Server image (`server/`), the preview sidecar, the docs, and the one issue tracker. |
 | **[worbus-android](https://github.com/illuminator69/worbus-android)** | Worbus for Android — a fork of [Navic](https://github.com/ssalggnikool/Navic) by paige, with its UI rebuilt around Worbus. Kept separate so upstream Navic releases can still be merged. Download and issues: see this repository. GPL-3.0. |
 | **[worbus-desktop](https://github.com/illuminator69/worbus-desktop)** | Worbus for desktop — a fork of [Feishin](https://github.com/jeffvli/feishin) by Jeff Li. Separate for the same reason: flattening thousands of commits of upstream history into this tree would destroy the merge path. Download and issues: see this repository. GPL-3.0; this is also where the binaries' source lives. |
-| **[lb-bot](https://github.com/illuminator69/lb-bot)** | The library-gap filler. An independent service with its own release cycle, useful on its own, and optional here. |
+| **[lb-bot](https://github.com/illuminator69/lb-bot)** | The discography index. An independent service with its own release cycle, useful on its own, and optional here. |
 
 ## Contents of this repo
 
@@ -157,5 +157,5 @@ upstream projects' licences — all credit for Navic belongs to
 
 - Worbus for Android is a fork of [Navic](https://github.com/ssalggnikool/Navic) by paige.
 - Worbus for desktop is a fork of [Feishin](https://github.com/jeffvli/feishin) by Jeff Li.
-- Licensed GPL-3.0, like the original.
+- Both apps are GPL-3.0, like Navic and Feishin.
 - Worbus is not affiliated with Navidrome.

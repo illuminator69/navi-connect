@@ -15,9 +15,14 @@ def front_door_has_no_banned_words() -> list[str]:
     files = [ROOT / "README.md", ROOT / "INSTALL.md"]
     site = ROOT / "site"
     if site.is_dir():
-        files += [p for p in sorted(site.rglob("*")) if p.is_file() and p.suffix in {".html", ".css", ".txt", ".md", ".yml"}]  # not .svg: path data and the paint property `fill`, no copy
+        # every text file under site/ whatever its suffix; the one exclusion is the favicon by path (its path data and
+        # the SVG paint property `fill` are not copy). Binary files (the PNGs) are skipped, as grep -I does.
+        files += [p for p in sorted(site.rglob("*")) if p.is_file() and p.relative_to(ROOT).as_posix() != "site/favicon.svg"]
     for f in files:
-        for n, line in enumerate(f.read_text().splitlines(), 1):
+        raw = f.read_bytes()
+        if b"\0" in raw:
+            continue
+        for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
             if BANNED.search(line) or ACQUI.search(line):
                 problems.append(f"{f.relative_to(ROOT)}:{n}: {line.strip()[:80]}")
     run = subprocess.run([str(ROOT / "tools/check_front_door.sh")], capture_output=True, text=True)

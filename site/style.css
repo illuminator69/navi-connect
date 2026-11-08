@@ -61,8 +61,8 @@ h2 { margin: 0 0 0.75rem; font-size: 1.375rem; line-height: 1.25; }
 .shots li { margin: 0; text-align: center; }
 .shots img { display: block; max-width: 100%; height: auto; border-radius: 0.75rem; box-shadow: var(--shadow); }
 .shots .wide { width: 100%; max-width: 56rem; }
-.phones { display: flex; justify-content: center; gap: 1rem; width: 100%; }
-.phones li { flex: 0 1 15rem; min-width: 0; }
+.phones { flex-direction: row; align-items: flex-start; justify-content: center; gap: 1rem; width: 100%; }
+.phones li { flex: 1 1 0; max-width: 15rem; min-width: 0; }
 figcaption, .cap { margin-top: 0.5rem; color: var(--muted); font-size: 0.9rem; }
 
 .about { max-width: 40rem; }

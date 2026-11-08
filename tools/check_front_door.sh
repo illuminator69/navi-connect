@@ -15,10 +15,13 @@ for f in README.md INSTALL.md; do
   fi
 done
 targets=(README.md INSTALL.md)
-[ -d site ] && targets+=(site)
-# --exclude=*.svg: the favicon is path data and the SVG paint property `fill` (CSS `fill:`, `fill-rule`), which
-# matches \bfill\b and is not copy; it holds no words. img/ holds PNGs.
-grep -rniE --exclude-dir=img --exclude='*.svg' -- "$RE" "${targets[@]}"
+# Every text file under site/ is scanned whatever its suffix; the one exclusion is the favicon, by its exact path:
+# it is path data and the SVG paint property `fill` (CSS `fill:`, `fill-rule`), which matches \bfill\b and is not
+# copy; it holds no words. -I skips binary files (the PNGs in img/).
+if [ -d site ]; then
+  while IFS= read -r -d '' f; do targets+=("$f"); done < <(find site -type f ! -path site/favicon.svg -print0 | sort -z)
+fi
+grep -rniEI -- "$RE" "${targets[@]}"
 rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "FAIL check_front_door: banned word on the launch path (above)" >&2
@@ -27,4 +30,4 @@ elif [ "$rc" -ne 1 ]; then
   echo "FAIL check_front_door: grep failed (exit $rc), nothing was checked" >&2
   exit 2
 fi
-echo "ok   check_front_door (${targets[*]})"
+echo "ok   check_front_door (README.md INSTALL.md and $(( ${#targets[@]} - 2 )) files under site/)"

@@ -2,8 +2,10 @@
 """
 Worbus P7, lane H (H3): the worbus.app page (site/) and its Pages workflow. Standard library only.
 
-  site_makes_no_outside_request  no <script>, no event-handler or inline javascript:, every src, srcset, <link href>,
-                                 CSS url() and @import is a relative path, the only absolute links are plain <a> to github.com
+  site_makes_no_outside_request  no <script>, no inline <style> (the CSS is style.css, which is scanned), no event-handler or
+                                 inline javascript:, every src, srcset, <link href>, CSS url() and @import is a relative
+                                 path, no protocol-relative //host load in any text file under site/, the only absolute
+                                 links are plain <a> to github.com
   site_links                     releases/latest, INSTALL.md and the issue chooser are linked
   site_says_not_affiliated       the fixed non-affiliation line is present
   site_credits_upstream          Navic and Feishin are named, each with a link to its upstream repository
@@ -52,6 +54,31 @@ def is_relative(ref: str) -> bool:
     return bool(ref) and not re.match(r"^([a-z][a-z0-9+.-]*:|//)", ref, re.I)
 
 
+# A protocol-relative load, in any text file under site/ whatever its suffix: url(//h), @import "//h" / @import url(//h),
+# src/href/poster/action/data = "//h" or "key": "//h" (HTML, SVG, JSON manifests), and a srcset entry that starts with //.
+PROTO_REL = re.compile(
+    r"""url\(\s*['"]?\s*//"""
+    r"""|@import\s+(?:url\(\s*)?['"]?\s*//"""
+    r"""|\b(?:src|href|poster|action|data)['"]?\s*[=:]\s*['"]?\s*//"""
+    r"""|\bsrcset\s*=\s*['"][^'"]*?(?:^|,)\s*//""",
+    re.I,
+)
+
+
+def text_files() -> list[Path]:
+    """Every file under site/ that is text (no NUL byte), the PNGs excluded by content, not by name."""
+    return [f for f in sorted(SITE.rglob("*")) if f.is_file() and b"\0" not in f.read_bytes()]
+
+
+def protocol_relative_loads() -> list[str]:
+    problems = []
+    for f in text_files():
+        for n, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+            if PROTO_REL.search(line):
+                problems.append(f"{f.relative_to(SITE)}:{n}: a protocol-relative load: {line.strip()[:70]}")
+    return problems
+
+
 def site_makes_no_outside_request() -> list[str]:
     if not PAGE.is_file():
         return ["site/index.html does not exist"]
@@ -60,6 +87,8 @@ def site_makes_no_outside_request() -> list[str]:
     for tag, a in s.tags:
         if tag == "script":
             problems.append("a <script> tag")
+        if tag == "style":
+            problems.append("an inline <style> block (the CSS belongs in style.css)")
         if tag in {"iframe", "object", "embed", "form", "base"}:
             problems.append(f"a <{tag}> tag")
         for k, v in a.items():
@@ -100,7 +129,7 @@ def site_makes_no_outside_request() -> list[str]:
             hits = [m for m in re.findall(r"https?://[^\s\"'<>)]+", f.read_text()) if m != "http://www.w3.org/2000/svg"]
             if hits:
                 problems.append(f"{f.relative_to(SITE)} names another host: {hits[:2]}")
-    return problems
+    return problems + protocol_relative_loads()
 
 
 def site_links() -> list[str]:
