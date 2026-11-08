@@ -6,8 +6,8 @@
 # Worbus
 
 **Your music library, finished and shared.** Worbus joins two self-hosted projects into one:
-a Spotify-Connect–style **shared playback session** across every device, and **lb-bot**, which knows
-every album your library is missing and can fetch it — from inside the player, on the artist page
+a Spotify-Connect–style **shared playback session** across every device, and **lb-bot**, which
+shows every album your library is missing, and where to find it — from inside the player, on the artist page
 you're already looking at.
 
 It sits on top of [Navidrome](https://navidrome.org) and needs nothing hosted by anyone else.
@@ -118,7 +118,7 @@ Inside those three pieces there are five parts, three of them optional:
 | **Hub** | A headless relay that owns the *session intent* — queue, position, which device is active, the sleep timer — and never touches audio. It also computes the stations, and proxies AudioMuse, lb-bot and the preview sidecar so no device carries their credentials. Python and `websockets`, one file. Lives in this repo under `hub/`. |
 | **Clients** | Every client is both a controller and a receiver. **Worbus for desktop** and **Worbus for Android** each connect over WebSocket and can play, or hand playback to someone else. |
 | **AudioMuse-AI** | Optional. The recommendation engine behind the stations, the mixes and Song Journey. Reached through the hub, so no device carries its credentials. |
-| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, knows what the library lacks, can acquire it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
+| **lb-bot** | Optional. Indexes each artist's full MusicBrainz discography, shows every album your library is missing, and where to find it, and can retag an album to a different release or merge two spellings of an artist. Also reached only through the hub. |
 | **Preview sidecar** (currently not being developed) | Optional. Lets you hear a track the library doesn't have, in the ordinary queue. Its own process under `preview/`, because it is the one thing that serves *audio* — the hub proxies its control plane and never a byte of media. |
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the whole design, and
