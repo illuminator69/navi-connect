@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+ACQUI = re.compile(r"acqui", re.I)  # not in the fixed regex (it misses "acquisition"); kept off the pages too
 BANNED = re.compile(r"soulseek|slskd|torrent|acquir|\bfills?\b|download(s|ed|ing)? (the |an? )?(album|music|song|track)", re.I)
 
 
@@ -14,25 +15,48 @@ def front_door_has_no_banned_words() -> list[str]:
     files = [ROOT / "README.md", ROOT / "INSTALL.md"]
     site = ROOT / "site"
     if site.is_dir():
-        files += [p for p in sorted(site.rglob("*")) if p.is_file() and p.suffix in {".html", ".css", ".svg", ".txt", ".md", ".yml"}]
+        files += [p for p in sorted(site.rglob("*")) if p.is_file() and p.suffix in {".html", ".css", ".txt", ".md", ".yml"}]  # not .svg: path data and the paint property `fill`, no copy
     for f in files:
         for n, line in enumerate(f.read_text().splitlines(), 1):
-            if BANNED.search(line):
+            if BANNED.search(line) or ACQUI.search(line):
                 problems.append(f"{f.relative_to(ROOT)}:{n}: {line.strip()[:80]}")
     run = subprocess.run([str(ROOT / "tools/check_front_door.sh")], capture_output=True, text=True)
-    if (run.returncode == 0) != (not problems):
+    if (run.returncode == 0) != (not any(BANNED.search(p) for p in problems)):
         problems.append(f"check_front_door.sh (exit {run.returncode}) disagrees with the python scan")
     return problems
 
 
+def front_door_check_fails_closed() -> list[str]:
+    """A missing README.md must not read as clean: run the script against a copy of the tree without it."""
+    import shutil
+    import tempfile
+    problems = []
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "tools").mkdir()
+        shutil.copy(ROOT / "tools/check_front_door.sh", Path(tmp) / "tools")
+        (Path(tmp) / "INSTALL.md").write_text("clean\n")
+        run = subprocess.run([str(Path(tmp) / "tools/check_front_door.sh")], capture_output=True, text=True)
+        if run.returncode == 0:
+            problems.append("exit 0 with README.md missing")
+        (Path(tmp) / "README.md").write_text("clean\n")
+        run = subprocess.run([str(Path(tmp) / "tools/check_front_door.sh")], capture_output=True, text=True)
+        if run.returncode != 0:
+            problems.append(f"exit {run.returncode} on two clean files")
+        (Path(tmp) / "README.md").write_text("it can acquire it\n")
+        run = subprocess.run([str(Path(tmp) / "tools/check_front_door.sh")], capture_output=True, text=True)
+        if run.returncode != 1:
+            problems.append(f"exit {run.returncode} on a banned word, want 1")
+    return problems
+
+
 def main() -> int:
-    problems = front_door_has_no_banned_words()
+    problems = front_door_has_no_banned_words() + front_door_check_fails_closed()
     if problems:
-        print("FAIL front_door_has_no_banned_words")
+        print("FAIL front_door_has_no_banned_words or front_door_check_fails_closed")
         for p in problems:
             print("  " + p)
         return 1
-    print("ok   front_door_has_no_banned_words")
+    print("ok   front_door_has_no_banned_words\nok   front_door_check_fails_closed")
     print("PASS test_front_door")
     return 0
 

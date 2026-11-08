@@ -143,6 +143,8 @@ preview/              the preview sidecar — preview.py, Dockerfile, docker-com
 docs/ARCHITECTURE.md  what each piece is, how they talk, and where the code lives
 docs/brand/           the Worbus icon (light and dark) shown at the top of this file
 docs/screenshots/0.6/ the screenshots shown in this file
+site/                 worbus.app: one static page, published by .github/workflows/pages.yml
+tools/                the front-door word check and the site's tests
 PROTOCOL.md           the wire protocol spec
 ```
 

@@ -1,0 +1,84 @@
+/* worbus.app: one page, no script, nothing from another host. Ink and Paper are the only colours. */
+:root {
+  --ink: #18211F;
+  --paper: #F1F3EF;
+  --bg: var(--paper);
+  --fg: var(--ink);
+  --muted: color-mix(in srgb, var(--fg) 72%, var(--bg));
+  --line: color-mix(in srgb, var(--fg) 22%, var(--bg));
+  --shadow: 0 1px 2px color-mix(in srgb, var(--fg) 18%, transparent), 0 8px 24px color-mix(in srgb, var(--fg) 14%, transparent);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--ink);
+    --fg: var(--paper);
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 1rem/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.wrap { width: 100%; max-width: 62rem; margin: 0 auto; padding: 0 1rem; }
+
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
+a:hover { text-decoration-thickness: 2px; }
+a:focus-visible { outline: 3px solid var(--fg); outline-offset: 3px; border-radius: 2px; }
+
+header { padding: 3rem 0 1.5rem; text-align: center; }
+header img { display: block; margin: 0 auto 1rem; width: 5rem; height: 5rem; }
+h1 { margin: 0 0 0.75rem; font-size: clamp(2.25rem, 8vw, 3.5rem); line-height: 1.1; letter-spacing: -0.02em; }
+.pitch { margin: 0 auto; max-width: 36rem; font-size: clamp(1.125rem, 3.5vw, 1.375rem); line-height: 1.45; }
+.sub { margin: 0.75rem auto 0; max-width: 36rem; color: var(--muted); }
+
+.get { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.75rem; margin: 2rem 0 0; padding: 0; list-style: none; }
+.get a {
+  display: inline-block;
+  padding: 0.7rem 1.25rem;
+  border: 2px solid var(--fg);
+  border-radius: 0.5rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+.get a:hover { background: color-mix(in srgb, var(--fg) 10%, var(--bg)); }
+.get .primary { background: var(--fg); color: var(--bg); }
+.get .primary:hover { background: color-mix(in srgb, var(--fg) 85%, var(--bg)); }
+
+main { padding-bottom: 1rem; }
+section { padding: 2rem 0; }
+h2 { margin: 0 0 0.75rem; font-size: 1.375rem; line-height: 1.25; }
+
+.shots { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; align-items: center; gap: 1.5rem; }
+.shots li { margin: 0; text-align: center; }
+.shots img { display: block; max-width: 100%; height: auto; border-radius: 0.75rem; box-shadow: var(--shadow); }
+.shots .wide { width: 100%; max-width: 56rem; }
+.phones { display: flex; justify-content: center; gap: 1rem; width: 100%; }
+.phones li { flex: 0 1 15rem; min-width: 0; }
+figcaption, .cap { margin-top: 0.5rem; color: var(--muted); font-size: 0.9rem; }
+
+.about { max-width: 40rem; }
+.about p, .about ul { margin: 0 0 0.75rem; }
+.about ul { padding-left: 1.25rem; }
+.about li { margin-bottom: 0.4rem; }
+
+footer { border-top: 1px solid var(--line); margin-top: 1rem; padding: 2rem 0 3rem; color: var(--muted); font-size: 0.95rem; }
+footer p { margin: 0 0 0.75rem; max-width: 40rem; }
+footer a { color: var(--fg); }
+
+@media (min-width: 48rem) {
+  header { padding-top: 4.5rem; }
+  .wrap { padding: 0 1.5rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { scroll-behavior: auto !important; }
+}
