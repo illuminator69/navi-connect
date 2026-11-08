@@ -15,7 +15,7 @@ entry is made and checked except for the stars, and waits.
 ## The three images
 
 The entry names `thumbnail.webp`, `screen1.webp` and `screen2.webp`. They sit in this folder next to `index.yaml`
-once the screenshots are taken. WebP, at most 1200 px wide and 500 KB each. The thumbnail is an Android Home
+once the screenshots are taken. WebP, at most 1200 px on the longest side and 500 KB each. The thumbnail is an Android Home
 screenshot and must not be a logo; the two gallery images are desktop screenshots. They pass the same privacy list
 as the README's screenshots (no address, hostname, username, token or path).
 
