@@ -4,7 +4,7 @@
 #
 # Build from the umbrella's ROOT, so hub/ and server/ are both in the context:
 #   docker build -f server/Dockerfile \
-#     --build-arg WORBUS_VERSION=0.6.0 --build-arg WORBUS_COMMIT=$(git rev-parse --short HEAD) .
+#     --build-arg WORBUS_VERSION=0.7.0 --build-arg WORBUS_COMMIT=$(git rev-parse --short HEAD) .
 # BuildKit reads server/Dockerfile.dockerignore beside this file (an allowlist: the
 # hub's tests, preview/ and the docs never enter the image).
 #

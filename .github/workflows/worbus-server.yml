@@ -35,7 +35,7 @@ jobs:
           else
             # A dispatch from a branch is a dev build: tagged by its commit only, never
             # `latest`. Bump with the release number.
-            version="0.6.0-dev"
+            version="0.7.0-dev"
           fi
           lbbot="$(sed -n 's/^ARG LBBOT_IMAGE=//p' server/Dockerfile | head -n 1)"
           if [[ -z "${lbbot}" || "${lbbot}" == *"@sha256:0000000000000000"* ]]; then

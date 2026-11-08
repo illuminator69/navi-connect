@@ -3,10 +3,12 @@ Template for the combined release page "Worbus {{version}}" on illuminator69/wor
 `gh release create v{{version}} --draft --title "Worbus {{version}}" --notes-file ...`). Fill every {{ }} and delete this
 comment. Placeholders:
   {{version}}             the version without the v, for example 0.6.0
+  {{previous}}            the version this one updates in place, without the v
   {{server_digest}}       the pushed worbus-server image digest, sha256:...
   {{android_sha256}}      the SHA-256 of Worbus-v{{version}}.apk, from the Android release's SHA256SUMS
   {{desktop_sha256sums}}  the lines of the desktop release's SHA256SUMS file, pasted as they are
   {{server_new}}, {{android_new}}, {{desktop_new}}  what is new in each piece (a short list)
+The second empty line under {{android_new}} is the credit line for a patch reporter, written at close-out.
 The client releases' own notes are each piece's section below, set with `gh release edit --notes-file`.
 Publish this page last, after the Android and desktop releases it links to.
 -->
@@ -30,10 +32,11 @@ The server has no files to download: it is the image, which `compose.yaml` in th
 
 {{android_new}}
 
+
 - Download: [Worbus-v{{version}}.apk](https://github.com/illuminator69/worbus-android/releases/download/v{{version}}/Worbus-v{{version}}.apk)
   on [worbus-android's release](https://github.com/illuminator69/worbus-android/releases/tag/v{{version}}).
 - SHA-256 of the APK: `{{android_sha256}}`
-- Worbus {{version}} updates 0.5.0 in place: install it over the one you have.
+- Worbus {{version}} updates {{previous}} in place: install it over the one you have.
 - To be told about updates, add `https://github.com/illuminator69/worbus-android` to Obtainium with the APK filter
   `Worbus-v.*\.apk`.
 
