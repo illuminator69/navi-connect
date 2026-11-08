@@ -11,7 +11,7 @@
 # LBBOT_IMAGE is the lb-bot release this server release holds, by digest, set per
 # release (close-out replaces the placeholder below with the pushed digest). A local
 # build of both halves passes its own: --build-arg LBBOT_IMAGE=lb-bot:local.
-ARG LBBOT_IMAGE=ghcr.io/illuminator69/lb-bot@sha256:1c1a31edeb3442784c6e63a3861c64343f147c04761cda7603ae095e6924bde2
+ARG LBBOT_IMAGE=ghcr.io/illuminator69/lb-bot@sha256:2d9f38978b9706b82e16fec640970ae0e543cd523879619d6a547206d36175ed
 FROM ${LBBOT_IMAGE}
 
 # lb-bot's image keeps its app in /app (listenbrainz_bot.py, web/dist, fpcalc from
