@@ -1,6 +1,6 @@
 name: Idea
 description: Something Worbus could do, or do better.
-labels: ["enhancement"]
+labels: ["idea"]
 body:
   - type: dropdown
     id: piece
