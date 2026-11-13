@@ -151,8 +151,11 @@ PROTOCOL.md           the wire protocol spec
 
 ## Licence
 
-The hub and the docs are this project's own work. Both clients are GPL-3.0 forks and carry their
-upstream projects' licences — all credit for Navic belongs to
+Worbus's own parts — the hub, the server, these docs, and [lb-bot](https://github.com/illuminator69/lb-bot)
+in its own repository — are free software under the GNU General Public License, version 3 or later
+(`GPL-3.0-or-later`); the text is in [LICENSE](LICENSE). Copyright (C) 2026 Worbus contributors.
+
+Both clients are GPL-3.0 forks and carry their upstream projects' licences — all credit for Navic belongs to
 [paige](https://github.com/ssalggnikool), and for Feishin to
 [jeffvli](https://github.com/jeffvli) and their contributors.
 

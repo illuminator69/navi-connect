@@ -131,3 +131,6 @@ docker image rm ghcr.io/illuminator69/worbus-server
 Then delete the `worbus-server` folder (its `data` holds the server's state: devices, queues, lb-bot's index and
 review) and uninstall the apps. Your music folder keeps what lb-bot placed or fixed in it; duplicates you deleted
 in lb-bot sit in its `.lb-bot-trash` folder there. Navidrome is not changed.
+
+Worbus Server is free software under the GNU General Public License, version 3 or later (`GPL-3.0-or-later`); see
+[LICENSE](LICENSE).
